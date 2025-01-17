@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "test/lib/cql_test_env.hh"
@@ -156,7 +156,7 @@ void execute_reads(const schema_ptr& schema, reader_concurrency_semaphore& sem, 
             (void)with_gate(g, [reads, read, &n, concurrency] {
                 const auto start = n;
                 n = std::min(reads, n + concurrency);
-                return parallel_for_each(boost::irange(start, n), read);
+                return parallel_for_each(std::views::iota(start, n), read);
             }).handle_exception([&e, &sem, initial_res] (std::exception_ptr eptr) {
                 const auto res = sem.available_resources();
                 testlog.error("Read failed: {}", eptr);

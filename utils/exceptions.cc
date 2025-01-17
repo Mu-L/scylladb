@@ -2,10 +2,10 @@
  * Copyright 2015-present ScyllaDB
  */
 
-/* SPDX-License-Identifier: AGPL-3.0-or-later
+/* SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/rpc/rpc.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/backtrace.hh>

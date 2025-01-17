@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -64,6 +64,9 @@ public:
     static constexpr int32_t DEFAULT_DEFAULT_TIME_TO_LIVE = 0;
     static constexpr int32_t DEFAULT_MIN_INDEX_INTERVAL = 128;
     static constexpr int32_t DEFAULT_MAX_INDEX_INTERVAL = 2048;
+    static constexpr int32_t DEFAULT_MEMTABLE_FLUSH_PERIOD = 0;
+
+    static constexpr int32_t DEFAULT_MEMTABLE_FLUSH_PERIOD_MIN_VALUE = 60000;
 
 private:
     mutable std::optional<sstables::compaction_strategy_type> _compaction_strategy_class;

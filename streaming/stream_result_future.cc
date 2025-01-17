@@ -4,13 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "streaming/stream_result_future.hh"
 #include "streaming/stream_manager.hh"
 #include "streaming/stream_exception.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include <cfloat>
 #include <fmt/ranges.h>
 
@@ -38,7 +38,7 @@ future<stream_state> stream_result_future::init_sending_side(stream_manager& mgr
     return sr->_done.get_future();
 }
 
-shared_ptr<stream_result_future> stream_result_future::init_receiving_side(stream_manager& mgr, streaming::plan_id plan_id, sstring description, inet_address from) {
+shared_ptr<stream_result_future> stream_result_future::init_receiving_side(stream_manager& mgr, streaming::plan_id plan_id, sstring description, locator::host_id from) {
     auto sr = mgr.get_receiving_stream(plan_id);
     if (sr) {
         auto err = fmt::format("[Stream #{}] GOT PREPARE_MESSAGE from {}, description={},"

@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -14,7 +14,6 @@
 
 #include <algorithm>
 #include <functional>
-#include <iosfwd>
 
 namespace cql3 {
 
@@ -89,12 +88,12 @@ public:
     friend std::hash<column_identifier_raw>;
 };
 
-static inline
+inline
 const column_definition* get_column_definition(const schema& schema, const column_identifier& id) {
     return schema.get_column_definition(id.bytes_);
 }
 
-static inline
+inline
 ::shared_ptr<column_identifier> to_identifier(const column_definition& def) {
     return def.column_specification->name;
 }

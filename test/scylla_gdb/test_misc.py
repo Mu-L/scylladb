@@ -81,6 +81,12 @@ def test_small_object_1(gdb):
 def test_small_object_2(gdb):
     scylla(gdb, 'small-object -o 64 --summarize')
 
+def test_large_objects_1(gdb):
+    scylla(gdb, 'large-objects -o 131072 --random-page')
+
+def test_large_objects_2(gdb):
+    scylla(gdb, 'large-objects -o 32768 --summarize')
+
 def test_lsa(gdb):
     scylla(gdb, 'lsa')
 
@@ -117,8 +123,8 @@ def test_timers(gdb):
 def schema(gdb, scylla_gdb):
     db = scylla_gdb.sharded(gdb.parse_and_eval('::debug::the_database')).local()
     table = next(scylla_gdb.for_each_table(db))
-    gdb.set_convenience_variable('schema', 
-        table['_schema']['_p'].reinterpret_cast(gdb.lookup_type('schema').pointer()))
+    gdb.set_convenience_variable('schema',
+        scylla_gdb.seastar_lw_shared_ptr(table['_schema']).get())
     yield '$schema'
 
 @pytest.fixture(scope="module")
@@ -157,6 +163,21 @@ def task(gdb, scylla_gdb):
 def test_fiber(gdb, task):
     scylla(gdb, f'fiber {task}')
 
+# Similar to task(), but looks for a coroutine frame.
+@pytest.fixture(scope="module")
+def coro_task(gdb, scylla_gdb):
+    for obj_addr, vtable_addr in scylla_gdb.find_vptrs():
+        name = scylla_gdb.resolve(vtable_addr)
+        if name and name.strip() == 'service::topology_coordinator::run() [clone .resume]':
+            return obj_addr.cast(gdb.lookup_type('uintptr_t'))
+    raise gdb.error("No coroutine frames found with expected name")
+
+def test_coro_frame(gdb, coro_task):
+    # Note the offset by two words.
+    # This moves the pointer from the outer coroutine frame to the inner seastar::task.
+    # $coro_frame expects a seastar::task*.
+    gdb.execute(f'p *$coro_frame({coro_task} + 16)')
+
 def test_sstable_summary(gdb, sstable):
     scylla(gdb, f'sstable-summary {sstable}')
 
@@ -168,5 +189,19 @@ def test_read_stats(gdb, sstable):
 
 def test_get_config_value(gdb):
     scylla(gdb, f'get-config-value compaction_static_shares')
+
+@pytest.mark.without_scylla
+def test_run_without_scylla(scylla_gdb):
+    # just try to load the scylla-gdb module without attaching to scylla.
+    #
+    # please note, if this test fails, there are good chances that scylla-gdb.py
+    # is unable to load without debug symbols. Calls to "gdb.lookup_type()" and
+    # similar functions that rely on debug symbols should be made within GDB
+    # commands themselves when they get exuecuted. To address potential
+    # failures, consider moving code that references debug symbols into a code
+    # path executed only when debug symbols is loaded. If the value of the
+    # symbol is a constant, consider caching it. using functools.cache
+    # decorator.
+    _ = scylla_gdb
 
 # FIXME: need a simple test for lsa-segment

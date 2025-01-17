@@ -3,8 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#include <seastar/util/closeable.hh>
 
 #include "mutation.hh"
 #include "query-result-writer.hh"
@@ -105,7 +107,7 @@ mutation_decorated_key_less_comparator::operator()(const mutation& m1, const mut
     return m1.decorated_key().less_compare(*m1.schema(), m2.decorated_key());
 }
 
-boost::iterator_range<std::vector<mutation>::const_iterator>
+std::ranges::subrange<std::vector<mutation>::const_iterator>
 slice(const std::vector<mutation>& partitions, const dht::partition_range& r) {
     struct cmp {
         bool operator()(const dht::ring_position& pos, const mutation& m) const {
@@ -116,7 +118,7 @@ slice(const std::vector<mutation>& partitions, const dht::partition_range& r) {
         };
     };
 
-    return boost::make_iterator_range(
+    return std::ranges::subrange(
         r.start()
             ? (r.start()->is_inclusive()
                 ? std::lower_bound(partitions.begin(), partitions.end(), r.start()->value(), cmp())
@@ -284,7 +286,9 @@ future<> split_mutation(mutation source, std::vector<mutation>& target, size_t m
         auto reader = make_mutation_reader_from_mutations_v2(s,
             sem.make_tracking_only_permit(s, "split_mutation", db::no_timeout, {}),
             std::move(source));
-        co_await reader.consume(mutation_by_size_splitter(s, target, max_size));
+        co_await with_closeable(std::move(reader), [&] (mutation_reader& reader) {
+            return reader.consume(mutation_by_size_splitter(s, target, max_size));
+        });
     }
     co_await sem.stop();
 }

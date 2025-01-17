@@ -3,20 +3,25 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/algorithm/cxx11/all_of.hpp>
+#include <limits>
+
 #include <boost/range/combine.hpp>
+#include <boost/test/tools/old/interface.hpp>
 #include <fmt/ranges.h>
+#include <fmt/std.h>
 #include "test/lib/scylla_test_case.hh"
 
+#include "dht/token.hh"
 #include "dht/i_partitioner.hh"
 #include "dht/sharder.hh"
 #include "dht/murmur3_partitioner.hh"
 #include "schema/schema.hh"
 #include "types/types.hh"
 #include "schema/schema_builder.hh"
+#include "utils/assert.hh"
 #include "utils/to_string.hh"
 
 #include "test/lib/simple_schema.hh"
@@ -35,11 +40,72 @@ debug(Args&&... args) {
 }
 
 static dht::token token_from_long(uint64_t value) {
-    return dht::token(dht::token::kind::key, value);
+    return dht::token(value);
 }
 
 static int64_t long_from_token(dht::token token) {
     return token._data;
+}
+
+void print_token(sstring desc, dht::token t) {
+    testlog.debug("{}={}", desc, t);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_minimum_token) {
+    auto t = dht::token::minimum();
+    BOOST_REQUIRE_EQUAL(t, dht::minimum_token());
+    BOOST_REQUIRE(t.is_minimum());
+    BOOST_REQUIRE_EQUAL(dht::token::to_int64(t), std::numeric_limits<int64_t>::min());
+    BOOST_REQUIRE_EQUAL(t.raw(), std::numeric_limits<int64_t>::min());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_maximum_token) {
+    auto t = dht::token::maximum();
+    BOOST_REQUIRE_EQUAL(t, dht::maximum_token());
+    BOOST_REQUIRE(t.is_maximum());
+    BOOST_REQUIRE_EQUAL(dht::token::to_int64(t), std::numeric_limits<int64_t>::min());
+    BOOST_REQUIRE_EQUAL(t.raw(), std::numeric_limits<int64_t>::max());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_first_token) {
+    auto t = dht::first_token();
+    BOOST_REQUIRE_EQUAL(t, dht::first_token());
+    BOOST_REQUIRE(t.is_first());
+    BOOST_REQUIRE_EQUAL(dht::token::to_int64(t), std::numeric_limits<int64_t>::min() + 1);
+    BOOST_REQUIRE_EQUAL(t.raw(), std::numeric_limits<int64_t>::min() + 1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_last_token) {
+    auto t = dht::token::last();
+    BOOST_REQUIRE_EQUAL(t, dht::last_token());
+    BOOST_REQUIRE(t.is_last());
+    BOOST_REQUIRE_EQUAL(dht::token::to_int64(t), std::numeric_limits<int64_t>::max());
+    BOOST_REQUIRE_EQUAL(t.raw(), std::numeric_limits<int64_t>::max());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_token_ordering) {
+    auto minimum = dht::minimum_token();
+    print_token("minimum", minimum);
+    auto first = dht::first_token();
+    print_token("first", first);
+    BOOST_REQUIRE(minimum <=> first < 0);
+    auto next = next_token(first);
+    print_token("next", next);
+    BOOST_REQUIRE(first <=> next < 0);
+    auto last = dht::last_token();
+    print_token("last", last);
+    BOOST_REQUIRE(next <=> last < 0);
+    auto maximum = dht::maximum_token();
+    print_token("maximum", maximum);
+    BOOST_REQUIRE(last <=> maximum < 0);
+
+    auto midpoint = dht::token::midpoint(first, last);
+    print_token("midpoint", midpoint);
+    BOOST_REQUIRE(first <=> midpoint < 0);
+    next = dht::next_token(midpoint);
+    print_token("next", next);
+    BOOST_REQUIRE(midpoint <=> next < 0);
+    BOOST_REQUIRE(next <=> last < 0);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_decorated_key_is_compatible_with_origin) {
@@ -126,9 +192,9 @@ SEASTAR_THREAD_TEST_CASE(test_ring_position_ordering) {
 
     testlog.info("Keys: {}", keys);
 
-    auto positions = boost::copy_range<std::vector<dht::ring_position>>(keys);
-    auto ext_positions = boost::copy_range<std::vector<dht::ring_position_ext>>(keys);
-    auto views = boost::copy_range<std::vector<dht::ring_position_view>>(positions);
+    auto positions = keys | std::ranges::to<std::vector<dht::ring_position>>();
+    auto ext_positions = keys | std::ranges::to<std::vector<dht::ring_position_ext>>();
+    auto views = positions | std::ranges::to<std::vector<dht::ring_position_view>>();
 
     total_order_check<dht::ring_position_comparator, dht::ring_position, dht::ring_position_view, dht::decorated_key>(cmp)
       .next(dht::ring_position_view::min())
@@ -242,8 +308,7 @@ void test_sharding(const dht::sharder& sharder, unsigned shards, std::vector<dht
 
 SEASTAR_THREAD_TEST_CASE(test_murmur3_sharding) {
     auto make_token_vector = [] (std::vector<int64_t> v) {
-        return boost::copy_range<std::vector<dht::token>>(
-                v | boost::adaptors::transformed(token_from_long));
+        return v | std::views::transform(token_from_long) | std::ranges::to<std::vector<dht::token>>();
     };
     dht::static_sharder mm3p7s(7);
     auto mm3p7s_shard_limits = make_token_vector({
@@ -266,8 +331,7 @@ SEASTAR_THREAD_TEST_CASE(test_murmur3_sharding) {
 
 SEASTAR_THREAD_TEST_CASE(test_murmur3_sharding_with_ignorebits) {
     auto make_token_vector = [] (std::vector<int64_t> v) {
-        return boost::copy_range<std::vector<dht::token>>(
-                v | boost::adaptors::transformed(token_from_long));
+        return v | std::views::transform(token_from_long) | std::ranges::to<std::vector<dht::token>>();
     };
     dht::static_sharder mm3p7s2i(7, 2);
     auto mm3p7s2i_shard_limits = make_token_vector({
@@ -448,7 +512,7 @@ test_something_with_some_interesting_ranges_and_sharder(std::function<void (cons
 static
 void
 do_test_split_range_to_single_shard(const schema& s, const dht::static_sharder& sharder_, const dht::partition_range& pr) {
-    for (auto shard : boost::irange(0u, sharder_.shard_count())) {
+    for (auto shard : std::views::iota(0u, sharder_.shard_count())) {
         auto ranges = dht::split_range_to_single_shard(s, sharder_, pr, shard).get();
         auto sharder = dht::ring_position_range_sharder(sharder_, pr);
         auto x = sharder.next(s);
@@ -519,7 +583,7 @@ static
 void
 do_test_selective_token_range_sharder(const dht::sharder& input_sharder, const schema& s, const dht::token_range& range) {
     bool debug = false;
-    for (auto shard : boost::irange(0u, input_sharder.shard_count())) {
+    for (auto shard : std::views::iota(0u, input_sharder.shard_count())) {
         auto sharder = dht::selective_token_range_sharder(input_sharder, range, shard);
         auto range_shard = sharder.next();
         while (range_shard) {
@@ -566,11 +630,11 @@ SEASTAR_THREAD_TEST_CASE(test_find_first_token_for_shard) {
     auto second_boundary = sharder.token_for_next_shard_for_reads(dht::minimum_token(), 2);
     auto third_boundary = sharder.token_for_next_shard_for_reads(dht::minimum_token(), 0);
     auto next_token = [] (dht::token t) {
-        assert(dht::token::to_int64(t) < std::numeric_limits<int64_t>::max());
+        SCYLLA_ASSERT(dht::token::to_int64(t) < std::numeric_limits<int64_t>::max());
         return dht::token::from_int64(dht::token::to_int64(t) + 1);
     };
     auto prev_token = [] (dht::token t) {
-        assert(dht::token::to_int64(t) > std::numeric_limits<int64_t>::min() + 1);
+        SCYLLA_ASSERT(dht::token::to_int64(t) > std::numeric_limits<int64_t>::min() + 1);
         return dht::token::from_int64(dht::token::to_int64(t) - 1);
     };
 

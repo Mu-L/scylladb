@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #pragma once
 
@@ -18,7 +18,7 @@
 #include "utils/UUID.hh"
 #include "gms/inet_address.hh"
 #include "enum_set.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "seastarx.hh"
 
 namespace service {
@@ -175,6 +175,7 @@ struct event_record {
     std::string message;
     elapsed_clock::duration elapsed;
     i_tracing_backend_helper::wall_clock::time_point event_time_point;
+    sstring scheduling_group_name = current_scheduling_group().name();
 
     event_record(sstring message_, elapsed_clock::duration elapsed_, i_tracing_backend_helper::wall_clock::time_point event_time_point_)
         : message(std::move(message_))

@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include "multishard_mutation_query.hh"
 #include "schema/schema_registry.hh"
 #include "db/config.hh"
@@ -27,11 +28,13 @@
 #include "db/paxos_grace_seconds_extension.hh"
 #include "db/per_partition_rate_limit_extension.hh"
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
+#include <seastar/testing/thread_test_case.hh>
 
 #include <fmt/ranges.h>
-#include <boost/range/algorithm/sort.hpp>
 #include <utility>
+#include <algorithm>
 
 const sstring KEYSPACE_NAME = "ks";
 
@@ -75,6 +78,7 @@ public:
     virtual std::vector<data_type> clustering_key_columns(std::mt19937& engine) override { return _underlying_spec->clustering_key_columns(engine); }
     virtual std::vector<data_type> regular_columns(std::mt19937& engine) override { return _underlying_spec->regular_columns(engine); }
     virtual std::vector<data_type> static_columns(std::mt19937& engine) override { return _underlying_spec->static_columns(engine); }
+    virtual compress_sstable& compress() override { return _underlying_spec->compress(); };
 };
 
 } // anonymous namespace
@@ -157,7 +161,7 @@ static std::pair<schema_ptr, std::vector<dht::decorated_key>> create_test_table(
 }
 
 static uint64_t aggregate_querier_cache_stat(distributed<replica::database>& db, uint64_t query::querier_cache::stats::*stat) {
-    return map_reduce(boost::irange(0u, smp::count), [stat, &db] (unsigned shard) {
+    return map_reduce(std::views::iota(0u, smp::count), [stat, &db] (unsigned shard) {
         return db.invoke_on(shard, [stat] (replica::database& local_db) {
             auto& stats = local_db.get_querier_cache_stats();
             return stats.*stat;
@@ -169,7 +173,7 @@ static void check_cache_population(distributed<replica::database>& db, size_t qu
         seastar::compat::source_location sl = seastar::compat::source_location::current()) {
     testlog.info("{}() called from {}() {}:{:d}", __FUNCTION__, sl.function_name(), sl.file_name(), sl.line());
 
-    parallel_for_each(boost::irange(0u, smp::count), [queriers, &db] (unsigned shard) {
+    parallel_for_each(std::views::iota(0u, smp::count), [queriers, &db] (unsigned shard) {
         return db.invoke_on(shard, [queriers] (replica::database& local_db) {
             auto& stats = local_db.get_querier_cache_stats();
             tests::require_equal(stats.population, queriers);
@@ -186,6 +190,8 @@ static void require_eventually_empty_caches(distributed<replica::database>& db,
     };
     tests::require(eventually_true(aggregated_population_is_zero));
 }
+
+BOOST_AUTO_TEST_SUITE(multishard_mutation_query_test)
 
 // Best run with SMP>=2
 SEASTAR_THREAD_TEST_CASE(test_abandoned_read) {
@@ -219,6 +225,8 @@ SEASTAR_THREAD_TEST_CASE(test_abandoned_read) {
         return make_ready_future<>();
     }, cql_config_with_extensions()).get();
 }
+
+} // multishard_mutation_query_test namespace
 
 static std::vector<mutation> read_all_partitions_one_by_one(distributed<replica::database>& db, schema_ptr s, std::vector<dht::decorated_key> pkeys,
         const query::partition_slice& slice) {
@@ -303,7 +311,7 @@ read_partitions_with_generic_paged_scan(distributed<replica::database>& db, sche
         while (!ranges->front().contains(res_builder.last_pkey(), cmp)) {
             ranges->erase(ranges->begin());
         }
-        assert(!ranges->empty());
+        SCYLLA_ASSERT(!ranges->empty());
 
         const auto pkrange_begin_inclusive = res_builder.last_ckey() && res_builder.last_pkey_rows() < slice.partition_row_limit();
 
@@ -319,7 +327,7 @@ read_partitions_with_generic_paged_scan(distributed<replica::database>& db, sche
 
         if (res_builder.last_ckey()) {
             auto ckranges = cmd.slice.default_row_ranges();
-            query::trim_clustering_row_ranges_to(*s, ckranges, *res_builder.last_ckey(), slice.is_reversed());
+            query::trim_clustering_row_ranges_to(*s, ckranges, *res_builder.last_ckey());
             cmd.slice.clear_range(*s, res_builder.last_pkey().key());
             cmd.slice.clear_ranges();
             cmd.slice.set_range(*s, res_builder.last_pkey().key(), std::move(ckranges));
@@ -357,7 +365,6 @@ public:
 
 private:
     schema_ptr _s;
-    const query::partition_slice& _slice;
     uint64_t _page_size = 0;
     std::vector<mutation> _results;
     std::optional<dht::decorated_key> _last_pkey;
@@ -369,11 +376,8 @@ private:
         if (mut.partition().clustered_rows().empty()) {
             return std::nullopt;
         }
-        if (_slice.is_reversed()) {
-            return mut.partition().clustered_rows().begin()->key();
-        } else {
-            return mut.partition().clustered_rows().rbegin()->key();
-        }
+
+        return mut.partition().clustered_rows().rbegin()->key();
     }
 
 public:
@@ -387,7 +391,7 @@ public:
         return std::get<0>(query_mutations_on_all_shards(db, std::move(s), cmd, ranges, std::move(trace_state), timeout).get());
     }
 
-    explicit mutation_result_builder(schema_ptr s, const query::partition_slice& slice, uint64_t page_size) : _s(std::move(s)), _slice(slice), _page_size(page_size) { }
+    explicit mutation_result_builder(schema_ptr s, const query::partition_slice&, uint64_t page_size) : _s(std::move(s)), _page_size(page_size) { }
 
     bool add(const reconcilable_result& res) {
         auto it = res.partitions().begin();
@@ -521,13 +525,15 @@ void check_results_are_equal(std::vector<mutation>& results1, std::vector<mutati
     auto mut_less = [] (const mutation& a, const mutation& b) {
         return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
     };
-    boost::sort(results1, mut_less);
-    boost::sort(results2, mut_less);
+    std::ranges::sort(results1, mut_less);
+    std::ranges::sort(results2, mut_less);
     for (unsigned i = 0; i < results1.size(); ++i) {
         testlog.trace("Comparing mutation #{:d}", i);
         assert_that(results2[i]).is_equal_to(results1[i]);
     }
 }
+
+namespace multishard_mutation_query_test {
 
 // Best run with SMP>=2
 SEASTAR_THREAD_TEST_CASE(test_read_all) {
@@ -764,6 +770,7 @@ SEASTAR_THREAD_TEST_CASE(test_read_reversed) {
         auto& db = env.db();
 
         auto [s, pkeys] = create_test_table(env, KEYSPACE_NAME, get_name(), 4, 8);
+        s = s->make_reversed();
 
         unsigned i = 0;
 
@@ -792,8 +799,7 @@ SEASTAR_THREAD_TEST_CASE(test_read_reversed) {
             std::vector<query::result_set_row> expected_rows;
             for (const auto& mut : expected_results) {
                 auto rs = query::result_set(mut);
-                // mut re-sorts rows into forward order, so we have to reverse them again here
-                std::copy(rs.rows().rbegin(), rs.rows().rend(), std::back_inserter(expected_rows));
+                std::copy(rs.rows().begin(), rs.rows().end(), std::back_inserter(expected_rows));
             }
             auto expected_data_results = query::result_set(s, std::move(expected_rows));
 
@@ -810,6 +816,8 @@ SEASTAR_THREAD_TEST_CASE(test_read_reversed) {
         return make_ready_future<>();
     }, cql_config_with_extensions()).get();
 }
+
+} // multishard_mutation_query_test namespace
 
 namespace {
 
@@ -868,10 +876,10 @@ struct serializer<blob_header> {
     template <typename Input>
     static blob_header read(Input& in) {
         blob_header head;
-        head.size = ser::deserialize(in, boost::type<int>{});
-        head.includes_pk = ser::deserialize(in, boost::type<bool>{});
-        head.has_ck = ser::deserialize(in, boost::type<bool>{});
-        head.includes_ck = ser::deserialize(in, boost::type<bool>{});
+        head.size = ser::deserialize(in, std::type_identity<int>{});
+        head.includes_pk = ser::deserialize(in, std::type_identity<bool>{});
+        head.has_ck = ser::deserialize(in, std::type_identity<bool>{});
+        head.includes_ck = ser::deserialize(in, std::type_identity<bool>{});
         return head;
     }
     template <typename Output>
@@ -883,10 +891,10 @@ struct serializer<blob_header> {
     }
     template <typename Input>
     static void skip(Input& in) {
-        ser::skip(in, boost::type<int>{});
-        ser::skip(in, boost::type<bool>{});
-        ser::skip(in, boost::type<bool>{});
-        ser::skip(in, boost::type<bool>{});
+        ser::skip(in, std::type_identity<int>{});
+        ser::skip(in, std::type_identity<bool>{});
+        ser::skip(in, std::type_identity<bool>{});
+        ser::skip(in, std::type_identity<bool>{});
     }
 };
 
@@ -896,7 +904,7 @@ namespace {
 
 template <typename RandomEngine>
 static interval<int> generate_range(RandomEngine& rnd_engine, int start, int end, bool allow_open_ended_start = true) {
-    assert(start < end);
+    SCYLLA_ASSERT(start < end);
 
     std::uniform_int_distribution<int> defined_bound_dist(0, 7);
     std::uniform_int_distribution<int8_t> inclusive_dist(0, 1);
@@ -1109,6 +1117,8 @@ run_fuzzy_test_workload(fuzzy_test_config cfg, distributed<replica::database>& d
 
 } // namespace
 
+namespace multishard_mutation_query_test {
+
 SEASTAR_THREAD_TEST_CASE(fuzzy_test) {
     auto cql_cfg = cql_config_with_extensions();
     cql_cfg.db_config->enable_commitlog(false);
@@ -1160,3 +1170,5 @@ SEASTAR_THREAD_TEST_CASE(fuzzy_test) {
         return make_ready_future<>();
     }, cql_cfg).get();
 }
+
+BOOST_AUTO_TEST_SUITE_END()

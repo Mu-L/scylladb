@@ -5,10 +5,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 
+#include "utils/assert.hh"
 #include <inttypes.h>
 #include <boost/regex.hpp>
 
@@ -128,7 +129,7 @@ void create_table_statement::apply_properties_to(schema_builder& builder, const 
 
 void create_table_statement::add_column_metadata_from_aliases(schema_builder& builder, std::vector<bytes> aliases, const std::vector<data_type>& types, column_kind kind) const
 {
-    assert(aliases.size() == types.size());
+    SCYLLA_ASSERT(aliases.size() == types.size());
     for (size_t i = 0; i < aliases.size(); i++) {
         if (!aliases[i].empty()) {
             builder.with_column(aliases[i], types[i], kind);
@@ -192,6 +193,13 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
 
     auto stmt = ::make_shared<create_table_statement>(*_cf_name, _properties.properties(), _if_not_exists, _static_columns, _properties.properties()->get_id());
 
+    bool ks_uses_tablets;
+    try {
+        ks_uses_tablets = db.find_keyspace(keyspace()).get_replication_strategy().uses_tablets();
+    } catch (const data_dictionary::no_such_keyspace& e) {
+        throw exceptions::invalid_request_exception("Cannot create a table in a non-existent keyspace: " + keyspace());
+    }
+
     std::optional<std::map<bytes, data_type>> defined_multi_cell_columns;
     for (auto&& entry : _definitions) {
         ::shared_ptr<column_identifier> id = entry.first;
@@ -201,6 +209,10 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
             throw exceptions::invalid_request_exception("Cannot set default_time_to_live on a table with counters");
         }
 
+        if (ks_uses_tablets && pt.is_counter()) {
+            throw exceptions::invalid_request_exception(format("Cannot use the 'counter' type for table {}.{}: Counters are not yet supported with tablets", keyspace(), cf_name));
+        }
+
         if (pt.get_type()->is_multi_cell()) {
             if (pt.get_type()->is_user_type()) {
                 // check for multi-cell types (non-frozen UDTs or collections) inside a non-frozen UDT
@@ -208,7 +220,7 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
                 for (auto&& inner: type->all_types()) {
                     if (inner->is_multi_cell()) {
                         // a nested non-frozen UDT should have already been rejected when defining the type
-                        assert(inner->is_collection());
+                        SCYLLA_ASSERT(inner->is_collection());
                         throw exceptions::invalid_request_exception("Non-frozen UDTs with nested non-frozen collections are not supported");
                     }
                 }
@@ -331,8 +343,8 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
 #endif
         } else {
             if (stmt->_columns.size() > 1) {
-                throw exceptions::invalid_request_exception(format("COMPACT STORAGE with composite PRIMARY KEY allows no more than one column not part of the PRIMARY KEY (got: {})",
-                    fmt::join(stmt->_columns | boost::adaptors::map_keys, ", ")));
+                throw exceptions::invalid_request_exception(seastar::format("COMPACT STORAGE with composite PRIMARY KEY allows no more than one column not part of the PRIMARY KEY (got: {})",
+                    fmt::join(stmt->_columns | std::views::keys, ", ")));
             }
 #if 0
             Map.Entry<ColumnIdentifier, AbstractType> lastEntry = stmt.columns.entrySet().iterator().next();
@@ -378,7 +390,7 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
         }
     }
 
-    return std::make_unique<prepared_statement>(stmt);
+    return std::make_unique<prepared_statement>(audit_info(), stmt);
 }
 
 data_type create_table_statement::raw_statement::get_type_and_remove(column_map_type& columns, ::shared_ptr<column_identifier> t)
@@ -501,6 +513,10 @@ std::optional<sstring> check_restricted_table_properties(
             event_t::target_type::TABLE,
             keyspace(),
             column_family());
+}
+
+audit::statement_category create_table_statement::raw_statement::category() const {
+    return audit::statement_category::DDL;
 }
 
 }

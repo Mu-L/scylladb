@@ -3,16 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "sstables/shared_sstable.hh"
 #include "db/timeout_clock.hh"
-#include "db_clock.hh"
 #include "utils/chunked_vector.hh"
 #include "schema/schema_fwd.hh"
+#include "gc_clock.hh"
 
 #include <seastar/core/sharded.hh>
 #include <seastar/core/metrics_registration.hh>

@@ -5,13 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <optional>
 #include <seastar/core/coroutine.hh>
 #include "raft_group0_client.hh"
-#include <boost/algorithm/string/join.hpp>
+#include "raft_group_registry.hh"
 
 #include "frozen_schema.hh"
 #include "schema_mutations.hh"
@@ -22,7 +22,10 @@
 #include "idl/group0_state_machine.dist.impl.hh"
 #include "service/raft/group0_state_machine.hh"
 #include "replica/database.hh"
+#include "utils/assert.hh"
 #include "utils/to_string.hh"
+#include "db/system_keyspace.hh"
+#include "replica/tablets.hh"
 
 
 namespace service {
@@ -116,7 +119,7 @@ struct group0_guard::impl {
     {}
 
     void release_read_apply_mutex() {
-        assert(_read_apply_mutex_holder.count() == 1);
+        SCYLLA_ASSERT(_read_apply_mutex_holder.count() == 1);
         _read_apply_mutex_holder.return_units(1);
     }
 };
@@ -155,7 +158,7 @@ semaphore& raft_group0_client::operation_mutex() {
     return _operation_mutex;
 }
 
-future<> raft_group0_client::add_entry(group0_command group0_cmd, group0_guard guard, seastar::abort_source* as,
+future<> raft_group0_client::add_entry(group0_command group0_cmd, group0_guard guard, seastar::abort_source& as,
         std::optional<raft_timeout> timeout)
 {
     if (this_shard_id() != 0) {
@@ -239,7 +242,7 @@ static utils::UUID generate_group0_state_id(utils::UUID prev_state_id) {
     return utils::UUID_gen::get_random_time_UUID_from_micros(std::chrono::microseconds{ts});
 }
 
-future<group0_guard> raft_group0_client::start_operation(seastar::abort_source* as, std::optional<raft_timeout> timeout) {
+future<group0_guard> raft_group0_client::start_operation(seastar::abort_source& as, std::optional<raft_timeout> timeout) {
     if (this_shard_id() != 0) {
         on_internal_error(logger, "start_group0_operation: must run on shard 0");
     }
@@ -251,12 +254,12 @@ future<group0_guard> raft_group0_client::start_operation(seastar::abort_source* 
     auto [upgrade_lock_holder, upgrade_state] = co_await get_group0_upgrade_state();
     switch (upgrade_state) {
         case group0_upgrade_state::use_post_raft_procedures: {
-            auto operation_holder = co_await get_units(_operation_mutex, 1);
-            co_await _raft_gr.group0_with_timeouts().read_barrier(as, timeout);
+            auto operation_holder = co_await get_units(_operation_mutex, 1, as);
+            co_await _raft_gr.group0_with_timeouts().read_barrier(&as, timeout);
 
             // Take `_group0_read_apply_mutex` *after* read barrier.
             // Read barrier may wait for `group0_state_machine::apply` which also takes this mutex.
-            auto read_apply_holder = co_await hold_read_apply_mutex();
+            auto read_apply_holder = co_await hold_read_apply_mutex(as);
 
             auto observed_group0_state_id = co_await _sys_ks.get_last_group0_state_id();
             auto new_group0_state_id = generate_group0_state_id(observed_group0_state_id);
@@ -297,9 +300,14 @@ future<group0_guard> raft_group0_client::start_operation(seastar::abort_source* 
     }
 }
 
+void raft_group0_client::validate_change(const topology_change& change) {
+    replica::validate_tablet_metadata_change(_token_metadata.get()->tablets(), change.mutations);
+}
+
 template<typename Command>
 requires std::same_as<Command, schema_change> || std::same_as<Command, topology_change> || std::same_as<Command, write_mutations> || std::same_as<Command, mixed_change>
 group0_command raft_group0_client::prepare_command(Command change, group0_guard& guard, std::string_view description) {
+    validate_change(change);
     group0_command group0_cmd {
         .change{std::move(change)},
         .history_append{db::system_keyspace::make_group0_history_state_id_mutation(
@@ -320,6 +328,7 @@ group0_command raft_group0_client::prepare_command(Command change, group0_guard&
 template<typename Command>
 requires std::same_as<Command, broadcast_table_query> || std::same_as<Command, write_mutations>
 group0_command raft_group0_client::prepare_command(Command change, std::string_view description) {
+    validate_change(change);
     const auto new_group0_state_id = generate_group0_state_id(utils::UUID{});
 
     group0_command group0_cmd {
@@ -337,8 +346,8 @@ group0_command raft_group0_client::prepare_command(Command change, std::string_v
     return group0_cmd;
 }
 
-raft_group0_client::raft_group0_client(service::raft_group_registry& raft_gr, db::system_keyspace& sys_ks, maintenance_mode_enabled maintenance_mode)
-        : _raft_gr(raft_gr), _sys_ks(sys_ks), _maintenance_mode(maintenance_mode) {
+raft_group0_client::raft_group0_client(service::raft_group_registry& raft_gr, db::system_keyspace& sys_ks, locator::shared_token_metadata& tm, maintenance_mode_enabled maintenance_mode)
+        : _raft_gr(raft_gr), _sys_ks(sys_ks), _token_metadata(tm), _maintenance_mode(maintenance_mode) {
 }
 
 size_t raft_group0_client::max_command_size() const {
@@ -433,14 +442,6 @@ future<> raft_group0_client::wait_until_group0_upgraded(abort_source& as) {
     }
 }
 
-future<semaphore_units<>> raft_group0_client::hold_read_apply_mutex() {
-    if (this_shard_id() != 0) {
-        on_internal_error(logger, "hold_read_apply_mutex: must run on shard 0");
-    }
-
-    return get_units(_read_apply_mutex, 1);
-}
-
 future<semaphore_units<>> raft_group0_client::hold_read_apply_mutex(abort_source& as) {
     if (this_shard_id() != 0) {
         on_internal_error(logger, "hold_read_apply_mutex: must run on shard 0");
@@ -504,6 +505,16 @@ template group0_command raft_group0_client::prepare_command(broadcast_table_quer
 template group0_command raft_group0_client::prepare_command(write_mutations change, std::string_view description);
 template group0_command raft_group0_client::prepare_command(mixed_change change, group0_guard& guard, std::string_view description);
 
+group0_batch::group0_batch(::service::group0_guard&& g)
+        : _guard(std::move(g)) {
+}
+
+group0_batch::group0_batch(std::optional<::service::group0_guard> g)
+        : _guard(std::move(g)) {
+}
+
+group0_batch::~group0_batch() = default;
+
 api::timestamp_type group0_batch::write_timestamp() const {
     if (!_guard) {
         on_internal_error(logger, "group0_batch: write_timestamp without guard taken");
@@ -546,7 +557,7 @@ static future<> add_write_mutations_entry(
         std::string_view description,
         std::vector<canonical_mutation> muts,
         ::service::group0_guard group0_guard,
-        seastar::abort_source* as,
+        seastar::abort_source& as,
         std::optional<::service::raft_timeout> timeout) {
     logger.trace("add_write_mutations_entry: {} mutations with description {}",
             muts.size(), description);
@@ -577,12 +588,12 @@ future<> group0_batch::commit(::service::raft_group0_client& group0_client, seas
     if (!_guard) {
         on_internal_error(logger, "group0_batch: trying to announce without guard");
     }
-    auto description = boost::algorithm::join(_descriptions, "; ");
+    auto description = fmt::to_string(fmt::join(_descriptions, "; "));
     // common case, don't bother with generators as we would have only 1-2 mutations,
     // when producer expects substantial number or size of mutations it should use generator
     if (_generators.size() == 0) {
         std::vector<canonical_mutation> cmuts = {_muts.begin(), _muts.end()};
-        co_return co_await add_write_mutations_entry(group0_client, description, std::move(cmuts), std::move(*_guard), &as, timeout);
+        co_return co_await add_write_mutations_entry(group0_client, description, std::move(cmuts), std::move(*_guard), as, timeout);
     }
     // raft doesn't support streaming so we need to materialize all mutations in memory
     co_await materialize_mutations();
@@ -591,7 +602,7 @@ future<> group0_batch::commit(::service::raft_group0_client& group0_client, seas
     }
     std::vector<canonical_mutation> cmuts = {_muts.begin(), _muts.end()};
     _muts.clear();
-    co_await add_write_mutations_entry(group0_client, description, std::move(cmuts), std::move(*_guard), &as, timeout);
+    co_await add_write_mutations_entry(group0_client, description, std::move(cmuts), std::move(*_guard), as, timeout);
 }
 
 future<std::pair<std::vector<mutation>, ::service::group0_guard>> group0_batch::extract() && {

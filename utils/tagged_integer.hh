@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -35,7 +35,6 @@ public:
     }
 
     value_type value() const noexcept { return _value; }
-    operator value_type() const noexcept { return _value; }
 
     explicit operator bool() const { return _value != 0; }
 

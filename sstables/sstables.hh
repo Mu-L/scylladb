@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -36,6 +36,8 @@
 #include "sstables/shareable_components.hh"
 #include "sstables/storage.hh"
 #include "sstables/generation_type.hh"
+#include "sstables/types.hh"
+#include "sstables/checksummed_data_source.hh"
 #include "mutation/mutation_fragment_stream_validator.hh"
 #include "readers/mutation_reader_fwd.hh"
 #include "readers/mutation_reader.hh"
@@ -58,8 +60,6 @@ class large_data_handler;
 
 namespace sstables {
 
-class random_access_reader;
-
 class sstable_directory;
 extern thread_local utils::updateable_value<bool> global_cache_index_pages;
 
@@ -70,11 +70,8 @@ class writer;
 namespace fs = std::filesystem;
 
 extern logging::logger sstlog;
-class key;
 class sstable_writer;
-class sstable_writer_v2;
 class sstables_manager;
-class metadata_collector;
 
 struct foreign_sstable_open_info;
 
@@ -97,7 +94,6 @@ class data_consume_context;
 
 class index_reader;
 class partition_index_cache;
-class sstables_manager;
 
 extern size_t summary_byte_cost(double summary_ratio);
 
@@ -113,6 +109,7 @@ struct sstable_writer_config {
     run_id run_identifier = run_id::create_random_id();
     size_t summary_byte_cost;
     sstring origin;
+    bool correct_pi_block_width = true;
 
 private:
     explicit sstable_writer_config() {}
@@ -162,7 +159,7 @@ inline sstable_state state_from_dir(std::string_view dir) {
         return sstable_state::upload;
     }
 
-    throw std::runtime_error(format("Unknown sstable state dir {}", dir));
+    throw std::runtime_error(seastar::format("Unknown sstable state dir {}", dir));
 }
 
 // FIXME -- temporary, move to fs storage after patching the rest
@@ -192,7 +189,6 @@ public:
     using manager_set_link_type = bi::set_member_hook<bi::link_mode<bi::auto_unlink>>;
 public:
     sstable(schema_ptr schema,
-            sstring table_dir,
             const data_dictionary::storage_options& storage,
             generation_type generation,
             sstable_state state,
@@ -271,25 +267,25 @@ public:
     // Returns a mutation_reader for given range of partitions.
     //
     // Precondition: if the slice is reversed, the schema must be reversed as well.
-    // Reversed slices must be provided in the 'half-reversed' format (the order of ranges
-    // being reversed, but the ranges themselves are not).
     mutation_reader make_reader(
-            schema_ptr schema,
+            schema_ptr query_schema,
             reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
             tracing::trace_state_ptr trace_state = {},
             streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
             mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes,
-            read_monitor& monitor = default_read_monitor());
+            read_monitor& monitor = default_read_monitor(),
+            integrity_check integrity = integrity_check::no);
 
     // A reader which doesn't use the index at all. It reads everything from the
     // sstable and it doesn't support skipping.
-    mutation_reader make_crawling_reader(
+    mutation_reader make_full_scan_reader(
             schema_ptr schema,
             reader_permit permit,
             tracing::trace_state_ptr trace_state = {},
-            read_monitor& monitor = default_read_monitor());
+            read_monitor& monitor = default_read_monitor(),
+            integrity_check integrity = integrity_check::no);
 
     // Returns mutation_source containing all writes contained in this sstable.
     // The mutation_source shares ownership of this sstable.
@@ -514,6 +510,10 @@ public:
 private:
     sstring filename(component_type f) const {
         auto dir = _storage->prefix();
+        return filename(f, std::move(dir));
+    }
+
+    sstring filename(component_type f, sstring dir) const {
         return filename(dir, _schema->ks_name(), _schema->cf_name(), _version, _generation, _format, f);
     }
 
@@ -596,6 +596,8 @@ private:
     // information in their scylla metadata.
     std::optional<scylla_metadata::large_data_stats> _large_data_stats;
     sstring _origin;
+    std::optional<scylla_metadata::ext_timestamp_stats> _ext_timestamp_stats;
+    optimized_optional<sstable_id> _sstable_identifier;
 
     // Total reclaimable memory from all the components of the SSTable.
     // It is initialized to 0 to prevent the sstables manager from reclaiming memory
@@ -638,7 +640,7 @@ private:
             open_flags oflags = open_flags::wo | open_flags::create | open_flags::exclusive) noexcept;
 
     void generate_toc();
-    void open_sstable();
+    void open_sstable(const sstring& origin);
 
     future<> read_compression();
     void write_compression();
@@ -649,7 +651,7 @@ private:
                                sstable_enabled_features features,
                                run_identifier identifier,
                                std::optional<scylla_metadata::large_data_stats> ld_stats,
-                               sstring origin);
+                               std::optional<scylla_metadata::ext_timestamp_stats> ts_stats);
 
     future<> read_filter(sstable_open_config cfg = {});
 
@@ -658,7 +660,7 @@ private:
     // partitions, if the partition estimate provided during bloom
     // filter initialisation was not good.
     // This should be called only before an sstable is sealed.
-    void maybe_rebuild_filter_from_index(uint64_t num_partitions, sstring origin);
+    void maybe_rebuild_filter_from_index(uint64_t num_partitions);
 
     future<> read_summary() noexcept;
 
@@ -708,6 +710,8 @@ private:
     size_t total_memory_reclaimed() const;
     // Reload components from which memory was previously reclaimed
     future<> reload_reclaimed_components();
+    // Disable reload of components for this sstable
+    void disable_component_memory_reload();
 
 public:
     // Finds first position_in_partition in a given partition.
@@ -727,9 +731,19 @@ public:
     //
     // When created with `raw_stream::yes`, the sstable data file will be
     // streamed as-is, without decompressing (if compressed).
+    //
+    // When created with `integrity_check::yes`, the integrity mechanisms
+    // of the underlying data streams will be enabled.
+    //
+    // The `error_handler` parameter allows to customize the error handling
+    // logic when a checksum or digest mismatch is detected on an
+    // integrity-checked stream with no compression. The parameter is ignored
+    // if integrity checking is disabled or the SSTable is compressed.
     using raw_stream = bool_class<class raw_stream_tag>;
     input_stream<char> data_stream(uint64_t pos, size_t len,
-            reader_permit permit, tracing::trace_state_ptr trace_state, lw_shared_ptr<file_input_stream_history> history, raw_stream raw = raw_stream::no);
+            reader_permit permit, tracing::trace_state_ptr trace_state, lw_shared_ptr<file_input_stream_history> history,
+            raw_stream raw = raw_stream::no, integrity_check integrity = integrity_check::no,
+            integrity_error_handler error_handler = throwing_integrity_error_handler);
 
     // Read exactly the specific byte range from the data file (after
     // uncompression, if the file is compressed). This can be used to read
@@ -768,6 +782,10 @@ private:
     void write_toc(file_writer w);
 public:
     future<> read_toc() noexcept;
+
+    shareable_components& get_shared_components() const {
+        return *_components;
+    }
 
     schema_ptr get_schema() const {
         return _schema;
@@ -894,6 +912,19 @@ public:
             const schema& s, const serialization_header& h, const sstable_enabled_features& f) {
         return _column_translation.get_for_schema(s, h, f);
     }
+    column_translation get_column_translation(const schema& s) {
+        if (get_version() >= sstable_version_types::mc) [[likely]] {
+            return _column_translation.get_for_schema(s, get_serialization_header(), features());
+        } else {
+            return _column_translation.get_for_schema(s);
+        }
+    }
+    column_translation get_column_translation() {
+        if (!_column_translation.version()) {
+            return get_column_translation(*_schema);
+        }
+        return _column_translation;
+    }
     const std::vector<unsigned>& get_shards_for_this_sstable() const {
         return _shards;
     }
@@ -923,6 +954,14 @@ public:
 
     const summary& get_summary() const {
         return _components->summary;
+    }
+
+    const lw_shared_ptr<const checksum> get_checksum() const {
+        return _components->checksum ? _components->checksum->shared_from_this() : nullptr;
+    }
+
+    std::optional<uint32_t> get_digest() const {
+        return _components->digest;
     }
 
     // Gets ratio of droppable tombstone. A tombstone is considered droppable here
@@ -957,8 +996,17 @@ public:
     // the map.  Otherwise, return a disengaged optional.
     std::optional<large_data_stats_entry> get_large_data_stat(large_data_type t) const noexcept;
 
+    // Return the extended timestamp statistics map.
+    // Some or all entries may be missing if not present in scylla_metadata
+    scylla_metadata::ext_timestamp_stats::map_type get_ext_timestamp_stats() const noexcept;
+
     const sstring& get_origin() const noexcept {
         return _origin;
+    }
+
+    // sstable_id is null iff not present in scylla_metadata
+    const optimized_optional<sstable_id>& sstable_identifier() const noexcept {
+        return _sstable_identifier;
     }
 
     // Drops all evictable in-memory caches of on-disk content.
@@ -989,19 +1037,19 @@ public:
     friend class sstables_manager;
     template <typename DataConsumeRowsContext>
     friend std::unique_ptr<DataConsumeRowsContext>
-    data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, disk_read_range, uint64_t);
+    data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, disk_read_range, uint64_t, integrity_check);
     template <typename DataConsumeRowsContext>
     friend std::unique_ptr<DataConsumeRowsContext>
-    data_consume_single_partition(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, disk_read_range);
+    data_consume_single_partition(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, disk_read_range, integrity_check);
     template <typename DataConsumeRowsContext>
     friend std::unique_ptr<DataConsumeRowsContext>
-    data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&);
+    data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, integrity_check);
     friend void lw_shared_ptr_deleter<sstables::sstable>::dispose(sstable* s);
     gc_clock::time_point get_gc_before_for_drop_estimation(const gc_clock::time_point& compaction_time, const tombstone_gc_state& gc_state, const schema_ptr& s) const;
     gc_clock::time_point get_gc_before_for_fully_expire(const gc_clock::time_point& compaction_time, const tombstone_gc_state& gc_state, const schema_ptr& s) const;
 
-    future<uint32_t> read_digest();
-    future<checksum> read_checksum();
+    future<std::optional<uint32_t>> read_digest();
+    future<lw_shared_ptr<checksum>> read_checksum();
 };
 
 // Validate checksums
@@ -1025,9 +1073,21 @@ public:
 // This method validates both the full checksum and the per-chunk checksum
 // for the entire Data.db.
 //
-// Returns true if all checksums are valid.
+// Returns `valid` if all checksums are valid.
+// Returns `invalid` if at least one checksum is invalid.
+// Returns `no_checksum` if the sstable is uncompressed and does not have
+// a CRC component (CRC.db is missing from TOC.txt).
 // Validation errors are logged individually.
-future<bool> validate_checksums(shared_sstable sst, reader_permit permit);
+enum class validate_checksums_status {
+    invalid = 0,
+    valid = 1,
+    no_checksum = 2
+};
+struct validate_checksums_result {
+    validate_checksums_status status;
+    bool has_digest;
+};
+future<validate_checksums_result> validate_checksums(shared_sstable sst, reader_permit permit);
 
 struct index_sampling_state {
     static constexpr size_t default_summary_byte_cost = 2000;

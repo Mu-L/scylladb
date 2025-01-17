@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -62,7 +62,7 @@ public:
      *
      *   [] (const token& t) {
      *      auto shards = shard_for_writes();
-     *      assert(shards.size() <= 1);
+     *      SCYLLA_ASSERT(shards.size() <= 1);
      *      return shards.empty() ? 0 : shards[0];
      *   }
      *

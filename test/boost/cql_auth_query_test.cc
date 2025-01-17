@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <string_view>
@@ -14,7 +14,9 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/util/defer.hh>
-#include "test/lib/scylla_test_case.hh"
+
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include "test/lib/test_utils.hh"
 
 #include "auth/authenticated_user.hh"
@@ -26,6 +28,8 @@
 #include "service/client_state.hh"
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
+
+BOOST_AUTO_TEST_SUITE(cql_auth_query_test)
 
 static const auto alice = std::string_view("alice");
 static const auto bob = std::string_view("bob");
@@ -47,7 +51,7 @@ static shared_ptr<db::config> db_config_with_auth() {
 //
 
 static void create_user_if_not_exists(cql_test_env& env, std::string_view user_name) {
-    env.execute_cql(format("CREATE USER IF NOT EXISTS {} WITH PASSWORD '{}'", user_name, user_name)).get();
+    env.execute_cql(seastar::format("CREATE USER IF NOT EXISTS {} WITH PASSWORD '{}'", user_name, user_name)).get();
 }
 
 // Invoke `f` as though the user indicated with `user_name` had logged in. The current logged in user is restored after
@@ -339,3 +343,5 @@ SEASTAR_TEST_CASE(modify_table_with_index) {
                 {{int32_type->decompose(14)}});
     }, db_config_with_auth());
 }
+
+BOOST_AUTO_TEST_SUITE_END()

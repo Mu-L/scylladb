@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <unordered_map>
 #include "unimplemented.hh"
 #include <seastar/core/sstring.hh>
 #include <seastar/core/enum.hh>
-#include "log.hh"
+#include "utils/log.hh"
 #include "seastarx.hh"
 
 namespace unimplemented {

@@ -5,15 +5,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include "schema/schema.hh"
 #include "query-request.hh"
 #include "mutation/mutation_fragment.hh"
 #include "mutation/mutation_fragment_v2.hh"
+
+#include <boost/range/iterator_range.hpp>
 
 // Utility for in-order checking of overlap with position ranges.
 class clustering_ranges_walker {
@@ -249,7 +252,7 @@ public:
             auto range_end = position_in_partition_view::for_range_end(rng);
             if (!less(rt.position(), range_start) && !less(range_end, rt.end_position())) {
                 // Fully enclosed by this range.
-                assert(!first);
+                SCYLLA_ASSERT(!first);
                 return std::move(rt);
             }
             auto this_range_rt = rt;

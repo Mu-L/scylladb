@@ -4,7 +4,7 @@
 # Copyright (C) 2015-present ScyllaDB
 #
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 import argparse
 import asyncio
@@ -23,12 +23,15 @@ import resource
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
 import traceback
 import xml.etree.ElementTree as ET
 import yaml
+from random import randint
+from tempfile import TemporaryDirectory
 
 from abc import ABC, abstractmethod
 from io import StringIO
@@ -36,6 +39,9 @@ from scripts import coverage    # type: ignore
 from test.pylib.artifact_registry import ArtifactRegistry
 from test.pylib.host_registry import HostRegistry
 from test.pylib.pool import Pool
+from test.pylib.s3_proxy import S3ProxyServer
+from test.pylib.s3_server_mock import MockS3Server
+from test.pylib.resource_gather import setup_cgroup, run_resource_watcher, get_resource_gather
 from test.pylib.util import LogPrefixAdapter
 from test.pylib.scylla_cluster import ScyllaServer, ScyllaCluster, get_cluster_manager, merge_cmdline_options
 from test.pylib.minio_server import MinioServer
@@ -54,7 +60,74 @@ all_modes = {'debug': 'Debug',
              'dev': 'Dev',
              'sanitize': 'Sanitize',
              'coverage': 'Coverage'}
-debug_modes = set(['debug', 'sanitize'])
+debug_modes = {'debug', 'sanitize'}
+
+LDAP_SERVER_CONFIGURATION_FILE = os.path.join(os.path.dirname(__file__), 'test', 'resource', 'slapd.conf')
+
+DEFAULT_ENTRIES = [
+    """dn: dc=example,dc=com
+objectClass: dcObject
+objectClass: organization
+dc: example
+o: Example
+description: Example directory.
+""",
+    """dn: cn=root,dc=example,dc=com
+objectClass: organizationalRole
+cn: root
+description: Directory manager.
+""",
+    """dn: ou=People,dc=example,dc=com
+objectClass: organizationalUnit
+ou: People
+description: Our people.
+""",
+    """# Default superuser for Scylla
+dn: uid=cassandra,ou=People,dc=example,dc=com
+objectClass: organizationalPerson
+objectClass: uidObject
+cn: cassandra
+ou: People
+sn: cassandra
+userid: cassandra
+userPassword: cassandra
+""",
+    """dn: uid=jsmith,ou=People,dc=example,dc=com
+objectClass: organizationalPerson
+objectClass: uidObject
+cn: Joe Smith
+ou: People
+sn: Smith
+userid: jsmith
+userPassword: joeisgreat
+""",
+    """dn: uid=jdoe,ou=People,dc=example,dc=com
+objectClass: organizationalPerson
+objectClass: uidObject
+cn: John Doe
+ou: People
+sn: Doe
+userid: jdoe
+userPassword: pa55w0rd
+""",
+    """dn: cn=role1,dc=example,dc=com
+objectClass: groupOfUniqueNames
+cn: role1
+uniqueMember: uid=jsmith,ou=People,dc=example,dc=com
+uniqueMember: uid=cassandra,ou=People,dc=example,dc=com
+""",
+    """dn: cn=role2,dc=example,dc=com
+objectClass: groupOfUniqueNames
+cn: role2
+uniqueMember: uid=cassandra,ou=People,dc=example,dc=com
+""",
+    """dn: cn=role3,dc=example,dc=com
+objectClass: groupOfUniqueNames
+cn: role3
+uniqueMember: uid=jdoe,ou=People,dc=example,dc=com
+""",
+]
+
 
 def create_formatter(*decorators) -> Callable[[Any], str]:
     """Return a function which decorates its argument with the given
@@ -90,14 +163,8 @@ def path_to(mode, *components):
     build_dir = 'build'
     if os.path.exists(os.path.join(build_dir, 'build.ninja')):
         *dir_components, basename = components
-        exe_path = os.path.join(build_dir, *dir_components, all_modes[mode], basename)
-    else:
-        exe_path = os.path.join(build_dir, mode, *components)
-    if not os.access(exe_path, os.F_OK):
-        raise FileNotFoundError(f"{exe_path} does not exist.")
-    elif not os.access(exe_path, os.X_OK):
-        raise PermissionError(f"{exe_path} is not executable.")
-    return exe_path
+        return os.path.join(build_dir, *dir_components, all_modes[mode], basename)
+    return os.path.join(build_dir, mode, *components)
 
 
 def ninja(target):
@@ -218,8 +285,8 @@ class TestSuite(ABC):
 
     @staticmethod
     def all_tests() -> Iterable['Test']:
-        return itertools.chain(*[suite.tests for suite in
-                                 TestSuite.suites.values()])
+        return itertools.chain(*(suite.tests for suite in
+                                 TestSuite.suites.values()))
 
     @property
     @abstractmethod
@@ -232,6 +299,7 @@ class TestSuite(ABC):
 
     async def run(self, test: 'Test', options: argparse.Namespace):
         try:
+            test.started = True
             for i in range(1, self.FLAKY_RETRIES):
                 if i > 1:
                     test.is_flaky_failure = True
@@ -240,9 +308,12 @@ class TestSuite(ABC):
                 await test.run(options)
                 if test.success or not test.is_flaky or test.is_cancelled:
                     break
+        except asyncio.CancelledError:
+            test.is_cancelled = True
+            raise
         finally:
             self.pending_test_count -= 1
-            self.n_failed += int(not test.success)
+            self.n_failed += int(test.failed)
             if self.pending_test_count == 0:
                 await TestSuite.artifacts.cleanup_after_suite(self, self.n_failed > 0)
         return test
@@ -346,6 +417,12 @@ class UnitTestSuite(TestSuite):
 
     @property
     def pattern(self) -> str:
+        # This should only match individual tests and not combined_tests.cc
+        # file of the combined test.
+        # It is because combined_tests.cc itself does not contain any tests.
+        # To keep the code simple, we have avoided this by renaming
+        # combined test file to “_tests.cc” instead of changing the match
+        # pattern.
         return "*_test.cc"
 
 
@@ -356,11 +433,49 @@ class BoostTestSuite(UnitTestSuite):
     # --list_content. Static to share across all modes.
     _case_cache: Dict[str, List[str]] = dict()
 
+    _exec_name_cache: Dict[str, str] = dict()
+
+    def _generate_cache(self, exec_path, exec_name) -> None:
+        res = subprocess.run(
+                [exec_path, '--list_content'],
+                check=True,
+                capture_output=True,
+                env=dict(os.environ,
+                         **{"ASAN_OPTIONS": "halt_on_error=0"}),
+            )
+        testname = None
+        fqname = None
+        for line in res.stderr.decode().splitlines():
+            if not line.startswith('    '):
+                testname = line.strip().rstrip('*')
+                fqname = os.path.join(self.mode, self.name, testname)
+                self._exec_name_cache[fqname] = exec_name
+                self._case_cache[fqname] = []
+            else:
+                casename = line.strip().rstrip('*')
+                if casename.startswith('_'):
+                    continue
+                self._case_cache[fqname].append(casename)
+
     def __init__(self, path, cfg: dict, options: argparse.Namespace, mode) -> None:
         super().__init__(path, cfg, options, mode)
+        exec_name = 'combined_tests'
+        exec_path = path_to(self.mode, "test", self.name, exec_name)
+        # Apply combined test only for test/boost,
+        # cache the tests only if the executable exists, so we can
+        # run test.py with a partially built tree
+        if self.name == 'boost' and os.path.exists(exec_path):
+            self._generate_cache(exec_path, exec_name)
 
     async def create_test(self, shortname: str, casename: str, suite, args) -> None:
-        exe = path_to(suite.mode, "test", suite.name, shortname)
+        fqname = os.path.join(self.mode, self.name, shortname)
+        if fqname in self._exec_name_cache:
+            execname = self._exec_name_cache[fqname]
+            combined_test = True
+        else:
+            execname = None
+            combined_test = False
+        exe = path_to(suite.mode, "test", suite.name, execname if combined_test else shortname)
         if not os.access(exe, os.X_OK):
             print(palette.warn(f"Boost test executable {exe} not found."))
             return
@@ -368,6 +483,8 @@ class BoostTestSuite(UnitTestSuite):
         allows_compaction_groups = self.all_can_run_compaction_groups_except != None and shortname not in self.all_can_run_compaction_groups_except
         if options.parallel_cases and (shortname not in self.no_parallel_cases) and casename is None:
             fqname = os.path.join(self.mode, self.name, shortname)
+            # since combined tests are preloaded to self._case_cache, this will
+            # only run in non-combined test mode
             if fqname not in self._case_cache:
                 process = await asyncio.create_subprocess_exec(
                     exe, *['--list_content'],
@@ -378,21 +495,49 @@ class BoostTestSuite(UnitTestSuite):
                     preexec_fn=os.setsid,
                 )
                 _, stderr = await asyncio.wait_for(process.communicate(), options.timeout)
-
-                case_list = [case[:-1] for case in stderr.decode().splitlines() if case.endswith('*')]
+                # --list_content produces the list of all test cases in the file. When BOOST_DATA_TEST_CASE is used it
+                # will additionally produce the lines with numbers for each case preserving the function name like this:
+                # test_singular_tree_ptr_sz*
+                #     _0*
+                #     _1*
+                #     _2*
+                # however, it's only possible to run test_singular_tree_ptr_sz that will execute all test cases
+                # this line catches only test function name ignoring unrelated lines like '_0'
+                # Note: this will ignore any test case starting with a '_' symbol
+                case_list = [case[:-1] for case in stderr.decode().splitlines() if case.endswith('*') and not case.strip().startswith('_')]
                 self._case_cache[fqname] = case_list
 
             case_list = self._case_cache[fqname]
             if len(case_list) == 1:
-                test = BoostTest(self.next_id((shortname, self.suite_key)), shortname, suite, args, None, allows_compaction_groups)
+                test = BoostTest(self.next_id((shortname, self.suite_key)), shortname, suite, args, None, allows_compaction_groups, execname)
                 self.tests.append(test)
             else:
                 for case in case_list:
-                    test = BoostTest(self.next_id((shortname, self.suite_key, case)), shortname, suite, args, case, allows_compaction_groups)
+                    test = BoostTest(self.next_id((shortname, self.suite_key, case)), shortname, suite, args, case, allows_compaction_groups, execname)
                     self.tests.append(test)
         else:
-            test = BoostTest(self.next_id((shortname, self.suite_key)), shortname, suite, args, casename, allows_compaction_groups)
+            test = BoostTest(self.next_id((shortname, self.suite_key)), shortname, suite, args, casename, allows_compaction_groups, execname)
             self.tests.append(test)
+
+    async def add_test(self, shortname, casename) -> None:
+        """Create a UnitTest class with possibly custom command line
+        arguments and add it to the list of tests"""
+        fqname = os.path.join(self.mode, self.name, shortname)
+        if fqname in self._exec_name_cache:
+            execname = self._exec_name_cache[fqname]
+            combined_test = True
+        else:
+            combined_test = False
+        # Skip tests which are not configured, and hence are not built
+        if os.path.join("test", self.name, execname if combined_test else shortname) not in self.options.tests:
+                return
+
+        # Default seastar arguments, if not provided in custom test options,
+        # are two cores and 2G of RAM
+        args = self.custom_args.get(shortname, ["-c2 -m2G"])
+        args = merge_cmdline_options(args, self.options.extra_scylla_cmdline_options)
+        for a in args:
+            await self.create_test(shortname, casename, self, a)
 
     def junit_tests(self) -> Iterable['Test']:
         """Boost tests produce an own XML output, so are not included in a junit report"""
@@ -400,6 +545,19 @@ class BoostTestSuite(UnitTestSuite):
 
     def boost_tests(self) -> Iterable['Tests']:
         return self.tests
+
+
+class LdapTestSuite(UnitTestSuite):
+    """TestSuite for ldap unit tests"""
+
+    async def create_test(self, shortname, casename, suite, args):
+        test = LdapTest(self.next_id((shortname, self.suite_key)), shortname, suite, args)
+        self.tests.append(test)
+
+    def junit_tests(self):
+        """Ldap tests produce an own XML output, so are not included in a junit report"""
+        return []
+
 
 class PythonTestSuite(TestSuite):
     """A collection of Python pytests against a single Scylla instance"""
@@ -414,7 +572,13 @@ class PythonTestSuite(TestSuite):
 
         cluster_cfg = self.cfg.get("cluster", {"initial_size": 1})
         cluster_size = cluster_cfg["initial_size"]
-        pool_size = cfg.get("pool_size", 2)
+        env_pool_size = os.getenv("CLUSTER_POOL_SIZE")
+        if options.cluster_pool_size is not None:
+            pool_size = options.cluster_pool_size
+        elif env_pool_size is not None:
+            pool_size = int(env_pool_size)
+        else:
+            pool_size = cfg.get("pool_size", 2)
         self.dirties_cluster = set(cfg.get("dirties_cluster", []))
 
         self.create_cluster = self.get_cluster_factory(cluster_size, options)
@@ -462,7 +626,8 @@ class PythonTestSuite(TestSuite):
                 cmdline_options=cmdline_options,
                 config_options=config_options,
                 property_file=create_cfg.property_file,
-                append_env=self.base_env)
+                append_env=self.base_env,
+                server_encryption=create_cfg.server_encryption)
 
             return server
 
@@ -501,6 +666,13 @@ class PythonTestSuite(TestSuite):
     async def add_test(self, shortname, casename) -> None:
         test = PythonTest(self.next_id((shortname, self.suite_key)), shortname, casename, self)
         self.tests.append(test)
+
+    async def run(self, test: 'Test', options: argparse.Namespace):
+        if not os.access(self.scylla_exe, os.F_OK):
+            raise FileNotFoundError(f"{self.scylla_exe} does not exist.")
+        if not os.access(self.scylla_exe, os.X_OK):
+            raise PermissionError(f"{self.scylla_exe} is not executable.")
+        return await super().run(test, options)
 
 
 class CQLApprovalTestSuite(PythonTestSuite):
@@ -600,6 +772,8 @@ class Test:
         self.id = test_no
         self.path = ""
         self.args: List[str] = []
+        # Arguments which are required by a program regardless of additional test specific arguments
+        self.core_args : List[str] = []
         self.valid_exit_codes = [0]
         # Name with test suite name
         self.name = os.path.join(suite.name, shortname.split('.')[0])
@@ -607,6 +781,7 @@ class Test:
         self.shortname = shortname
         self.mode = suite.mode
         self.suite = suite
+        self.allure_dir = pathlib.Path(suite.options.tmpdir) / self.mode / 'allure'
         # Unique file name, which is also readable by human, as filename prefix
         self.uname = "{}.{}.{}".format(self.suite.name, self.shortname, self.id)
         self.log_filename = pathlib.Path(suite.options.tmpdir) / self.mode / (self.uname + ".log")
@@ -618,20 +793,26 @@ class Test:
         # shouldn't be retried, even if it is flaky
         self.is_cancelled = False
         self.env = dict(self.suite.base_env)
-        Test._reset(self)
-
-    def reset(self) -> None:
-        """Reset this object, including all derived state."""
-        for cls in reversed(self.__class__.__mro__):
-            _reset = getattr(cls, '_reset', None)
-            if _reset is not None:
-                _reset(self)
-
-    def _reset(self) -> None:
-        """Reset the test before a retry, if it is retried as flaky"""
+        self.started = False
         self.success = False
         self.time_start: float = 0
         self.time_end: float = 0
+
+    def reset(self) -> None:
+        """Reset the test before a retry, if it is retried as flaky"""
+        self.success = False
+        self.time_start = 0
+        self.time_end = 0
+
+    @property
+    def failed(self):
+        """Returns True, if this test Failed"""
+        return self.started and not self.success and not self.is_cancelled
+
+    @property
+    def did_not_run(self):
+        """Returns True, if this test did not run correctly, i.e. was canceled either during or before execution"""
+        return not self.started or self.is_cancelled
 
     @abstractmethod
     async def run(self, options: argparse.Namespace) -> 'Test':
@@ -640,6 +821,16 @@ class Test:
     @abstractmethod
     def print_summary(self) -> None:
         pass
+
+    async def setup(self, port, options):
+        """
+        Performs any necessary setup steps before running a test.
+        Returns (fn, txt, test_env) where:
+        fn  - is a cleanup function to call unconditionally after the test stops running
+        txt - is failure-injection description.
+        test_env - is a dictionary containing environment variables map specific for the test
+        """
+        return (lambda: 0, None,{})
 
     def check_log(self, trim: bool) -> None:
         """Check and trim logs and xml output for tests which have it"""
@@ -672,12 +863,6 @@ class UnitTest(Test):
         if self.mode == "coverage":
             self.env.update(coverage.env(self.path))
 
-        UnitTest._reset(self)
-
-    def _reset(self) -> None:
-        """Reset the test before a retry, if it is retried as flaky"""
-        pass
-
     def print_summary(self) -> None:
         print("Output of {} {}:".format(self.path, " ".join(self.args)))
         print(read_log(self.log_filename))
@@ -690,16 +875,38 @@ class UnitTest(Test):
 
 TestPath = collections.namedtuple('TestPath', ['suite_name', 'test_name', 'case_name'])
 
-class BoostTest(UnitTest):
+class BoostTest(Test):
     """A unit test which can produce its own XML output"""
 
+    standard_args = shlex.split("--overprovisioned --unsafe-bypass-fsync 1 "
+                                "--kernel-page-cache 1 "
+                                "--blocked-reactor-notify-ms 2000000 --collectd 0 "
+                                "--max-networking-io-control-blocks=100 ")
+
     def __init__(self, test_no: int, shortname: str, suite, args: str,
-                 casename: Optional[str], allows_compaction_groups : bool) -> None:
+                 casename: Optional[str], allows_compaction_groups : bool, execname: Optional[str]) -> None:
         boost_args = []
+        combined_test = True if execname else False
+        _shortname = shortname
         if casename:
             shortname += '.' + casename
-            boost_args += ['--run_test=' + casename]
-        super().__init__(test_no, shortname, suite, args)
+            if combined_test:
+                boost_args += ['--run_test=' + _shortname + '/' + casename]
+            else:
+                boost_args += ['--run_test=' + casename]
+        else:
+            if combined_test:
+                boost_args += ['--run_test=' + _shortname]
+
+        super().__init__(test_no, shortname, suite)
+        if combined_test:
+            self.path = path_to(self.mode, "test", suite.name, execname)
+        else:
+            self.path = path_to(self.mode, "test", suite.name, shortname.split('.')[0])
+        self.args = shlex.split(args) + UnitTest.standard_args
+        if self.mode == "coverage":
+            self.env.update(coverage.env(self.path))
+
         self.xmlout = os.path.join(suite.options.tmpdir, self.mode, "xml", self.uname + ".xunit.xml")
         boost_args += ['--report_level=no',
                        '--logger=HRF,test_suite:XML,test_suite,' + self.xmlout]
@@ -708,12 +915,12 @@ class BoostTest(UnitTest):
         boost_args += ['--']
         self.args = boost_args + self.args
         self.casename = casename
-        BoostTest._reset(self)
         self.__test_case_elements: list[ET.Element] = []
         self.allows_compaction_groups = allows_compaction_groups
 
-    def _reset(self) -> None:
+    def reset(self) -> None:
         """Reset the test before a retry, if it is retried as flaky"""
+        super().reset()
         self.__test_case_elements = []
 
     def get_test_cases(self) -> list[ET.Element]:
@@ -760,11 +967,124 @@ class BoostTest(UnitTest):
             self.args += ['--random-seed', options.random_seed]
         if self.allows_compaction_groups and options.x_log2_compaction_groups:
             self.args += [ "--x-log2-compaction-groups", str(options.x_log2_compaction_groups) ]
-        return await super().run(options)
+        self.success = await run_test(self, options, env=self.env)
+        logging.info("Test %s %s", self.uname, "succeeded" if self.success else "failed ")
+        return self
 
     def write_junit_failure_report(self, xml_res: ET.Element) -> None:
         """Does not write junit report for Jenkins legacy reasons"""
         assert False
+
+    def print_summary(self) -> None:
+        print("Output of {} {}:".format(self.path, " ".join(self.args)))
+        print(read_log(self.log_filename))
+
+
+def can_connect(address, family=socket.AF_INET):
+    s = socket.socket(family)
+    try:
+        s.connect(address)
+        return True
+    except OSError as e:
+        if 'AF_UNIX path too long' in str(e):
+            raise OSError(e.errno, "{} ({})".format(str(e), address)) from None
+        else:
+            return False
+    except:
+        return False
+
+
+def try_something_backoff(something):
+    sleep_time = 0.05
+    while not something():
+        if sleep_time > 30:
+            return False
+        time.sleep(sleep_time)
+        sleep_time *= 2
+    return True
+
+def make_saslauthd_conf(port, instance_path):
+    """Creates saslauthd.conf with appropriate contents under instance_path.  Returns the path to the new file."""
+    saslauthd_conf_path = os.path.join(instance_path, 'saslauthd.conf')
+    with open(saslauthd_conf_path, 'w') as f:
+        f.write('ldap_servers: ldap://localhost:{}\nldap_search_base: dc=example,dc=com'.format(port))
+    return saslauthd_conf_path
+
+
+class LdapTest(BoostTest):
+    """A unit test which can produce its own XML output, and needs an ldap server"""
+
+    def __init__(self, test_no, shortname, args, suite):
+        super().__init__(test_no, shortname, args, suite, None, False, None)
+
+    async def setup(self, port, options):
+        instances_root = os.path.join(options.tmpdir, self.mode, 'ldap_instances');
+        instance_path = os.path.join(os.path.abspath(instances_root), str(port))
+        slapd_pid_file = os.path.join(instance_path, 'slapd.pid')
+        saslauthd_socket_path = TemporaryDirectory()
+        os.makedirs(instance_path, exist_ok=True)
+        # This will always fail because it lacks the permissions to read the default slapd data
+        # folder but it does create the instance folder so we don't want to fail here.
+        try:
+            subprocess.check_output(['slaptest', '-f', LDAP_SERVER_CONFIGURATION_FILE, '-F', instance_path],
+                                    stderr=subprocess.DEVNULL)
+        except:
+            pass
+        # Set up failure injection.
+        proxy_name = 'p{}'.format(port)
+        subprocess.check_output([
+            'toxiproxy-cli', 'c', proxy_name,
+            '--listen', 'localhost:{}'.format(port + 2), '--upstream', 'localhost:{}'.format(port)])
+        # Sever the connection after byte_limit bytes have passed through:
+        byte_limit = options.byte_limit if options.byte_limit else randint(0, 2000)
+        subprocess.check_output(['toxiproxy-cli', 't', 'a', proxy_name, '-t', 'limit_data', '-n', 'limiter',
+                                 '-a', 'bytes={}'.format(byte_limit)])
+        # Change the data folder in the default config.
+        replace_expression = 's/olcDbDirectory:.*/olcDbDirectory: {}/g'.format(
+            os.path.abspath(instance_path).replace('/', r'\/'))
+        subprocess.check_output(
+            ['find', instance_path, '-type', 'f', '-exec', 'sed', '-i', replace_expression, '{}', ';'])
+        # Change the pid file to be kept with the instance.
+        replace_expression = 's/olcPidFile:.*/olcPidFile: {}/g'.format(
+            os.path.abspath(slapd_pid_file).replace('/', r'\/'))
+        subprocess.check_output(
+            ['find', instance_path, '-type', 'f', '-exec', 'sed', '-i', replace_expression, '{}', ';'])
+        # Put the test data in.
+        cmd = ['slapadd', '-F', instance_path]
+        subprocess.check_output(
+            cmd, input='\n\n'.join(DEFAULT_ENTRIES).encode('ascii'), stderr=subprocess.STDOUT)
+        # Set up the server.
+        SLAPD_URLS='ldap://:{}/ ldaps://:{}/'.format(port, port + 1)
+        def can_connect_to_slapd():
+            return can_connect(('127.0.0.1', port)) and can_connect(('127.0.0.1', port + 1)) and can_connect(('127.0.0.1', port + 2))
+        def can_connect_to_saslauthd():
+            return can_connect(os.path.join(saslauthd_socket_path.name, 'mux'), socket.AF_UNIX)
+        slapd_proc = subprocess.Popen(['prlimit', '-n1024', 'slapd', '-F', instance_path, '-h', SLAPD_URLS, '-d', '0'])
+        saslauthd_conf_path = make_saslauthd_conf(port, instance_path)
+        test_env = {
+            "SEASTAR_LDAP_PORT" : str(port),
+            "SASLAUTHD_MUX_PATH" : os.path.join(saslauthd_socket_path.name, "mux")
+        }
+
+        saslauthd_proc = subprocess.Popen(
+            ['saslauthd', '-d', '-n', '1', '-a', 'ldap', '-O', saslauthd_conf_path, '-m', saslauthd_socket_path.name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        def finalize():
+            slapd_proc.terminate()
+            slapd_proc.wait() # Wait for slapd to remove slapd.pid, so it doesn't race with rmtree below.
+            saslauthd_proc.kill() # Somehow, invoking terminate() here also terminates toxiproxy-server. o_O
+            shutil.rmtree(instance_path)
+            saslauthd_socket_path.cleanup()
+            subprocess.check_output(['toxiproxy-cli', 'd', proxy_name])
+        try:
+            if not try_something_backoff(can_connect_to_slapd):
+                raise Exception('Unable to connect to slapd')
+            if not try_something_backoff(can_connect_to_saslauthd):
+                raise Exception('Unable to connect to saslauthd')
+        except:
+            finalize()
+            raise
+        return finalize, '--byte-limit={}'.format(byte_limit), test_env
 
 
 class CQLApprovalTest(Test):
@@ -780,10 +1100,6 @@ class CQLApprovalTest(Test):
         self.reject = suite.suite_path / (self.shortname + ".reject")
         self.server_log: Optional[str] = None
         self.server_log_filename: Optional[pathlib.Path] = None
-        CQLApprovalTest._reset(self)
-
-    def _reset(self) -> None:
-        """Reset the test before a retry, if it is retried as flaky"""
         self.is_before_test_ok = False
         self.is_executed_ok = False
         self.is_new = False
@@ -794,9 +1110,27 @@ class CQLApprovalTest(Test):
         self.server_log = None
         self.server_log_filename = None
         self.env: Dict[str, str] = dict()
+        self._prepare_args(suite.options)
+
+    def reset(self) -> None:
+        """Reset the test before a retry, if it is retried as flaky"""
+        super().reset()
+        self.is_before_test_ok = False
+        self.is_executed_ok = False
+        self.is_new = False
+        self.is_after_test_ok = False
+        self.is_equal_result = False
+        self.summary = "not run"
+        self.unidiff = None
+        self.server_log = None
+        self.server_log_filename = None
+        self.env = dict()
         old_tmpfile = pathlib.Path(self.tmpfile)
         if old_tmpfile.exists():
             old_tmpfile.unlink()
+
+
+    def _prepare_args(self, options: argparse.Namespace):
         self.args = [
             "-s",  # don't capture print() inside pytest
             "test/pylib/cql_repl/cql_repl.py",
@@ -805,6 +1139,9 @@ class CQLApprovalTest(Test):
             "--run_id={}".format(self.id),
             "--mode={}".format(self.mode),
         ]
+        self.args.append(f"--alluredir={self.allure_dir}")
+        if not options.save_log_on_success:
+            self.args.append("--allure-no-capture")
 
     async def run(self, options: argparse.Namespace) -> Test:
         self.success = False
@@ -918,11 +1255,9 @@ class RunTest(Test):
             "-o",
             "junit_suite_name={}".format(self.suite.name)
         ]
-        RunTest._reset(self)
-
-    def _reset(self):
-        """Reset the test before a retry, if it is retried as flaky"""
-        pass
+        self.args.append(f"--alluredir={self.allure_dir}")
+        if not suite.options.save_log_on_success:
+            self.args.append("--allure-no-capture")
 
     def print_summary(self) -> None:
         print("Output of {} {}:".format(self.path, " ".join(self.args)))
@@ -940,12 +1275,14 @@ class PythonTest(Test):
 
     def __init__(self, test_no: int, shortname: str, casename: str, suite) -> None:
         super().__init__(test_no, shortname, suite)
-        self.path = "pytest"
+        self.path = "python"
+        self.core_args = ["-m", "pytest"]
         self.casename = casename
         self.xmlout = os.path.join(self.suite.options.tmpdir, self.mode, "xml", self.uname + ".xunit.xml")
         self.server_log: Optional[str] = None
         self.server_log_filename: Optional[pathlib.Path] = None
-        PythonTest._reset(self)
+        self.is_before_test_ok = False
+        self.is_after_test_ok = False
 
     def _prepare_pytest_params(self, options: argparse.Namespace):
         self.args = [
@@ -960,6 +1297,9 @@ class PythonTest(Test):
             "--run_id={}".format(self.id),
             "--mode={}".format(self.mode)
         ]
+        self.args.append(f"--alluredir={self.allure_dir}")
+        if not options.save_log_on_success:
+            self.args.append("--allure-no-capture")
         if options.markers:
             self.args.append(f"-m={options.markers}")
 
@@ -972,8 +1312,9 @@ class PythonTest(Test):
             arg += '::' + self.casename
         self.args.append(arg)
 
-    def _reset(self) -> None:
+    def reset(self) -> None:
         """Reset the test before a retry, if it is retried as flaky"""
+        super().reset()
         self.server_log = None
         self.server_log_filename = None
         self.is_before_test_ok = False
@@ -996,15 +1337,20 @@ class PythonTest(Test):
         try:
             cluster.before_test(self.uname)
             prepare_cql = self.suite.cfg.get("prepare_cql", None)
-            if prepare_cql:
-                next(iter(cluster.running.values())).control_connection.execute(prepare_cql)
+            if prepare_cql and not hasattr(cluster, 'prepare_cql_executed'):
+                cc = next(iter(cluster.running.values())).control_connection
+                if not isinstance(prepare_cql, collections.abc.Iterable):
+                    prepare_cql = [prepare_cql]
+                for stmt in prepare_cql:
+                    cc.execute(stmt)
+                cluster.prepare_cql_executed = True
             logger.info("Leasing Scylla cluster %s for test %s", cluster, self.uname)
             self.args.insert(0, "--host={}".format(cluster.endpoint()))
             self.is_before_test_ok = True
             cluster.take_log_savepoint()
             status = await run_test(self, options, env=self.suite.scylla_env)
-            if self.shortname in self.suite.dirties_cluster:
-                cluster.is_dirty = True
+            # if self.shortname in self.suite.dirties_cluster:
+            cluster.is_dirty = True
             cluster.after_test(self.uname, status)
             self.is_after_test_ok = True
             self.success = status
@@ -1043,9 +1389,7 @@ class TopologyTest(PythonTest):
 
         test_path = os.path.join(self.suite.options.tmpdir, self.mode)
         async with get_cluster_manager(self.mode + '/' + self.uname, self.suite.clusters, test_path) as manager:
-            self.args.insert(0, "--run_id={}".format(self.id))
             self.args.insert(0, "--tmpdir={}".format(options.tmpdir))
-            self.args.insert(0, "--mode={}".format(self.mode))
             self.args.insert(0, "--manager-api={}".format(manager.sock_path))
             if options.artifacts_dir_url:
                 self.args.insert(0, "--artifacts_dir_url={}".format(options.artifacts_dir_url))
@@ -1076,7 +1420,6 @@ class ToolTest(Test):
         launcher = self.suite.cfg.get("launcher", "pytest")
         self.path = launcher.split(maxsplit=1)[0]
         self.xmlout = os.path.join(self.suite.options.tmpdir, self.mode, "xml", self.uname + ".xunit.xml")
-        ToolTest._reset(self)
 
     def _prepare_pytest_params(self, options: argparse.Namespace):
         launcher = self.suite.cfg.get("launcher", "pytest")
@@ -1090,6 +1433,9 @@ class ToolTest(Test):
             "--mode={}".format(self.mode),
             "--run_id={}".format(self.id)
         ]
+        self.args.append(f"--alluredir={self.allure_dir}")
+        if not options.save_log_on_success:
+            self.args.append("--allure-no-capture")
         if options.markers:
             self.args.append(f"-m={options.markers}")
 
@@ -1097,10 +1443,6 @@ class ToolTest(Test):
             no_tests_selected_exit_code = 5
             self.valid_exit_codes = [0, no_tests_selected_exit_code]
         self.args.append(str(self.suite.suite_path / (self.shortname + ".py")))
-
-    def _reset(self) -> None:
-        """Reset the test before a retry, if it is retried as flaky"""
-        pass
 
     def print_summary(self) -> None:
         print("Output of {} {}:".format(self.path, " ".join(self.args)))
@@ -1124,18 +1466,15 @@ class TabularConsoleOutput:
     def __init__(self, verbose: bool, test_count: int) -> None:
         self.verbose = verbose
         self.test_count = test_count
-        self.print_newline = False
         self.last_test_no = 0
-        self.last_line_len = 1
 
     def print_start_blurb(self) -> None:
         print("="*80)
         print("{:10s} {:^8s} {:^7s} {:8s} {}".format("[N/TOTAL]", "SUITE", "MODE", "RESULT", "TEST"))
         print("-"*78)
+        print("")
 
     def print_end_blurb(self) -> None:
-        if self.print_newline:
-            print("")
         print("-"*78)
 
     def print_progress(self, test: Test) -> None:
@@ -1151,37 +1490,49 @@ class TabularConsoleOutput:
         else:
             status = palette.fail("[ FAIL ]")
         msg = "{:10s} {:^8s} {:^7s} {:8s} {}".format(
-            "[{}/{}]".format(self.last_test_no, self.test_count),
+            f"[{self.last_test_no}/{self.test_count}]",
             test.suite.name, test.mode[:7],
             status,
             test.uname
         )
         if not self.verbose:
             if test.success:
-                print("\r" + " " * self.last_line_len, end="")
-                self.last_line_len = len(msg)
-                print("\r" + msg, end="")
-                self.print_newline = True
-            else:
-                if self.print_newline:
-                    print("")
+                print("\033[A", end="\r")
+                print("\033[K", end="\r")
                 print(msg)
-                self.print_newline = False
+            else:
+                print("\033[A", end="\r")
+                print("\033[K", end="\r")
+                print(f"{msg}\n")
         else:
             msg += " {:.2f}s".format(test.time_end - test.time_start)
             print(msg)
 
+toxiproxy_id_gen = 0
 
 async def run_test(test: Test, options: argparse.Namespace, gentle_kill=False, env=dict()) -> bool:
     """Run test program, return True if success else False"""
 
     with test.log_filename.open("wb") as log:
-
-        def report_error(error):
+        global toxiproxy_id_gen
+        toxiproxy_id = toxiproxy_id_gen
+        toxiproxy_id_gen += 1
+        ldap_port = 5000 + (toxiproxy_id * 3) % 55000
+        cleanup_fn = None
+        finject_desc = None
+        def report_error(error, failure_injection_desc = None):
             msg = "=== TEST.PY SUMMARY START ===\n"
             msg += "{}\n".format(error)
             msg += "=== TEST.PY SUMMARY END ===\n"
+            if failure_injection_desc is not None:
+                msg += 'failure injection: {}'.format(failure_injection_desc)
             log.write(msg.encode(encoding="UTF-8"))
+
+        try:
+            cleanup_fn, finject_desc, test_env = await test.setup(ldap_port, options)
+        except Exception as e:
+            report_error("Test setup failed ({})\n{}".format(str(e), traceback.format_exc()))
+            return False
         process = None
         stdout = None
         logging.info("Starting test %s: %s %s", test.uname, test.path, " ".join(test.args))
@@ -1197,12 +1548,29 @@ async def run_test(test: Test, options: argparse.Namespace, gentle_kill=False, e
             "detect_stack_use_after_return=1",
             os.getenv("ASAN_OPTIONS"),
         ]
+        ldap_instance_path = os.path.join(
+            os.path.abspath(os.path.join(options.tmpdir, test.mode, 'ldap_instances')),
+            str(ldap_port))
+        saslauthd_mux_path = os.path.join(ldap_instance_path, 'mux')
+        if options.manual_execution:
+            print('Please run the following shell command, then press <enter>:')
+            test_env_string = " ".join([f"{k}={v}" for k,v in test_env.items()])
+            print('{} {}'.format(
+                test_env_string, ' '.join([shlex.quote(e) for e in [test.path, *test.args]])))
+            input('-- press <enter> to continue --')
+            if cleanup_fn is not None:
+                cleanup_fn()
+            return True
         try:
+            resource_gather = get_resource_gather(options.gather_metrics, test, options.tmpdir)
+            resource_gather.make_cgroup()
             log.write("=== TEST.PY STARTING TEST {} ===\n".format(test.uname).encode(encoding="UTF-8"))
             log.write("export UBSAN_OPTIONS='{}'\n".format(
                 ":".join(filter(None, UBSAN_OPTIONS))).encode(encoding="UTF-8"))
             log.write("export ASAN_OPTIONS='{}'\n".format(
                 ":".join(filter(None, ASAN_OPTIONS))).encode(encoding="UTF-8"))
+            for k,v in test_env.items():
+                log.write(f"export {k}={v}\n".encode(encoding="UTF-8"))
             log.write("{} {}\n".format(test.path, " ".join(test.args)).encode(encoding="UTF-8"))
             log.write("=== TEST.PY TEST {} OUTPUT ===\n".format(test.uname).encode(encoding="UTF-8"))
             log.flush()
@@ -1210,15 +1578,16 @@ async def run_test(test: Test, options: argparse.Namespace, gentle_kill=False, e
             test.time_end = 0
 
             path = test.path
-            args = test.args
+            args = test.core_args + test.args
             if options.cpus:
                 path = 'taskset'
-                args = ['-c', options.cpus, test.path, *test.args]
-            process = await asyncio.create_subprocess_exec(
-                path, *args,
-                stderr=log,
-                stdout=log,
-                env=dict(os.environ,
+                args = ['-c', options.cpus, test.path, *args]
+
+            test_running_event = asyncio.Event()
+            test_resource_watcher = resource_gather.cgroup_monitor(test_event=test_running_event)
+
+            test_env.update(
+                dict(os.environ,
                          UBSAN_OPTIONS=":".join(filter(None, UBSAN_OPTIONS)),
                          ASAN_OPTIONS=":".join(filter(None, ASAN_OPTIONS)),
                          # TMPDIR env variable is used by any seastar/scylla
@@ -1226,20 +1595,40 @@ async def run_test(test: Test, options: argparse.Namespace, gentle_kill=False, e
                          TMPDIR=os.path.join(options.tmpdir, test.mode),
                          SCYLLA_TEST_ENV='yes',
                          **env,
-                         ),
-                preexec_fn=os.setsid,
+                 )
+            )
+            process = await asyncio.create_subprocess_exec(
+                path, *args,
+                stderr=log,
+                stdout=log,
+                env=test_env,
+                preexec_fn=resource_gather.put_process_to_cgroup,
             )
             stdout, _ = await asyncio.wait_for(process.communicate(), options.timeout)
+            test_running_event.set()
             test.time_end = time.time()
+
+            metrics = resource_gather.get_test_metrics()
+            try:
+                async with asyncio.timeout(2):
+                    await test_resource_watcher
+            except TimeoutError:
+                log.write(f'Metrics for {test.name} can be inaccurate, job reached timeout'.encode(encoding='UTF-8'))
+            finally:
+                resource_gather.remove_cgroup()
+
             if process.returncode not in test.valid_exit_codes:
                 report_error('Test exited with code {code}\n'.format(code=process.returncode))
+                resource_gather.write_metrics_to_db(metrics)
                 return False
             try:
                 test.check_log(not options.save_log_on_success)
             except Exception as e:
                 print("")
                 print(test.name + ": " + palette.crit("failed to parse XML output: {}".format(e)))
+                resource_gather.write_metrics_to_db(metrics)
                 return False
+            resource_gather.write_metrics_to_db(metrics, True)
             return True
         except (asyncio.TimeoutError, asyncio.CancelledError) as e:
             test.is_cancelled = True
@@ -1256,6 +1645,9 @@ async def run_test(test: Test, options: argparse.Namespace, gentle_kill=False, e
                 report_error("Test was cancelled: the parent process is exiting")
         except Exception as e:
             report_error("Failed to run the test:\n{e}".format(e=e))
+        finally:
+            if cleanup_fn is not None:
+                cleanup_fn()
     return False
 
 
@@ -1297,6 +1689,8 @@ def parse_cmd_line() -> argparse.Namespace:
         help="""Path to temporary test data and log files. The data is
         further segregated per build mode. Default: ./testlog.""",
     )
+    parser.add_argument("--gather-metrics", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--max-failures", type=int, default=-1, help="Maximum number of failures to tolerate before cancelling rest of tests.")
     parser.add_argument('--mode', choices=all_modes.keys(), action="append", dest="modes",
                         help="Run only tests for given build mode(s)")
     parser.add_argument('--repeat', action="store", default="1", type=int,
@@ -1349,6 +1743,13 @@ def parse_cmd_line() -> argparse.Namespace:
     parser.add_argument("--artifacts_dir_url", action='store', type=str, default=None, dest="artifacts_dir_url",
                         help="Provide the URL to artifacts directory to generate the link to failed tests directory "
                              "with logs")
+    parser.add_argument("--cluster-pool-size", action="store", default=None, type=int,
+                        help="Set the pool_size for PythonTest and its descendants. Alternatively environment variable "
+                             "CLUSTER_POOL_SIZE can be used to achieve the same")
+    parser.add_argument('--manual-execution', action='store_true', default=False,
+                        help='Let me manually run the test executable at the moment this script would run it')
+    parser.add_argument('--byte-limit', action="store", default=None, type=int,
+                        help="Specific byte limit for failure injection (random by default)")
     scylla_additional_options = parser.add_argument_group('Additional options for Scylla tests')
     scylla_additional_options.add_argument('--x-log2-compaction-groups', action="store", default="0", type=int,
                              help="Controls number of compaction groups to be used by Scylla tests. Value of 3 implies 8 groups.")
@@ -1385,7 +1786,7 @@ def parse_cmd_line() -> argparse.Namespace:
             # [1/1] List configured modes
             # debug release dev
             args.modes = re.sub(r'.* List configured modes\n(.*)\n', r'\1',
-                                out, 1, re.DOTALL).split("\n")[-1].split(' ')
+                                out, count=1, flags=re.DOTALL).split("\n")[-1].split(' ')
         except Exception:
             print(palette.fail("Failed to read output of `ninja mode_list`: please run ./configure.py first"))
             raise
@@ -1419,12 +1820,13 @@ def parse_cmd_line() -> argparse.Namespace:
         prepare_dir(os.path.join(args.tmpdir, mode, "xml"), "*.xml")
         shutil.rmtree(os.path.join(args.tmpdir, mode, "failed_test"), ignore_errors=True)
         prepare_dir(os.path.join(args.tmpdir, mode, "failed_test"), "*")
+        prepare_dir(os.path.join(args.tmpdir, mode, "allure"), "*.xml")
 
     # Get the list of tests configured by configure.py
     try:
         out = ninja('unit_test_list')
         # [1/1] List configured unit tests
-        args.tests = set(re.sub(r'.* List configured unit tests\n(.*)\n', r'\1', out, 1, re.DOTALL).split("\n"))
+        args.tests = set(re.sub(r'.* List configured unit tests\n(.*)\n', r'\1', out, count=1, flags=re.DOTALL).split("\n"))
     except Exception:
         print(palette.fail("Failed to read output of `ninja unit_test_list`: please run ./configure.py first"))
         raise
@@ -1459,30 +1861,48 @@ async def find_tests(options: argparse.Namespace) -> None:
 async def run_all_tests(signaled: asyncio.Event, options: argparse.Namespace) -> None:
     console = TabularConsoleOutput(options.verbose, TestSuite.test_count())
     signaled_task = asyncio.create_task(signaled.wait())
-    pending = set([signaled_task])
+    pending = {signaled_task}
 
-    async def cancel(pending):
+    async def cancel(pending, msg):
         for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        print("... done.")
-        raise asyncio.CancelledError
+            task.cancel(msg)
+        await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
+        print("...done")
 
     async def reap(done, pending, signaled):
         nonlocal console
         if signaled.is_set():
-            await cancel(pending)
+            await cancel(pending, "Signal received")
+        failed = 0
         for coro in done:
             result = coro.result()
             if isinstance(result, bool):
                 continue    # skip signaled task result
-            console.print_progress(result)
+            if not result.success:
+                failed += 1
+            if not result.did_not_run:
+                console.print_progress(result)
+        return failed
 
     ms = MinioServer(options.tmpdir, '127.0.0.1', LogPrefixAdapter(logging.getLogger('minio'), {'prefix': 'minio'}))
     await ms.start()
     TestSuite.artifacts.add_exit_artifact(None, ms.stop)
 
+    hosts = HostRegistry()
+    mock_s3_server = MockS3Server(await hosts.lease_host(), 2012,
+                                  LogPrefixAdapter(logging.getLogger('s3_mock'), {'prefix': 's3_mock'}))
+    await mock_s3_server.start()
+    TestSuite.artifacts.add_exit_artifact(None, mock_s3_server.stop)
+
+    minio_uri = "http://" + os.environ[ms.ENV_ADDRESS] + ":" + os.environ[ms.ENV_PORT]
+    proxy_s3_server = S3ProxyServer(await hosts.lease_host(), 9002, minio_uri, 3, int(time.time()),
+                                    LogPrefixAdapter(logging.getLogger('s3_proxy'), {'prefix': 's3_proxy'}))
+    await proxy_s3_server.start()
+    TestSuite.artifacts.add_exit_artifact(None, proxy_s3_server.stop)
+
     console.print_start_blurb()
+    max_failures = options.max_failures
+    failed = 0
     try:
         TestSuite.artifacts.add_exit_artifact(None, TestSuite.hosts.cleanup)
         for test in TestSuite.all_tests():
@@ -1490,14 +1910,19 @@ async def run_all_tests(signaled: asyncio.Event, options: argparse.Namespace) ->
             if len(pending) > options.jobs:
                 # Wait for some task to finish
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                await reap(done, pending, signaled)
+                failed += await reap(done, pending, signaled)
+                if 0 < max_failures <= failed:
+                    print("Too much failures, stopping")
+                    await cancel(pending, "Too much failures, stopping")
             pending.add(asyncio.create_task(test.suite.run(test, options)))
         # Wait & reap ALL tasks but signaled_task
         # Do not use asyncio.ALL_COMPLETED to print a nice progress report
         while len(pending) > 1:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            await reap(done, pending, signaled)
-
+            failed += await reap(done, pending, signaled)
+            if 0 < max_failures <= failed:
+                print("Too much failures, stopping")
+                await cancel(pending, "Too much failures, stopping")
     except asyncio.CancelledError:
         return
     finally:
@@ -1518,7 +1943,7 @@ def read_log(log_filename: pathlib.Path) -> str:
         return "===Error reading log {}===".format(e)
 
 
-def print_summary(failed_tests, options: argparse.Namespace) -> None:
+def print_summary(failed_tests: List["Test"], cancelled_tests: int, options: argparse.Namespace) -> None:
     rusage = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu_used = rusage.ru_stime + rusage.ru_utime
     cpu_available = (time.monotonic() - launch_time) * multiprocessing.cpu_count()
@@ -1531,8 +1956,10 @@ def print_summary(failed_tests, options: argparse.Namespace) -> None:
             for test in failed_tests:
                 test.print_summary()
                 print("-"*78)
-        print("Summary: {} of the total {} tests failed".format(
-            len(failed_tests), TestSuite.test_count()))
+        if cancelled_tests > 0:
+            print(f"Summary: {len(failed_tests)} of the total {TestSuite.test_count()} tests failed, {cancelled_tests} cancelled")
+        else:
+            print(f"Summary: {len(failed_tests)} of the total {TestSuite.test_count()} tests failed")
 
 
 def format_unidiff(fromfile: str, tofile: str) -> str:
@@ -1564,6 +1991,7 @@ def write_junit_report(tmpdir: str, mode: str) -> None:
     junit_filename = os.path.join(tmpdir, mode, "xml", "junit.xml")
     total = 0
     failed = 0
+    skipped = 0
     xml_results = ET.Element("testsuite", name="non-boost tests", errors="0")
     for suite in TestSuite.suites.values():
         for test in suite.junit_tests():
@@ -1575,14 +2003,16 @@ def write_junit_report(tmpdir: str, mode: str) -> None:
             xml_res = ET.SubElement(xml_results, 'testcase',
                                     name="{}.{}.{}.{}".format(test.suite.name, test.shortname, mode, test.id),
                                     time=test_time)
-            if test.success is True:
-                continue
-            failed += 1
-            test.write_junit_failure_report(xml_res)
+            if test.failed:
+                failed += 1
+                test.write_junit_failure_report(xml_res)
+            if test.did_not_run:
+                skipped += 1
     if total == 0:
         return
     xml_results.set("tests", str(total))
     xml_results.set("failures", str(failed))
+    xml_results.set("skipped", str(skipped))
     with open(junit_filename, "w") as f:
         ET.ElementTree(xml_results).write(f, encoding="unicode")
 
@@ -1657,7 +2087,7 @@ def summarize_boost_tests(tests):
     return test
 
 
-def write_consolidated_boost_junit_xml(tmpdir: str, mode: str) -> None:
+def write_consolidated_boost_junit_xml(tmpdir: str, mode: str) -> str:
     # collects all boost tests sorted by their full names
     boost_tests = itertools.chain.from_iterable(suite.boost_tests()
                                                 for suite in TestSuite.suites.values())
@@ -1684,7 +2114,63 @@ def write_consolidated_boost_junit_xml(tmpdir: str, mode: str) -> None:
             test = ET.SubElement(suite, 'TestSuite', name=test_name)
         test.append(test_case)
     et = ET.ElementTree(xml)
-    et.write(f'{tmpdir}/{mode}/xml/boost.xunit.xml', encoding='unicode')
+    xunit_file = f'{tmpdir}/{mode}/xml/boost.xunit.xml'
+    et.write(xunit_file, encoding='unicode')
+    return xunit_file
+
+
+def boost_to_junit(boost_xml, junit_xml):
+    boost_root = ET.parse(boost_xml).getroot()
+    junit_root = ET.Element('testsuites')
+
+    def parse_tag_output(test_case_element: ET.Element, tag_output: str) -> str:
+        text_template = '''
+            [{level}] - {level_message}
+            [FILE] - {file_name}
+            [LINE] - {line_number}
+            '''
+        text = ''
+        tag_outputs = test_case_element.findall(tag_output)
+        if tag_outputs:
+            for tag_output in tag_outputs:
+                text += text_template.format(level='Info', level_message=tag_output.text,
+                                             file_name=tag_output.get('file'), line_number=tag_output.get('line'))
+        return text
+
+    # report produced {write_consolidated_boost_junit_xml} have the nested structure suite_boost -> [suite1, suite2, ...]
+    # so we are excluding the upper suite with name boost
+    for test_suite in boost_root.findall('./TestSuite/TestSuite'):
+        suite_time = 0.0
+        suite_test_total = 0
+        suite_test_fails_number = 0
+
+        junit_test_suite = ET.SubElement(junit_root, 'testsuite')
+        junit_test_suite.attrib['name'] = test_suite.attrib['name']
+
+        test_cases = test_suite.findall('TestCase')
+        for test_case in test_cases:
+            # convert the testing time: boost uses microseconds and Junit uses seconds
+            test_case_time = int(test_case.find('TestingTime').text) / 1_000_000
+            suite_time += test_case_time
+            suite_test_total += 1
+
+            junit_test_case = ET.SubElement(junit_test_suite, 'testcase')
+            junit_test_case.set('name', test_case.get('name'))
+            junit_test_case.set('time', str(test_case_time))
+            junit_test_case.set('file', test_case.get('file'))
+            junit_test_case.set('line', test_case.get('line'))
+
+            system_out = ET.SubElement(junit_test_case, 'system-out')
+            system_out.text = ''
+            for tag in ['Info', 'Message', 'Exception']:
+                output = parse_tag_output(test_case, tag)
+                if output:
+                    system_out.text += output
+
+        junit_test_suite.set('tests', str(suite_test_total))
+        junit_test_suite.set('time', str(suite_time))
+        junit_test_suite.set('failures', str(suite_test_fails_number))
+    ET.ElementTree(junit_root).write(junit_xml, encoding='UTF-8')
 
 
 def open_log(tmpdir: str, log_file_name: str, log_level: str) -> None:
@@ -1704,33 +2190,60 @@ async def main() -> int:
     options = parse_cmd_line()
 
     open_log(options.tmpdir, f"test.py.{'-'.join(options.modes)}.log", options.log_level)
-
+    setup_cgroup(options.gather_metrics)
     await find_tests(options)
     if options.list_tests:
         print('\n'.join([f"{t.suite.mode:<8} {type(t.suite).__name__[:-9]:<11} {t.name}"
                          for t in TestSuite.all_tests()]))
         return 0
 
+    if options.manual_execution and TestSuite.test_count() > 1:
+        print('--manual-execution only supports running a single test, but multiple selected: {}'.format(
+            [t.path for t in TestSuite.tests()][:3])) # Print whole t.path; same shortname may be in different dirs.
+        return 1
+
     signaled = asyncio.Event()
+    stop_event = asyncio.Event()
+    resource_watcher = run_resource_watcher(options.gather_metrics, signaled, stop_event, options.tmpdir)
 
     setup_signal_handlers(asyncio.get_running_loop(), signaled)
 
+    tp_server = None
     try:
-        await run_all_tests(signaled, options)
-    except Exception as e:
-        print(palette.fail(e))
-        raise
+        if [t for t in TestSuite.all_tests() if isinstance(t, LdapTest)]:
+            tp_server = subprocess.Popen('toxiproxy-server', stderr=subprocess.DEVNULL)
+            def can_connect_to_toxiproxy():
+                return can_connect(('127.0.0.1', 8474))
+            if not try_something_backoff(can_connect_to_toxiproxy):
+                raise Exception('Could not connect to toxiproxy')
+
+        try:
+            logging.info('running all tests')
+            await run_all_tests(signaled, options)
+            logging.info('after running all tests')
+            stop_event.set()
+            async with asyncio.timeout(5):
+                await resource_watcher
+        except Exception as e:
+            print(palette.fail(e))
+            raise
+    finally:
+        if tp_server is not None:
+            tp_server.terminate()
 
     if signaled.is_set():
         return -signaled.signo      # type: ignore
 
-    failed_tests = [t for t in TestSuite.all_tests() if t.success is not True]
+    failed_tests = [test for test in TestSuite.all_tests() if test.failed]
+    cancelled_tests = sum(1 for test in TestSuite.all_tests() if test.did_not_run)
 
-    print_summary(failed_tests, options)
+    print_summary(failed_tests, cancelled_tests, options)
 
     for mode in options.modes:
+        junit_file = f"{options.tmpdir}/{mode}/allure/boost.junit.xml"
         write_junit_report(options.tmpdir, mode)
-        write_consolidated_boost_junit_xml(options.tmpdir, mode)
+        xunit_file = write_consolidated_boost_junit_xml(options.tmpdir, mode)
+        boost_to_junit(xunit_file, junit_file)
 
     if 'coverage' in options.modes:
         coverage.generate_coverage_report(path_to("coverage", "tests"))

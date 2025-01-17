@@ -5,9 +5,10 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
+#include "utils/assert.hh"
 #include "cql3/statements/ks_prop_defs.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "data_dictionary/keyspace_metadata.hh"
@@ -15,6 +16,7 @@
 #include "locator/abstract_replication_strategy.hh"
 #include "exceptions/exceptions.hh"
 #include "gms/feature_service.hh"
+#include "db/config.hh"
 
 namespace cql3 {
 
@@ -138,28 +140,22 @@ data_dictionary::storage_options ks_prop_defs::get_storage_options() const {
     return opts;
 }
 
-ks_prop_defs::init_tablets_options ks_prop_defs::get_initial_tablets(const sstring& strategy_class, bool enabled_by_default) const {
-    // FIXME -- this should be ignored somehow else
-    init_tablets_options ret{ .enabled = false, .specified_count = std::nullopt };
-    if (locator::abstract_replication_strategy::to_qualified_class_name(strategy_class) != "org.apache.cassandra.locator.NetworkTopologyStrategy") {
-        return ret;
-    }
-
+std::optional<unsigned> ks_prop_defs::get_initial_tablets(std::optional<unsigned> default_value) const {
     auto tablets_options = get_map(KW_TABLETS);
     if (!tablets_options) {
-        return enabled_by_default ? init_tablets_options{ .enabled = true } : ret;
+        return default_value;
     }
 
+    unsigned initial_count = 0;
     auto it = tablets_options->find("enabled");
     if (it != tablets_options->end()) {
         auto enabled = it->second;
         tablets_options->erase(it);
 
         if (enabled == "true") {
-            ret = init_tablets_options{ .enabled = true, .specified_count = 0 }; // even if 'initial' is not set, it'll start with auto-detection
+            // nothing
         } else if (enabled == "false") {
-            assert(!ret.enabled);
-            return ret;
+            return std::nullopt;
         } else {
             throw exceptions::configuration_exception(sstring("Tablets enabled value must be true or false; found: ") + enabled);
         }
@@ -168,7 +164,7 @@ ks_prop_defs::init_tablets_options ks_prop_defs::get_initial_tablets(const sstri
     it = tablets_options->find("initial");
     if (it != tablets_options->end()) {
         try {
-            ret = init_tablets_options{ .enabled = true, .specified_count = std::stol(it->second)};
+            initial_count = std::stol(it->second);
         } catch (...) {
             throw exceptions::configuration_exception(sstring("Initial tablets value should be numeric; found ") + it->second);
         }
@@ -179,7 +175,7 @@ ks_prop_defs::init_tablets_options ks_prop_defs::get_initial_tablets(const sstri
         throw exceptions::configuration_exception(sstring("Unrecognized tablets option ") + tablets_options->begin()->first);
     }
 
-    return ret;
+    return initial_count;
 }
 
 std::optional<sstring> ks_prop_defs::get_replication_strategy_class() const {
@@ -190,32 +186,14 @@ bool ks_prop_defs::get_durable_writes() const {
     return get_boolean(KW_DURABLE_WRITES, true);
 }
 
-std::map<sstring, sstring> ks_prop_defs::get_all_options_flattened(const gms::feature_service& feat) const {
-    std::map<sstring, sstring> all_options;
-
-    auto ingest_flattened_options = [&all_options](const std::map<sstring, sstring>& options, const sstring& prefix) {
-        for (auto& option: options) {
-            all_options[prefix + ":" + option.first] = option.second;
-        }
-    };
-    ingest_flattened_options(get_replication_options(), KW_REPLICATION);
-    ingest_flattened_options(get_storage_options().to_map(), KW_STORAGE);
-    ingest_flattened_options(get_map(KW_TABLETS).value_or(std::map<sstring, sstring>{}), KW_TABLETS);
-    ingest_flattened_options({{sstring(KW_DURABLE_WRITES), to_sstring(get_boolean(KW_DURABLE_WRITES, true))}}, KW_DURABLE_WRITES);
-
-    return all_options;
-}
-
-lw_shared_ptr<data_dictionary::keyspace_metadata> ks_prop_defs::as_ks_metadata(sstring ks_name, const locator::token_metadata& tm, const gms::feature_service& feat) {
+lw_shared_ptr<data_dictionary::keyspace_metadata> ks_prop_defs::as_ks_metadata(sstring ks_name, const locator::token_metadata& tm, const gms::feature_service& feat, const db::config& cfg) {
     auto sc = get_replication_strategy_class().value();
-    auto initial_tablets = get_initial_tablets(sc, feat.tablets);
-    // if tablets options have not been specified, but tablets are globally enabled, set the value to 0
-    if (initial_tablets.enabled && !initial_tablets.specified_count) {
-        initial_tablets.specified_count = 0;
-    }
+    // if tablets options have not been specified, but tablets are globally enabled, set the value to 0 for N.T.S. only
+    auto enable_tablets = feat.tablets && cfg.enable_tablets();
+    auto initial_tablets = get_initial_tablets(enable_tablets && locator::abstract_replication_strategy::to_qualified_class_name(sc) == "org.apache.cassandra.locator.NetworkTopologyStrategy" ? std::optional<unsigned>(0) : std::nullopt);
     auto options = prepare_options(sc, tm, get_replication_options());
     return data_dictionary::keyspace_metadata::new_keyspace(ks_name, sc,
-            std::move(options), initial_tablets.specified_count, get_boolean(KW_DURABLE_WRITES, true), get_storage_options());
+            std::move(options), initial_tablets, get_boolean(KW_DURABLE_WRITES, true), get_storage_options());
 }
 
 lw_shared_ptr<data_dictionary::keyspace_metadata> ks_prop_defs::as_ks_metadata_update(lw_shared_ptr<data_dictionary::keyspace_metadata> old, const locator::token_metadata& tm, const gms::feature_service& feat) {
@@ -228,13 +206,9 @@ lw_shared_ptr<data_dictionary::keyspace_metadata> ks_prop_defs::as_ks_metadata_u
         sc = old->strategy_name();
         options = old_options;
     }
-    auto initial_tablets = get_initial_tablets(*sc, old->initial_tablets().has_value());
     // if tablets options have not been specified, inherit them if it's tablets-enabled KS
-    if (initial_tablets.enabled && !initial_tablets.specified_count) {
-        initial_tablets.specified_count = old->initial_tablets();
-    }
-
-    return data_dictionary::keyspace_metadata::new_keyspace(old->name(), *sc, options, initial_tablets.specified_count, get_boolean(KW_DURABLE_WRITES, true), get_storage_options());
+    auto initial_tablets = get_initial_tablets(old->initial_tablets());
+    return data_dictionary::keyspace_metadata::new_keyspace(old->name(), *sc, options, initial_tablets, get_boolean(KW_DURABLE_WRITES, true), get_storage_options());
 }
 
 

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -17,6 +17,7 @@ enum class compaction_strategy_type {
     size_tiered,
     leveled,
     time_window,
+    incremental,
 };
 
 enum class reshape_mode { strict, relaxed };

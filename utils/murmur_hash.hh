@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <array>
 
-#include "bytes.hh"
+#include "bytes_fwd.hh"
 
 /**
  * This is a very fast, non-cryptographic hash suitable for general hash-based
@@ -45,7 +45,7 @@ uint64_t read_block(InputIterator& in) {
            (((uint64_t) tmp[6] & 0xff) << 48) + (((uint64_t) tmp[7] & 0xff) << 56);
 }
 
-static inline
+inline
 uint64_t fmix(uint64_t k) {
     k ^= (uint64_t)k >> 33;
     k *= 0xff51afd7ed558ccdL;

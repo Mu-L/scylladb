@@ -3,19 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <iosfwd>
-#include <boost/intrusive/set.hpp>
-#include <boost/range/iterator_range.hpp>
-#include <boost/range/adaptor/filtered.hpp>
 #include <boost/intrusive/parent_from_member.hpp>
 
-#include <seastar/core/bitset-iter.hh>
 #include <seastar/util/optimized_optional.hh>
+
+#include <ranges>
 
 #include "schema/schema_fwd.hh"
 #include "tombstone.hh"
@@ -31,6 +29,11 @@
 #include "utils/compact-radix-tree.hh"
 #include "utils/immutable-collection.hh"
 #include "tombstone_gc.hh"
+#include "mutation/compact_and_expire_result.hh"
+
+#ifdef SEASTAR_DEBUG
+#include "utils/assert.hh"
+#endif
 
 class mutation_fragment;
 class mutation_partition_view;
@@ -190,7 +193,7 @@ public:
     // Expires cells based on query_time. Expires tombstones based on gc_before
     // and max_purgeable. Removes cells covered by tomb.
     // Returns true iff there are any live cells left.
-    bool compact_and_expire(
+    compact_and_expire_result compact_and_expire(
             const schema& s,
             column_kind kind,
             row_tombstone tomb,
@@ -200,7 +203,7 @@ public:
             const row_marker& marker,
             compaction_garbage_collector* collector = nullptr);
 
-    bool compact_and_expire(
+    compact_and_expire_result compact_and_expire(
             const schema& s,
             column_kind kind,
             row_tombstone tomb,
@@ -776,8 +779,8 @@ public:
         return _shadowable;
     }
 
-    bool is_shadowable() const {
-        return _shadowable.tomb() > _regular;
+    is_shadowable is_shadowable() const {
+        return ::is_shadowable(_shadowable.tomb() > _regular);
     }
 
     void maybe_shadow(const row_marker& marker) noexcept {
@@ -1361,7 +1364,6 @@ private:
         gc_clock::time_point now,
         const std::vector<query::clustering_range>& row_ranges,
         bool always_return_static_content,
-        bool reverse,
         uint64_t row_limit,
         can_gc_fn&,
         bool drop_tombstones_unconditionally,
@@ -1370,9 +1372,8 @@ private:
     // Calls func for each row entry inside row_ranges until func returns stop_iteration::yes.
     // Removes all entries for which func didn't return stop_iteration::no or wasn't called at all.
     // Removes all entries that are empty, check rows_entry::empty().
-    // If reversed is true, func will be called on entries in reverse order. In that case row_ranges
-    // must be already in reverse order.
-    template<bool reversed, typename Func>
+    // For row_ranges in reverse order, a reversed schema shall be provided.
+    template<typename Func>
     requires std::is_invocable_r_v<stop_iteration, Func, rows_entry&>
     void trim_rows(const schema& s,
         const std::vector<query::clustering_range>& row_ranges,
@@ -1396,7 +1397,7 @@ public:
     //
     uint64_t compact_for_query(const schema& s, const dht::decorated_key& dk, gc_clock::time_point query_time,
         const std::vector<query::clustering_range>& row_ranges, bool always_return_static_content,
-        bool reversed, uint64_t row_limit);
+        uint64_t row_limit);
 
     // Performs the following:
     //   - expires cells based on compaction_time
@@ -1451,16 +1452,16 @@ public:
     row_tombstone tombstone_for_row(const schema& schema, const clustering_key& key) const;
     // Can be called only for non-dummy entries
     row_tombstone tombstone_for_row(const schema& schema, const rows_entry& e) const;
-    boost::iterator_range<rows_type::const_iterator> range(const schema& schema, const query::clustering_range& r) const;
+    std::ranges::subrange<rows_type::const_iterator> range(const schema& schema, const query::clustering_range& r) const;
     rows_type::const_iterator lower_bound(const schema& schema, const query::clustering_range& r) const;
     rows_type::const_iterator upper_bound(const schema& schema, const query::clustering_range& r) const;
     rows_type::iterator lower_bound(const schema& schema, const query::clustering_range& r);
     rows_type::iterator upper_bound(const schema& schema, const query::clustering_range& r);
-    boost::iterator_range<rows_type::iterator> range(const schema& schema, const query::clustering_range& r);
+    std::ranges::subrange<rows_type::iterator> range(const schema& schema, const query::clustering_range& r);
     // Returns an iterator range of rows_entry, with only non-dummy entries.
     auto non_dummy_rows() const {
-        return boost::make_iterator_range(_rows.begin(), _rows.end())
-            | boost::adaptors::filtered([] (const rows_entry& e) { return bool(!e.dummy()); });
+        return std::ranges::subrange(_rows.begin(), _rows.end())
+            | std::views::filter([] (const rows_entry& e) { return bool(!e.dummy()); });
     }
     void accept(const schema&, mutation_partition_visitor&) const;
 
@@ -1486,7 +1487,7 @@ private:
 
     void check_schema(const schema& s) const {
 #ifdef SEASTAR_DEBUG
-        assert(s.version() == _schema_version);
+        SCYLLA_ASSERT(s.version() == _schema_version);
 #endif
     }
 };

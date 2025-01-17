@@ -4,18 +4,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 // Seastar features.
+#include "utils/assert.hh"
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/gate.hh>
-#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_mutex.hh>
-#include <seastar/core/timer.hh>
 #include <seastar/util/noncopyable_function.hh>
 
 // Scylla includes.
@@ -33,8 +32,6 @@
 #include <chrono>
 #include <span>
 #include <unordered_map>
-
-class fragmented_temporary_buffer;
 
 namespace utils {
 class directories;
@@ -104,7 +101,6 @@ public:
     static inline const std::string FILENAME_PREFIX{"HintsLog" + commitlog::descriptor::SEPARATOR};
     // Non-const - can be modified with an error injection.
     static inline std::chrono::seconds hints_flush_period = std::chrono::seconds(10);
-    static constexpr std::chrono::seconds HINT_FILE_WRITE_TIMEOUT = std::chrono::seconds(2);
 private:
     static constexpr uint64_t MAX_SIZE_OF_HINTS_IN_PROGRESS = 10 * 1024 * 1024; // 10MB
 
@@ -116,7 +112,7 @@ private:
     node_to_hint_store_factory_type _store_factory;
     host_filter _host_filter;
     service::storage_proxy& _proxy;
-    shared_ptr<gms::gossiper> _gossiper_anchor;
+    shared_ptr<const gms::gossiper> _gossiper_anchor;
     int64_t _max_hint_window_us = 0;
     replica::database& _local_db;
 
@@ -168,14 +164,14 @@ public:
     manager& operator=(manager&&) = delete;
 
     ~manager() noexcept {
-        assert(_ep_managers.empty());
+        SCYLLA_ASSERT(_ep_managers.empty());
     }
 
 public:
     void register_metrics(const sstring& group_name);
-    future<> start(shared_ptr<gms::gossiper> gossiper_ptr);
+    future<> start(shared_ptr<const gms::gossiper> gossiper_ptr);
     future<> stop();
-    bool store_hint(endpoint_id host_id, gms::inet_address ip, schema_ptr s, lw_shared_ptr<const frozen_mutation> fm,
+    bool store_hint(endpoint_id host_id, schema_ptr s, lw_shared_ptr<const frozen_mutation> fm,
             tracing::trace_state_ptr tr_state) noexcept;
 
     /// \brief Changes the host_filter currently used, stopping and starting endpoint_managers relevant to the new host_filter.
@@ -279,7 +275,10 @@ public:
     }
 
     /// \brief Returns a set of replay positions for hint queues towards endpoints from the `target_eps`.
-    sync_point::shard_rps calculate_current_sync_point(std::span<const gms::inet_address> target_eps) const;
+    ///
+    /// \param target_eps The list of endpoints the sync point should correspond to. When empty, the function assumes all endpoints.
+    /// \return Sync point corresponding to the specified endpoints.
+    sync_point::shard_rps calculate_current_sync_point(std::span<const locator::host_id> target_eps) const;
 
     /// \brief Waits until hint replay reach replay positions described in `rps`.
     future<> wait_for_sync_point(abort_source& as, const sync_point::shard_rps& rps);
@@ -295,7 +294,7 @@ private:
         return _proxy;
     }
 
-    gms::gossiper& local_gossiper() const noexcept {
+    const gms::gossiper& local_gossiper() const noexcept {
         return *_gossiper_anchor;
     }
 
@@ -304,6 +303,8 @@ private:
     }
 
     hint_endpoint_manager& get_ep_manager(const endpoint_id& host_id, const gms::inet_address& ip);
+
+    uint64_t max_size_of_hints_in_progress() const noexcept;
 
 public:
     bool have_ep_manager(const std::variant<locator::host_id, gms::inet_address>& ep) const noexcept;

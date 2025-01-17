@@ -79,52 +79,9 @@ and to the TRUNCATE data definition query.
 
 In addition, the timeout parameter can be applied to SELECT queries as well.
 
-```{eval-rst}
-.. _keyspace-storage-options:
- ```
- 
-## Keyspace storage options
 
-<!---
-This section must be moved to Data Definition> CREATE KEYSPACE
-when support for object storage is GA.
- --->
-
-By default, SStables of a keyspace are stored in a local directory.
-As an alternative, you can configure your keyspace to be stored
-on Amazon S3 or another S3-compatible object store.
-
-Support for object storage is experimental and must be explicitly
-enabled in the ``scylla.yaml`` configuration file by specifying 
-the ``keyspace-storage-options`` option:
-
-```
- experimental_features:
-     - keyspace-storage-options
-```
-
-With support for object storage enabled, add your endpoint configuration
-to ``scylla.yaml``:
-
-1. Create an ``object-storage-config-file.yaml`` file with a description of 
-   allowed endpoints, for example:
-
-    ```
-      endpoints:
-        - name: $endpoint_address_or_domain_name
-          port: $port_number
-          https: optional True or False
-          aws_region: optional region name, e.g. us-east-1
-          aws_access_key_id: optional AWS access key ID
-          aws_secret_access_key: optional AWS secret access key
-          aws_session_token: optional AWS session token
-    ```
-1. Specify the ``object-storage-config-file`` option in your ``scylla.yaml``,
-   providing ``object-storage-config-file.yaml`` as the value:
-
-   ```
-   object-storage-config-file: object-storage-config-file.yaml
-   ```
+After [enabling object storage support](../operating-scylla/admin.rst#admin-keyspace-storage-options), configure your endpoints by
+following these [instructions](../operating-scylla/admin.rst#object-storage-configuration).
 
 
 Now you can configure your object storage when creating a keyspace:
@@ -377,6 +334,20 @@ FINALFUNC final_fct
 INITCOND (0, 0);
 ```
 
+### Behavior of bind variables references with the same name
+
+If a bind variable is referred to twice (example: `WHERE aa = :var AND bb = :var`; `:var`
+is referenced twice), ScyllaDB and Cassandra treat it differently:
+
+ - Cassandra ignores the double reference and treats the two as two separate variables. They
+   can have different types, and occupy two slots in the bind variable metadata (used by
+   drivers when the user provides a bind variable tuple rather than a map)
+ - ScyllaDB treats the two references as referring to the same variable. The two references
+   must have the same type, and occupy one slot in the bind variable metadata.
+
+ScyllaDB can revert to the Cassandra treatment by setting the configuration item
+`cql_duplicate_bind_variable_names_refer_to_same_variable` to `false`.
+
 ### Lists elements for filtering
 
 Subscripting a list in a WHERE clause is supported as are maps.
@@ -440,3 +411,11 @@ To facilitate insight into which values come from which service level, there is 
 ```
 
 For more details, check [Service Levels docs](https://github.com/scylladb/scylla/blob/master/docs/cql/service-levels.rst)
+
+## DESCRIBE SCHEMA WITH INTERNALS [AND PASSWORDS]
+
+We extended the semantics of `DESCRIBE SCHEMA WITH INTERNALS`: aside from describing the elements of the schema,
+it also describes authentication/authorization and service levels. Additionally, we introduced a new tier of the
+statement: `DESCRIBE SCHEMA WITH INTERNALS AND PASSWORDS`, which also includes the information about hashed passwords of the roles.
+
+For more details, see [the article on DESCRIBE SCHEMA](./describe-schema.rst).

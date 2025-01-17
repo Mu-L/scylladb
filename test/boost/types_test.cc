@@ -3,14 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <string_view>
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/net/inet_address.hh>
 #include "utils/UUID_gen.hh"
-#include <boost/asio/ip/address_v4.hpp>
 #include <seastar/net/ip.hh>
 #include <boost/multiprecision/cpp_int.hpp>
 #include "types/types.hh"

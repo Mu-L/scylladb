@@ -1,7 +1,7 @@
 #
 # Copyright 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 import pytest
@@ -35,7 +35,7 @@ def test_refresh_no_table(nodetool):
             ("refresh", "ks"),
             {"expected_requests": []},
             ["nodetool: refresh requires ks and cf args",
-             "error processing arguments: required parameters are missing: keyspace and/or table"])
+             "error processing arguments: required parameter is missing: table"])
 
 
 def test_refresh_no_table_no_keyspace(nodetool):
@@ -44,7 +44,7 @@ def test_refresh_no_table_no_keyspace(nodetool):
             ("refresh",),
             {"expected_requests": []},
             ["nodetool: refresh requires ks and cf args",
-             "error processing arguments: required parameters are missing: keyspace and/or table"])
+             "error processing arguments: required parameters are missing: keyspace and table"])
 
 
 def test_refresh_primary_replica_only(nodetool, scylla_only):

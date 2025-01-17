@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -16,24 +16,21 @@
 #include <iosfwd>
 #include <functional>
 #include <compare>
+#include "bytes_fwd.hh"
 #include "utils/mutable_view.hh"
 #include "utils/simple_hashers.hh"
 
-using bytes = basic_sstring<int8_t, uint32_t, 31, false>;
-using bytes_view = std::basic_string_view<int8_t>;
-using bytes_mutable_view = basic_mutable_view<bytes_view::value_type>;
-using bytes_opt = std::optional<bytes>;
 using sstring_view = std::string_view;
 
 inline bytes to_bytes(bytes&& b) {
     return std::move(b);
 }
 
-inline sstring_view to_sstring_view(bytes_view view) {
+inline std::string_view to_string_view(bytes_view view) {
     return {reinterpret_cast<const char*>(view.data()), view.size()};
 }
 
-inline bytes_view to_bytes_view(sstring_view view) {
+inline bytes_view to_bytes_view(std::string_view view) {
     return {reinterpret_cast<const int8_t*>(view.data()), view.size()};
 }
 
@@ -42,7 +39,7 @@ struct fmt_hex {
     fmt_hex(const bytes_view& v) noexcept : v(v) {}
 };
 
-bytes from_hex(sstring_view s);
+bytes from_hex(std::string_view s);
 sstring to_hex(bytes_view b);
 sstring to_hex(const bytes& b);
 sstring to_hex(const bytes_opt& b);

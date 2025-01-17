@@ -78,7 +78,7 @@ If you are using a time range in the query, refer to the solution in the trouble
 DESC SCHEMA shows that I am using many materialized views (MVs) when I know I only added Secondary Indexes (SI). Why are there MVs in my schema?
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-As SI is built on top of MV, you can expect to see MV in your schema. There is nothing wrong with your system. More information on :doc:`Global Secondary Indexes </using-scylla/secondary-indexes>`.
+As SI is built on top of MV, you can expect to see MV in your schema. There is nothing wrong with your system. More information on :doc:`Global Secondary Indexes </features/secondary-indexes>`.
 
 
 Using the Java driver SimpleStatements are slow. Why does this happen?
@@ -104,14 +104,35 @@ You can clean snapshots by using :doc:`nodetool clearsnapshot </operating-scylla
   
 Features
 --------
-I want to try out new features.  How do I enable experimental mode?
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-You need to add the line :code:`experimental: true`  to your :code:`scylla.yaml` file.
 
-1. Launch the file in a text editor: :code:`$ vi /etc/scylla/scylla.yaml`. (Alternately, on docker, it's :code:`$ docker exec -it your_node vi /etc/scylla/scylla.yaml`);
-2. Add the line :code:`experimental: true`;
+I want to try out new features.  How do I enable them?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+ScyllaDB features can be enabled individually either through the configuration file or via command-line flags.
+
+To configure using :code:`scylla.yaml` file:
+
+1. Open the file in a text editor:
+
+   On Linux systems
+
+   :code:`$ vi /etc/scylla/scylla.yaml`
+
+   On Docker
+
+   :code:`$ docker exec -it your_node vi /etc/scylla/scylla.yaml`
+
+2. Add the features you want to enable
+
+   .. code-block:: yaml
+
+      # Example: enabling UDF and Alternator Streams features
+      experimental_features:
+         - udf
+         - alternator-streams
+
 3. Save the file and exit.
-4. Stop and restart the node. 
+4. Restart the node.
 
    On RedHat Enterprise Linux, CentOS or Ubuntu:
    
@@ -121,11 +142,15 @@ You need to add the line :code:`experimental: true`  to your :code:`scylla.yaml`
    
    :code:`$ docker stop <your_node> && docker start <your_node>`
 
-   Alternately, starting from ScyllaDB 2.0, you can start ScyllaDB for Docker with the :code:`experimental` flag as follows:
+Alternately, starting from ScyllaDB 3.3, you can enable features directly via command line flags the :code:`--experimental-features` flag as follows. This command line options can be repeated multiple times. For example, to enable UDF and Alternator Streams:
 
-   :code:`$ docker run --name <your_node> -d scylladb/scylla --experimental 1`
+.. code-block:: console
 
-You should now be able to use the experimental features available in your version of ScyllaDB.
+   $ docker run --name <your_node> -d scylladb/scylla \
+       --experimental-features=udf \
+       --experimental-features=alternator-streams
+
+You should now be able to use the specified experimental features.
 
 How do I check the current version of ScyllaDB that I am running?
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -194,7 +219,7 @@ Alternatively, you can explicitly install **all** the ScyllaDB packages for the 
 
 .. code-block:: console
 
-   sudo apt-get install scylla-enterprise{,-server,-jmx,-tools,-tools-core,-kernel-conf,-node-exporter,-conf,-python3}=2021.1.0-0.20210511.9e8e7d58b-1
+   sudo apt-get install scylla-enterprise{,-server,-tools,-tools-core,-kernel-conf,-node-exporter,-conf,-python3}=2021.1.0-0.20210511.9e8e7d58b-1
    sudo apt-get install scylla-enterprise-machine-image=2021.1.0-0.20210511.9e8e7d58b-1  # only execute on AMI instance
 
 
@@ -207,7 +232,7 @@ If you are creating a production cluster or if your cluster is going to have mor
 
 Our general recommendation is to always use a :code:`NetworkTopologyStrategy` and use :code:`Ec2XXX` snitches on AWS based clusters and :code:`GossipingPropertyFileSnitch` in all other cases.
 
-A description of all snitch options we support may be found here: `Snitches <https://github.com/scylladb/scylla/wiki/Snitches>`_.
+A description of all snitch options we support may be found in :doc:`Snitches </operating-scylla/system-configuration/snitch>`.
 
 Note: trying to mix a :code:`SimpleSnitch` with a :code:`DC-aware strategy` or a :code:`DC-aware snitch` with a :code:`SimpleStrategy` may cause your cluster not to work as intended therefore we **strongly discourage** these types of configurations in general.
 
@@ -343,17 +368,6 @@ Data you write to ScyllaDB gets persisted to SSTables. Since SSTables are immuta
 when you perform a delete, instead, a marker (also called a "tombstone") is written to indicate the value's new status.
 Never fear though, on the first compaction that occurs between the data and the tombstone, the data will be expunged
 completely and the corresponding disk space recovered. 
-
-What are seeds?
-^^^^^^^^^^^^^^^
-
-Seeds are used during startup to discover the cluster. They are referred by new nodes on bootstrap to learn about other nodes in the ring. When you add a new node to the cluster, you
-must specify one live seed to contact.
-
-In ScyllaDB versions earlier than ScyllaDB Open Source 4.3 and ScyllaDB Enterprise 2021.1, a seed node has an additional 
-function: it assists with gossip convergence. See :doc:`ScyllaDB Seed Nodes </kb/seed-nodes/>` for details.
-
-We recommend updating your ScyllaDB to version 4.3 or later (Open Source) or 2021.1 or later (Enterprise).
 
 .. _faq-raid0-required:
 

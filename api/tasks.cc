@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/coroutine.hh>
@@ -16,6 +16,7 @@
 #include "compaction/task_manager_module.hh"
 #include "service/storage_service.hh"
 #include "tasks/task_manager.hh"
+#include "replica/database.hh"
 
 using namespace seastar::httpd;
 
@@ -72,7 +73,7 @@ void set_tasks_compaction_module(http_context& ctx, routes& r, sharded<service::
         }
 
         auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
-        auto task = co_await compaction_module.make_and_start_task<cleanup_keyspace_compaction_task_impl>({}, std::move(keyspace), db, table_infos, flush_mode::all_tables);
+        auto task = co_await compaction_module.make_and_start_task<cleanup_keyspace_compaction_task_impl>({}, std::move(keyspace), db, table_infos, flush_mode::all_tables, tasks::is_user_task::yes);
 
         co_return json::json_return_type(task->get_status().id.to_sstring());
     });

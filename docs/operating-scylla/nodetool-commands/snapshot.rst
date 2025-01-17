@@ -25,13 +25,15 @@ OPTIONS
 ====================================================================  =====================================================================================
 Parameter                                                             Description
 ====================================================================  =====================================================================================
--cf <table> / --column-family <table>, --table <table>                The table name (you must specify one and only one keyspace for using this option)
+-cf <table> / --column-family <table>, --table <table>                The table name (you must specify one and only one keyspace for using this option).
+                                                                      The table can be a regular table, a materialized view, or an index. For an index,
+                                                                      the name of the materialized view backing the index should be used.
 --------------------------------------------------------------------  -------------------------------------------------------------------------------------
 -h <host> / --host <host>                                             Node hostname or ip address
 --------------------------------------------------------------------  -------------------------------------------------------------------------------------
 -kc <ktlist>, --kc.list <ktlist>                                      The list of Keyspaces to take snapshot
 --------------------------------------------------------------------  -------------------------------------------------------------------------------------
--p <port> / --port <port>                                             Remote jmx agent port number
+-p <port> / --port <port>                                             The port of the REST API of the ScyllaDB node.
 --------------------------------------------------------------------  -------------------------------------------------------------------------------------
 -sf / --skip-flush                                                    Do not flush memtables before snapshotting (snapshot will not contain unflushed data)
 --------------------------------------------------------------------  -------------------------------------------------------------------------------------

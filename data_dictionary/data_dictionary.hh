@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -120,7 +120,7 @@ public:
     schema_ptr find_indexed_table(std::string_view ks_name, std::string_view index_name) const;
     sstring get_available_index_name(std::string_view ks_name, std::string_view table_name,
                                                std::optional<sstring> index_name_root) const;
-    schema_ptr get_cdc_base_table(sstring_view ks_name, std::string_view table_name) const;
+    schema_ptr get_cdc_base_table(std::string_view ks_name, std::string_view table_name) const;
     schema_ptr get_cdc_base_table(const schema&) const;
     const db::extensions& extensions() const;
     const gms::feature_service& features() const;
@@ -129,20 +129,3 @@ public:
 };
 
 }
-
-#if FMT_VERSION < 100000
-// fmt v10 introduced formatter for std::exception
-template <>
-struct fmt::formatter<data_dictionary::no_such_keyspace> : fmt::formatter<string_view> {
-    auto format(const data_dictionary::no_such_keyspace& e, fmt::format_context& ctx) const {
-        return fmt::format_to(ctx.out(), "{}", e.what());
-    }
-};
-
-template <>
-struct fmt::formatter<data_dictionary::no_such_column_family> : fmt::formatter<string_view> {
-    auto format(const data_dictionary::no_such_column_family& e, fmt::format_context& ctx) const {
-        return fmt::format_to(ctx.out(), "{}", e.what());
-    }
-};
-#endif

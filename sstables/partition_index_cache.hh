@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,7 +12,9 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/shared_future.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include "utils/assert.hh"
 #include "utils/bptree.hh"
 #include "utils/lru.hh"
 #include "utils/lsa/weak_ptr.hh"
@@ -57,7 +59,7 @@ private:
                 // Live entry_ptr should keep the entry alive, except when the entry failed on loading.
                 // In that case, entry_ptr holders are not supposed to use the pointer, so it's safe
                 // to nullify those entry_ptrs.
-                assert(!ready());
+                SCYLLA_ASSERT(!ready());
             }
         }
 
@@ -206,7 +208,7 @@ public:
             return with_allocator(_region.allocator(), [&] {
                 auto it_and_flag = _cache.emplace(key, this, key);
                 entry &cp = *it_and_flag.first;
-                assert(it_and_flag.second);
+                SCYLLA_ASSERT(it_and_flag.second);
                 try {
                     return share(cp);
                 } catch (...) {

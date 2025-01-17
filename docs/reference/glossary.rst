@@ -50,7 +50,7 @@ Glossary
       Reduces data inconsistency which can occur when a node is down or there is network congestion. In ScyllaDB, when data is written and there is an unresponsive replica, the coordinator writes itself a hint. When the node recovers, the coordinator sends the node the pending hints to ensure that it has the data it should have received. See :doc:`Hinted Handoff </architecture/anti-entropy/hinted-handoff>`. 
     
     Idempotent   
-      Denoting an element of a set which is unchanged in value when multiplied or otherwise operated on by itself. :doc:`ScyllaDB Counters </using-scylla/counters>` are not indepotent because in the case of a write failure, the client cannot safely retry the request.
+      Denoting an element of a set which is unchanged in value when multiplied or otherwise operated on by itself. :doc:`ScyllaDB Counters </features/counters>` are not indepotent because in the case of a write failure, the client cannot safely retry the request.
     
     JBOD
       JBOD or Just another Bunch Of Disks is a non-raid storage system using a server with multiple disks in order to instantiate a separate file system per disk. The benefit is that if a single disk fails, only it needs to be replaced and not the whole disk array. The disadvantage is that free space and load may not be evenly distributed. See the :ref:`FAQ <faq-raid0-required>`.
@@ -58,6 +58,9 @@ Glossary
     Keyspace
       A collection of tables with attributes which define how data is replicated on nodes. See :doc:`Ring Architecture </architecture/ringarchitecture/index>`.
     
+    Key Management Interoperability Protocol (KMIP)
+      :abbr:`KMIP (Key Management Interoperability Protocol)` is a communication protocol that defines message formats for storing keys on a key management server (KMIP server). You can use a KMIP server to protect your keys when using Encryption at Rest. See :doc:`Encryption at Rest</operating-scylla/security/encryption-at-rest/>`.
+
     Leveled compaction strategy (LCS)
       :abbr:`LCS (Leveled compaction strategy)` uses small, fixed-size (by default 160 MB) SSTables divided into different levels. See :doc:`Compaction Strategies</architecture/compaction/compaction-strategies/>`.
 

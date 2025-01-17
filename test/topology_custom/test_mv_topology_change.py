@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2024-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 import asyncio
 import pytest
@@ -29,7 +29,9 @@ logger = logging.getLogger(__name__)
 @pytest.mark.asyncio
 @skip_mode('release', 'error injections are not supported in release mode')
 async def test_mv_topology_change(manager: ManagerClient):
-    cfg = {'force_gossip_topology_changes': True, 'error_injections_at_startup': ['delay_before_get_view_natural_endpoint']}
+    cfg = {'force_gossip_topology_changes': True,
+           'enable_tablets': False,
+           'error_injections_at_startup': ['delay_before_get_view_natural_endpoint']}
 
     servers = [await manager.server_add(config=cfg, timeout=60) for _ in range(3)]
 
@@ -71,7 +73,6 @@ async def test_mv_topology_change(manager: ManagerClient):
     await asyncio.gather(*tasks)
 
     [await manager.api.disable_injection(s.ip_addr, "delay_before_get_view_natural_endpoint") for s in servers]
-    [await manager.api.enable_injection(s.ip_addr, "delay_after_erm_update", False, parameters={'ks_name': 'ks', 'cf_name': 't'}) for s in servers]
 
     # to hit the issue #17786 we need to run multiple batches of writes, so that some write is processed while the 
     # effective replication maps for base and view are different
@@ -164,3 +165,32 @@ async def test_mv_update_on_pending_replica(manager: ManagerClient, intranode):
     assert [1] == [x.c for x in res]
     res = await cql.run_async(f"SELECT c FROM test.mv1 WHERE pk={key} ALLOW FILTERING")
     assert [1] == [x.c for x in res]
+
+# Reproduces issue #19529
+# Write to a table with MV while one node is stopped, and verify
+# it doesn't cause MV write timeouts or preventing topology changes.
+# The writes that are targeted to the stopped node are with CL=ANY so
+# they should store a hint and then complete successfuly.
+# If the MV write handler is not completed after storing the hint, as in
+# issue #19529, it remains active until it timeouts, preventing topology changes
+# during this time.
+@pytest.mark.asyncio
+async def test_mv_write_to_dead_node(manager: ManagerClient):
+    servers = await manager.servers_add(4)
+
+    cql = manager.get_cql()
+    await cql.run_async("CREATE KEYSPACE ks WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}")
+    await cql.run_async("CREATE TABLE ks.t (pk int primary key, v int)")
+    await cql.run_async("CREATE materialized view ks.t_view AS select pk, v from ks.t where v is not null primary key (v, pk)")
+
+    await manager.server_stop_gracefully(servers[-1].server_id)
+
+    # Do inserts. some should generate MV writes to the stopped node
+    for i in range(100):
+        await cql.run_async(f"insert into ks.t (pk, v) values ({i}, {i+1})")
+
+    # Remove the node to trigger a topology change.
+    # If the MV write is not completed, as in issue #19529, the topology change
+    # will be held for long time until the write timeouts.
+    # Otherwise, it is expected to complete in short time.
+    await manager.remove_node(servers[0].server_id, servers[-1].server_id, timeout=30)

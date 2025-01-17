@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "cql3/statements/cf_prop_defs.hh"
@@ -152,6 +152,13 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
                 "{} must be larger than {} and less than or equal to 1.0 (got {})",
                 KW_BF_FP_CHANCE, min_bloom_filter_fp_chance, bloom_filter_fp_chance));
         }
+    }
+
+    auto memtable_flush_period = get_int(KW_MEMTABLE_FLUSH_PERIOD, DEFAULT_MEMTABLE_FLUSH_PERIOD);
+    if (memtable_flush_period != 0 && memtable_flush_period < DEFAULT_MEMTABLE_FLUSH_PERIOD_MIN_VALUE) {
+        throw exceptions::configuration_exception(format(
+            "{} must be 0 or greater than {}",
+            KW_MEMTABLE_FLUSH_PERIOD, DEFAULT_MEMTABLE_FLUSH_PERIOD_MIN_VALUE));
     }
 
     speculative_retry::from_sstring(get_string(KW_SPECULATIVE_RETRY, speculative_retry(speculative_retry::type::NONE, 0).to_sstring()));

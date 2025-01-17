@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "cql3/query_processor.hh"
@@ -13,9 +13,9 @@
 #include <seastar/core/metrics.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
+#include <seastar/coroutine/as_future.hh>
 
 #include "service/storage_proxy.hh"
-#include "service/topology_mutation.hh"
 #include "service/migration_manager.hh"
 #include "service/mapreduce_service.hh"
 #include "service/raft/raft_group0_client.hh"
@@ -103,7 +103,7 @@ query_processor::query_processor(service::storage_proxy& proxy, data_dictionary:
                 "queries",
                 _stats.queries_by_cl[cl],
                 sm::description("Counts queries by consistency level."),
-                {cl_label(clevel(cl))}));
+                {cl_label(clevel(cl))}).set_skip_when_empty());
     }
     _metrics.add_group("query_processor", qp_group);
 
@@ -123,7 +123,7 @@ query_processor::query_processor(service::storage_proxy& proxy, data_dictionary:
                                         + _cql_stats.query_cnt(source_selector::USER, ks_selector::NONSYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::SELECT)
                                         + _cql_stats.query_cnt(source_selector::INTERNAL, ks_selector::SYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::SELECT)
                                         + _cql_stats.query_cnt(source_selector::INTERNAL, ks_selector::NONSYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::SELECT);
-                            }),
+                            }).set_skip_when_empty(),
 
                     sm::make_counter(
                             "inserts",
@@ -134,7 +134,7 @@ query_processor::query_processor(service::storage_proxy& proxy, data_dictionary:
                                         + _cql_stats.query_cnt(source_selector::USER, ks_selector::NONSYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::INSERT)
                                         + _cql_stats.query_cnt(source_selector::INTERNAL, ks_selector::SYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::INSERT)
                                         + _cql_stats.query_cnt(source_selector::INTERNAL, ks_selector::NONSYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::INSERT);
-                            }),
+                            }).set_skip_when_empty(),
                     sm::make_counter(
                             "inserts",
                             sm::description("Counts the total number of CQL INSERT requests with/without conditions."),
@@ -155,7 +155,7 @@ query_processor::query_processor(service::storage_proxy& proxy, data_dictionary:
                                         + _cql_stats.query_cnt(source_selector::USER, ks_selector::NONSYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::UPDATE)
                                         + _cql_stats.query_cnt(source_selector::INTERNAL, ks_selector::SYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::UPDATE)
                                         + _cql_stats.query_cnt(source_selector::INTERNAL, ks_selector::NONSYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::UPDATE);
-                            }),
+                            }).set_skip_when_empty(),
                     sm::make_counter(
                             "updates",
                             sm::description("Counts the total number of CQL UPDATE requests with/without conditions."),
@@ -176,7 +176,7 @@ query_processor::query_processor(service::storage_proxy& proxy, data_dictionary:
                                         + _cql_stats.query_cnt(source_selector::USER, ks_selector::NONSYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::DELETE)
                                         + _cql_stats.query_cnt(source_selector::INTERNAL, ks_selector::SYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::DELETE)
                                         + _cql_stats.query_cnt(source_selector::INTERNAL, ks_selector::NONSYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::DELETE);
-                            }),
+                            }).set_skip_when_empty(),
                     sm::make_counter(
                             "deletes",
                             sm::description("Counts the total number of CQL DELETE requests with/without conditions."),
@@ -200,20 +200,20 @@ query_processor::query_processor(service::storage_proxy& proxy, data_dictionary:
                             _cql_stats.query_cnt(source_selector::INTERNAL, ks_selector::SYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::SELECT),
                             sm::description("Counts the number of CQL SELECT requests executed on particular keyspaces. "
                                             "Label `who' indicates where the reqs come from (clients or DB internals)"),
-                            {internal_who_label_instance, system_ks_label_instance}),
+                            {internal_who_label_instance, system_ks_label_instance}).set_skip_when_empty(),
 
                     sm::make_counter(
                             "inserts_per_ks",
                             _cql_stats.query_cnt(source_selector::USER, ks_selector::SYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::INSERT),
                             sm::description("Counts the number of CQL INSERT requests executed on particular keyspaces. "
                                             "Label `who' indicates where the reqs come from (clients or DB internals)."),
-                            {user_who_label_instance, system_ks_label_instance, non_cas_label_instance}),
+                            {user_who_label_instance, system_ks_label_instance, non_cas_label_instance}).set_skip_when_empty(),
                     sm::make_counter(
                             "inserts_per_ks",
                             _cql_stats.query_cnt(source_selector::INTERNAL, ks_selector::SYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::INSERT),
                             sm::description("Counts the number of CQL INSERT requests executed on particular keyspaces. "
                                             "Label `who' indicates where the reqs come from (clients or DB internals)."),
-                            {internal_who_label_instance, system_ks_label_instance, non_cas_label_instance}),
+                            {internal_who_label_instance, system_ks_label_instance, non_cas_label_instance}).set_skip_when_empty(),
                     sm::make_counter(
                             "inserts_per_ks",
                             _cql_stats.query_cnt(source_selector::USER, ks_selector::SYSTEM, cond_selector::WITH_CONDITIONS, stm::statement_type::INSERT),
@@ -232,13 +232,13 @@ query_processor::query_processor(service::storage_proxy& proxy, data_dictionary:
                             _cql_stats.query_cnt(source_selector::USER, ks_selector::SYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::UPDATE),
                             sm::description("Counts the number of CQL UPDATE requests executed on particular keyspaces. "
                                             "Label `who' indicates where the reqs come from (clients or DB internals)"),
-                            {user_who_label_instance, system_ks_label_instance, non_cas_label_instance}),
+                            {user_who_label_instance, system_ks_label_instance, non_cas_label_instance}).set_skip_when_empty(),
                     sm::make_counter(
                             "updates_per_ks",
                             _cql_stats.query_cnt(source_selector::INTERNAL, ks_selector::SYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::UPDATE),
                             sm::description("Counts the number of CQL UPDATE requests executed on particular keyspaces. "
                                             "Label `who' indicates where the reqs come from (clients or DB internals)"),
-                            {internal_who_label_instance, system_ks_label_instance, non_cas_label_instance}),
+                            {internal_who_label_instance, system_ks_label_instance, non_cas_label_instance}).set_skip_when_empty(),
                     sm::make_counter(
                             "updates_per_ks",
                             _cql_stats.query_cnt(source_selector::USER, ks_selector::SYSTEM, cond_selector::WITH_CONDITIONS, stm::statement_type::UPDATE),
@@ -257,13 +257,13 @@ query_processor::query_processor(service::storage_proxy& proxy, data_dictionary:
                             _cql_stats.query_cnt(source_selector::USER, ks_selector::SYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::DELETE),
                             sm::description("Counts the number of CQL DELETE requests executed on particular keyspaces. "
                                             "Label `who' indicates where the reqs come from (clients or DB internals)"),
-                            {user_who_label_instance, system_ks_label_instance, non_cas_label_instance}),
+                            {user_who_label_instance, system_ks_label_instance, non_cas_label_instance}).set_skip_when_empty(),
                     sm::make_counter(
                             "deletes_per_ks",
                             _cql_stats.query_cnt(source_selector::INTERNAL, ks_selector::SYSTEM, cond_selector::NO_CONDITIONS, stm::statement_type::DELETE),
                             sm::description("Counts the number of CQL DELETE requests executed on particular keyspaces. "
                                             "Label `who' indicates where the reqs come from (clients or DB internals)"),
-                            {internal_who_label_instance, system_ks_label_instance, non_cas_label_instance}),
+                            {internal_who_label_instance, system_ks_label_instance, non_cas_label_instance}).set_skip_when_empty(),
                     sm::make_counter(
                             "deletes_per_ks",
                             _cql_stats.query_cnt(source_selector::USER, ks_selector::SYSTEM, cond_selector::WITH_CONDITIONS, stm::statement_type::DELETE),
@@ -281,59 +281,59 @@ query_processor::query_processor(service::storage_proxy& proxy, data_dictionary:
                             "batches",
                             _cql_stats.batches,
                             sm::description("Counts the total number of CQL BATCH requests without conditions."),
-                            {non_cas_label_instance}),
+                            {non_cas_label_instance}).set_skip_when_empty(),
 
                     sm::make_counter(
                             "batches",
                             _cql_stats.cas_batches,
                             sm::description("Counts the total number of CQL BATCH requests with conditions."),
-                            {cas_label_instance}),
+                            {cas_label_instance}).set_skip_when_empty(),
 
                     sm::make_counter(
                             "statements_in_batches",
                             _cql_stats.statements_in_batches,
                             sm::description("Counts the total number of sub-statements in CQL BATCH requests without conditions."),
-                            {non_cas_label_instance}),
+                            {non_cas_label_instance}).set_skip_when_empty(),
 
                     sm::make_counter(
                             "statements_in_batches",
                             _cql_stats.statements_in_cas_batches,
                             sm::description("Counts the total number of sub-statements in CQL BATCH requests with conditions."),
-                            {cas_label_instance}),
+                            {cas_label_instance}).set_skip_when_empty(),
 
                     sm::make_counter(
                             "batches_pure_logged",
                             _cql_stats.batches_pure_logged,
                             sm::description(
-                                    "Counts the total number of LOGGED batches that were executed as LOGGED batches.")),
+                                    "Counts the total number of LOGGED batches that were executed as LOGGED batches.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "batches_pure_unlogged",
                             _cql_stats.batches_pure_unlogged,
                             sm::description(
                                     "Counts the total number of UNLOGGED batches that were executed as UNLOGGED "
-                                    "batches.")),
+                                    "batches.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "batches_unlogged_from_logged",
                             _cql_stats.batches_unlogged_from_logged,
                             sm::description("Counts the total number of LOGGED batches that were executed as UNLOGGED "
-                                            "batches.")),
+                                            "batches.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "rows_read",
                             _cql_stats.rows_read,
-                            sm::description("Counts the total number of rows read during CQL requests.")),
+                            sm::description("Counts the total number of rows read during CQL requests.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "prepared_cache_evictions",
                             [] { return prepared_statements_cache::shard_stats().prepared_cache_evictions; },
-                            sm::description("Counts the number of prepared statements cache entries evictions.")),
+                            sm::description("Counts the number of prepared statements cache entries evictions.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "unprivileged_entries_evictions_on_size",
                             [] { return prepared_statements_cache::shard_stats().unprivileged_entries_evictions_on_size; },
-                            sm::description("Counts a number of evictions of prepared statements from the prepared statements cache after they have been used only once. An increasing counter suggests the user may be preparing a different statement for each request instead of reusing the same prepared statement with parameters.")),
+                            sm::description("Counts a number of evictions of prepared statements from the prepared statements cache after they have been used only once. An increasing counter suggests the user may be preparing a different statement for each request instead of reusing the same prepared statement with parameters.")).set_skip_when_empty(),
 
                     sm::make_gauge(
                             "prepared_cache_size",
@@ -348,88 +348,88 @@ query_processor::query_processor(service::storage_proxy& proxy, data_dictionary:
                     sm::make_counter(
                             "secondary_index_creates",
                             _cql_stats.secondary_index_creates,
-                            sm::description("Counts the total number of CQL CREATE INDEX requests.")),
+                            sm::description("Counts the total number of CQL CREATE INDEX requests.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "secondary_index_drops",
                             _cql_stats.secondary_index_drops,
-                            sm::description("Counts the total number of CQL DROP INDEX requests.")),
+                            sm::description("Counts the total number of CQL DROP INDEX requests.")).set_skip_when_empty(),
 
                     // secondary_index_reads total count is also included in all cql reads
                     sm::make_counter(
                             "secondary_index_reads",
                             _cql_stats.secondary_index_reads,
-                            sm::description("Counts the total number of CQL read requests performed using secondary indexes.")),
+                            sm::description("Counts the total number of CQL read requests performed using secondary indexes.")).set_skip_when_empty(),
 
                     // secondary_index_rows_read total count is also included in all cql rows read
                     sm::make_counter(
                             "secondary_index_rows_read",
                             _cql_stats.secondary_index_rows_read,
-                            sm::description("Counts the total number of rows read during CQL requests performed using secondary indexes.")),
+                            sm::description("Counts the total number of rows read during CQL requests performed using secondary indexes.")).set_skip_when_empty(),
 
                     // read requests that required ALLOW FILTERING
                     sm::make_counter(
                             "filtered_read_requests",
                             _cql_stats.filtered_reads,
-                            sm::description("Counts the total number of CQL read requests that required ALLOW FILTERING. See filtered_rows_read_total to compare how many rows needed to be filtered.")),
+                            sm::description("Counts the total number of CQL read requests that required ALLOW FILTERING. See filtered_rows_read_total to compare how many rows needed to be filtered.")).set_skip_when_empty(),
 
                     // rows read with filtering enabled (because ALLOW FILTERING was required)
                     sm::make_counter(
                             "filtered_rows_read_total",
                             _cql_stats.filtered_rows_read_total,
-                            sm::description("Counts the total number of rows read during CQL requests that required ALLOW FILTERING. See filtered_rows_matched_total and filtered_rows_dropped_total for information how accurate filtering queries are.")),
+                            sm::description("Counts the total number of rows read during CQL requests that required ALLOW FILTERING. See filtered_rows_matched_total and filtered_rows_dropped_total for information how accurate filtering queries are.")).set_skip_when_empty(),
 
                     // rows read with filtering enabled and accepted by the filter
                     sm::make_counter(
                             "filtered_rows_matched_total",
                             _cql_stats.filtered_rows_matched_total,
-                            sm::description("Counts the number of rows read during CQL requests that required ALLOW FILTERING and accepted by the filter. Number similar to filtered_rows_read_total indicates that filtering is accurate.")),
+                            sm::description("Counts the number of rows read during CQL requests that required ALLOW FILTERING and accepted by the filter. Number similar to filtered_rows_read_total indicates that filtering is accurate.")).set_skip_when_empty(),
 
                     // rows read with filtering enabled and rejected by the filter
                     sm::make_counter(
                             "filtered_rows_dropped_total",
                             [this]() {return _cql_stats.filtered_rows_read_total - _cql_stats.filtered_rows_matched_total;},
-                            sm::description("Counts the number of rows read during CQL requests that required ALLOW FILTERING and dropped by the filter. Number similar to filtered_rows_read_total indicates that filtering is not accurate and might cause performance degradation.")),
+                            sm::description("Counts the number of rows read during CQL requests that required ALLOW FILTERING and dropped by the filter. Number similar to filtered_rows_read_total indicates that filtering is not accurate and might cause performance degradation.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "select_bypass_caches",
                             _cql_stats.select_bypass_caches,
-                            sm::description("Counts the number of SELECT query executions with BYPASS CACHE option.")),
+                            sm::description("Counts the number of SELECT query executions with BYPASS CACHE option.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "select_allow_filtering",
                             _cql_stats.select_allow_filtering,
-                            sm::description("Counts the number of SELECT query executions with ALLOW FILTERING option.")),
+                            sm::description("Counts the number of SELECT query executions with ALLOW FILTERING option.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "select_partition_range_scan",
                             _cql_stats.select_partition_range_scan,
-                            sm::description("Counts the number of SELECT query executions requiring partition range scan.")),
+                            sm::description("Counts the number of SELECT query executions requiring partition range scan.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "select_partition_range_scan_no_bypass_cache",
                             _cql_stats.select_partition_range_scan_no_bypass_cache,
-                            sm::description("Counts the number of SELECT query executions requiring partition range scan without BYPASS CACHE option.")),
+                            sm::description("Counts the number of SELECT query executions requiring partition range scan without BYPASS CACHE option.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "select_parallelized",
                             _cql_stats.select_parallelized,
-                            sm::description("Counts the number of parallelized aggregation SELECT query executions.")),
+                            sm::description("Counts the number of parallelized aggregation SELECT query executions.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "authorized_prepared_statements_cache_evictions",
                             [] { return authorized_prepared_statements_cache::shard_stats().authorized_prepared_statements_cache_evictions; },
-                            sm::description("Counts the number of authenticated prepared statements cache entries evictions.")),
+                            sm::description("Counts the number of authenticated prepared statements cache entries evictions.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "authorized_prepared_statements_privileged_entries_evictions_on_size",
                             [] { return authorized_prepared_statements_cache::shard_stats().authorized_prepared_statements_privileged_entries_evictions_on_size; },
-                            sm::description("Counts a number of evictions of prepared statements from the authorized prepared statements cache after they have been used more than once.")),
+                            sm::description("Counts a number of evictions of prepared statements from the authorized prepared statements cache after they have been used more than once.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "authorized_prepared_statements_unprivileged_entries_evictions_on_size",
                             [] { return authorized_prepared_statements_cache::shard_stats().authorized_prepared_statements_unprivileged_entries_evictions_on_size; },
-                            sm::description("Counts a number of evictions of prepared statements from the authorized prepared statements cache after they have been used only once. An increasing counter suggests the user may be preparing a different statement for each request instead of reusing the same prepared statement with parameters.")),
+                            sm::description("Counts a number of evictions of prepared statements from the authorized prepared statements cache after they have been used only once. An increasing counter suggests the user may be preparing a different statement for each request instead of reusing the same prepared statement with parameters.")).set_skip_when_empty(),
 
                     sm::make_gauge(
                             "authorized_prepared_statements_cache_size",
@@ -444,7 +444,7 @@ query_processor::query_processor(service::storage_proxy& proxy, data_dictionary:
                     sm::make_counter(
                             "reverse_queries",
                             _cql_stats.reverse_queries,
-                            sm::description("Counts the number of CQL SELECT requests with reverse ORDER BY order.")),
+                            sm::description("Counts the number of CQL SELECT requests with reverse ORDER BY order.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "unpaged_select_queries",
@@ -452,49 +452,49 @@ query_processor::query_processor(service::storage_proxy& proxy, data_dictionary:
                                 return _cql_stats.unpaged_select_queries(ks_selector::NONSYSTEM)
                                         + _cql_stats.unpaged_select_queries(ks_selector::SYSTEM);
                             },
-                            sm::description("Counts the total number of unpaged CQL SELECT requests.")),
+                            sm::description("Counts the total number of unpaged CQL SELECT requests.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "unpaged_select_queries_per_ks",
                             _cql_stats.unpaged_select_queries(ks_selector::SYSTEM),
                             sm::description("Counts the number of unpaged CQL SELECT requests against particular keyspaces."),
-                            {system_ks_label_instance}),
+                            {system_ks_label_instance}).set_skip_when_empty(),
 
                     sm::make_counter(
                             "minimum_replication_factor_fail_violations",
                             _cql_stats.minimum_replication_factor_fail_violations,
                             sm::description("Counts the number of minimum_replication_factor_fail_threshold guardrail violations, "
-                                            "i.e. attempts to create a keyspace with RF on one of the DCs below the set guardrail.")),
+                                            "i.e. attempts to create a keyspace with RF on one of the DCs below the set guardrail.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "minimum_replication_factor_warn_violations",
                             _cql_stats.minimum_replication_factor_warn_violations,
                             sm::description("Counts the number of minimum_replication_factor_warn_threshold guardrail violations, "
-                                            "i.e. attempts to create a keyspace with RF on one of the DCs below the set guardrail.")),
+                                            "i.e. attempts to create a keyspace with RF on one of the DCs below the set guardrail.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "maximum_replication_factor_warn_violations",
                             _cql_stats.maximum_replication_factor_warn_violations,
                             sm::description("Counts the number of maximum_replication_factor_warn_threshold guardrail violations, "
-                                            "i.e. attempts to create a keyspace with RF on one of the DCs above the set guardrail.")),
+                                            "i.e. attempts to create a keyspace with RF on one of the DCs above the set guardrail.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "maximum_replication_factor_fail_violations",
                             _cql_stats.maximum_replication_factor_fail_violations,
                             sm::description("Counts the number of maximum_replication_factor_fail_threshold guardrail violations, "
-                                            "i.e. attempts to create a keyspace with RF on one of the DCs above the set guardrail.")),
+                                            "i.e. attempts to create a keyspace with RF on one of the DCs above the set guardrail.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "replication_strategy_warn_list_violations",
                             _cql_stats.replication_strategy_warn_list_violations,
                             sm::description("Counts the number of replication_strategy_warn_list guardrail violations, "
-                                            "i.e. attempts to set a discouraged replication strategy in a keyspace via CREATE/ALTER KEYSPACE.")),
+                                            "i.e. attempts to set a discouraged replication strategy in a keyspace via CREATE/ALTER KEYSPACE.")).set_skip_when_empty(),
 
                     sm::make_counter(
                             "replication_strategy_fail_list_violations",
                             _cql_stats.replication_strategy_fail_list_violations,
                             sm::description("Counts the number of replication_strategy_fail_list guardrail violations, "
-                                            "i.e. attempts to set a forbidden replication strategy in a keyspace via CREATE/ALTER KEYSPACE.")),
+                                            "i.e. attempts to set a forbidden replication strategy in a keyspace via CREATE/ALTER KEYSPACE.")).set_skip_when_empty(),
             });
 
     _mnotifier.register_listener(_migration_subscriber.get());
@@ -566,12 +566,11 @@ query_processor::execute_maybe_with_guard(service::query_state& query_state, ::s
 }
 
 future<::shared_ptr<result_message>>
-query_processor::execute_direct_without_checking_exception_message(const sstring_view& query_string, service::query_state& query_state, query_options& options) {
+query_processor::execute_direct_without_checking_exception_message(const std::string_view& query_string, service::query_state& query_state, dialect d, query_options& options) {
     log.trace("execute_direct: \"{}\"", query_string);
     tracing::trace(query_state.get_trace_state(), "Parsing a statement");
-    auto p = get_statement(query_string, query_state.get_client_state());
+    auto p = get_statement(query_string, query_state.get_client_state(), d);
     auto statement = p->statement;
-    const auto warnings = std::move(p->warnings);
     if (statement->get_bound_terms() != options.get_values_count()) {
         const auto msg = format("Invalid amount of bind variables: expected {:d} received {:d}",
                 statement->get_bound_terms(),
@@ -587,7 +586,7 @@ query_processor::execute_direct_without_checking_exception_message(const sstring
 #endif
     auto user = query_state.get_client_state().user();
     tracing::trace(query_state.get_trace_state(), "Processing a statement for authenticated user: {}", user ? (user->name ? *user->name : "anonymous") : "no user authenticated");
-    return execute_maybe_with_guard(query_state, std::move(statement), options, &query_processor::do_execute_direct, std::move(warnings));
+    return execute_maybe_with_guard(query_state, std::move(statement), options, &query_processor::do_execute_direct, std::move(p->warnings));
 }
 
 future<::shared_ptr<result_message>>
@@ -597,11 +596,27 @@ query_processor::do_execute_direct(
         const query_options& options,
         std::optional<service::group0_guard> guard,
         cql3::cql_warnings_vec warnings) {
-    co_await statement->check_access(*this, query_state.get_client_state());
-    auto m = co_await process_authorized_statement(statement, query_state, options, std::move(guard));
-    for (const auto& w : warnings) {
-        m->add_warning(w);
+    auto access_future = co_await coroutine::as_future(statement->check_access(*this, query_state.get_client_state()));
+    if (access_future.failed()) {
+        co_await audit::inspect(statement, query_state, options, true);
+        std::rethrow_exception(access_future.get_exception());
     }
+    auto mfut = co_await coroutine::as_future(process_authorized_statement(statement, query_state, options, std::move(guard)));
+    ::shared_ptr<result_message> m;
+    if (!mfut.failed()) {
+        m = mfut.get();
+    } else {
+        co_await audit::inspect(statement, query_state, options, true);
+        std::rethrow_exception(mfut.get_exception());
+    }
+    bool is_error = true;
+    if (m.get()) {
+        is_error = m->is_exception();
+        for (const auto& w : warnings) {
+            m->add_warning(w);
+        }
+    }
+    co_await audit::inspect(statement, query_state, options, is_error);
     co_return std::move(m);
 }
 
@@ -633,6 +648,8 @@ query_processor::do_execute_prepared(
             log.error("failed to cache the entry: {}", std::current_exception());
         }
     }
+
+    co_await audit::inspect(statement, query_state, options, false);
     co_return co_await process_authorized_statement(std::move(statement), query_state, options, std::move(guard));
 }
 
@@ -653,18 +670,21 @@ query_processor::process_authorized_statement(const ::shared_ptr<cql_statement> 
 }
 
 future<::shared_ptr<cql_transport::messages::result_message::prepared>>
-query_processor::prepare(sstring query_string, service::query_state& query_state) {
+query_processor::prepare(sstring query_string, service::query_state& query_state, cql3::dialect d) {
     auto& client_state = query_state.get_client_state();
-    return prepare(std::move(query_string), client_state);
+    return prepare(std::move(query_string), client_state, d);
 }
 
 future<::shared_ptr<cql_transport::messages::result_message::prepared>>
-query_processor::prepare(sstring query_string, const service::client_state& client_state) {
+query_processor::prepare(sstring query_string, const service::client_state& client_state, cql3::dialect d) {
     using namespace cql_transport::messages;
     return prepare_one<result_message::prepared::cql>(
             std::move(query_string),
             client_state,
-            compute_id,
+            d,
+            [d] (std::string_view query_string, std::string_view keyspace) {
+                return compute_id(query_string, keyspace, d);
+            },
             prepared_cache_key_type::cql_id);
 }
 
@@ -676,13 +696,14 @@ static std::string hash_target(std::string_view query_string, std::string_view k
 
 prepared_cache_key_type query_processor::compute_id(
         std::string_view query_string,
-        std::string_view keyspace) {
-    return prepared_cache_key_type(md5_hasher::calculate(hash_target(query_string, keyspace)));
+        std::string_view keyspace,
+        dialect d) {
+    return prepared_cache_key_type(md5_hasher::calculate(hash_target(query_string, keyspace)), d);
 }
 
 std::unique_ptr<prepared_statement>
-query_processor::get_statement(const sstring_view& query, const service::client_state& client_state) {
-    std::unique_ptr<raw::parsed_statement> statement = parse_statement(query);
+query_processor::get_statement(const std::string_view& query, const service::client_state& client_state, dialect d) {
+    std::unique_ptr<raw::parsed_statement> statement = parse_statement(query, d);
 
     // Set keyspace for statement that require login
     auto cf_stmt = dynamic_cast<raw::cf_statement*>(statement.get());
@@ -692,21 +713,26 @@ query_processor::get_statement(const sstring_view& query, const service::client_
     ++_stats.prepare_invocations;
     auto p = statement->prepare(_db, _cql_stats);
     p->statement->raw_cql_statement = sstring(query);
+    auto audit_info = p->statement->get_audit_info();
+    if (audit_info) {
+        audit_info->set_query_string(query);
+        p->statement->sanitize_audit_info();
+    }
     return p;
 }
 
 std::unique_ptr<raw::parsed_statement>
-query_processor::parse_statement(const sstring_view& query) {
+query_processor::parse_statement(const std::string_view& query, dialect d) {
     try {
         {
             const char* error_injection_key = "query_processor-parse_statement-test_failure";
             utils::get_local_injector().inject(error_injection_key, [&]() {
-                if (query.find(error_injection_key) != sstring_view::npos) {
+                if (query.find(error_injection_key) != std::string_view::npos) {
                     throw std::runtime_error(error_injection_key);
                 }
             });
         }
-        auto statement = util::do_with_parser(query,  std::mem_fn(&cql3_parser::CqlParser::query));
+        auto statement = util::do_with_parser(query, d, std::mem_fn(&cql3_parser::CqlParser::query));
         if (!statement) {
             throw exceptions::syntax_exception("Parsing failed");
         }
@@ -717,14 +743,14 @@ query_processor::parse_statement(const sstring_view& query) {
         throw;
     } catch (const std::exception& e) {
         log.error("The statement: {} could not be parsed: {}", query, e.what());
-        throw exceptions::syntax_exception(format("Failed parsing statement: [{}] reason: {}", query, e.what()));
+        throw exceptions::syntax_exception(seastar::format("Failed parsing statement: [{}] reason: {}", query, e.what()));
     }
 }
 
 std::vector<std::unique_ptr<raw::parsed_statement>>
-query_processor::parse_statements(std::string_view queries) {
+query_processor::parse_statements(std::string_view queries, dialect d) {
     try {
-        auto statements = util::do_with_parser(queries, std::mem_fn(&cql3_parser::CqlParser::queries));
+        auto statements = util::do_with_parser(queries, d, std::mem_fn(&cql3_parser::CqlParser::queries));
         if (statements.empty()) {
             throw exceptions::syntax_exception("Parsing failed");
         }
@@ -735,7 +761,7 @@ query_processor::parse_statements(std::string_view queries) {
         throw;
     } catch (const std::exception& e) {
         log.error("The statements: {} could not be parsed: {}", queries, e.what());
-        throw exceptions::syntax_exception(format("Failed parsing statements: [{}] reason: {}", queries, e.what()));
+        throw exceptions::syntax_exception(seastar::format("Failed parsing statements: [{}] reason: {}", queries, e.what()));
     }
 }
 
@@ -797,7 +823,7 @@ query_options query_processor::make_internal_options(
 statements::prepared_statement::checked_weak_ptr query_processor::prepare_internal(const sstring& query_string) {
     auto& p = _internal_statements[query_string];
     if (p == nullptr) {
-        auto np = parse_statement(query_string)->prepare(_db, _cql_stats);
+        auto np = parse_statement(query_string, internal_dialect())->prepare(_db, _cql_stats);
         np->statement->raw_cql_statement = query_string;
         p = std::move(np); // inserts it into map
     }
@@ -903,7 +929,8 @@ query_processor::execute_internal(
         auto p = prepare_internal(query_string);
         return execute_with_params(std::move(p), cl, query_state, values);
     } else {
-        auto p = parse_statement(query_string)->prepare(_db, _cql_stats);
+        // For internal queries, we want the default dialect, not the user provided one
+        auto p = parse_statement(query_string, dialect{})->prepare(_db, _cql_stats);
         p->statement->raw_cql_statement = query_string;
         auto checked_weak_ptr = p->checked_weak_from_this();
         return execute_with_params(std::move(checked_weak_ptr), cl, query_state, values).finally([p = std::move(p)] {});
@@ -961,7 +988,7 @@ query_processor::execute_batch_without_checking_exception_message(
         service::query_state& query_state,
         query_options& options,
         std::unordered_map<prepared_cache_key_type, authorized_prepared_statements_cache::value_type> pending_authorization_entries) {
-    co_await batch->check_access(*this, query_state.get_client_state());
+    auto access_future = co_await coroutine::as_future(batch->check_access(*this, query_state.get_client_state()));
     co_await coroutine::parallel_for_each(pending_authorization_entries, [this, &query_state] (auto& e) -> future<> {
             try {
                 co_await _authorized_prepared_cache.insert(*query_state.get_client_state().user(), e.first, std::move(e.second));
@@ -969,6 +996,11 @@ query_processor::execute_batch_without_checking_exception_message(
                 log.error("failed to cache the entry: {}", std::current_exception());
             }
         });
+    bool failed = access_future.failed();
+    co_await audit::inspect(batch, query_state, options, failed);
+    if (access_future.failed()) {
+        std::rethrow_exception(access_future.get_exception());
+    }
     batch->validate();
     batch->validate(*this, query_state.get_client_state());
     _stats.queries_by_cl[size_t(options.get_consistency())] += batch->get_statements().size();
@@ -1101,7 +1133,7 @@ void query_processor::migration_subscriber::on_update_view(
     on_update_column_family(ks_name, view_name, columns_changed);
 }
 
-void query_processor::migration_subscriber::on_update_tablet_metadata() {
+void query_processor::migration_subscriber::on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) {
 }
 
 void query_processor::migration_subscriber::on_drop_keyspace(const sstring& ks_name) {

@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -123,7 +123,7 @@ public:
      *
      * Each {@code StreamSession} is identified by this InetAddress which is broadcast address of the node streaming.
      */
-    inet_address peer;
+    locator::host_id peer;
     unsigned dst_cpu_id = 0;
 private:
     stream_manager& _mgr;
@@ -193,7 +193,7 @@ public:
      * @param connecting Actual connecting address
      * @param factory is used for establishing connection
      */
-    stream_session(stream_manager& mgr, inet_address peer_);
+    stream_session(stream_manager& mgr, locator::host_id peer_);
     ~stream_session();
 
     streaming::plan_id plan_id() const;

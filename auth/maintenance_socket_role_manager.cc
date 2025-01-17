@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "auth/maintenance_socket_role_manager.hh"
@@ -11,6 +11,7 @@
 #include <seastar/core/future.hh>
 #include <stdexcept>
 #include <string_view>
+#include "cql3/description.hh"
 #include "utils/class_registrator.hh"
 
 namespace auth {
@@ -43,10 +44,14 @@ future<> maintenance_socket_role_manager::stop() {
     return make_ready_future<>();
 }
 
+future<> maintenance_socket_role_manager::ensure_superuser_is_created() {
+    return make_ready_future<>();
+}
+
 template<typename T = void>
 future<T> operation_not_supported_exception(std::string_view operation) {
     return make_exception_future<T>(
-        std::runtime_error(format("role manager: {} operation not supported through maintenance socket", operation)));
+        std::runtime_error(fmt::format("role manager: {} operation not supported through maintenance socket", operation)));
 }
 
 future<> maintenance_socket_role_manager::create(std::string_view role_name, const role_config&, ::service::group0_batch&) {
@@ -71,6 +76,10 @@ future<> maintenance_socket_role_manager::revoke(std::string_view revokee_name, 
 
 future<role_set> maintenance_socket_role_manager::query_granted(std::string_view grantee_name, recursive_role_query) {
     return operation_not_supported_exception<role_set>("QUERY GRANTED");
+}
+
+future<role_to_directly_granted_map> maintenance_socket_role_manager::query_all_directly_granted() {
+    return operation_not_supported_exception<role_to_directly_granted_map>("QUERY ALL DIRECTLY GRANTED");
 }
 
 future<role_set> maintenance_socket_role_manager::query_all() {
@@ -105,4 +114,8 @@ future<> maintenance_socket_role_manager::remove_attribute(std::string_view role
     return operation_not_supported_exception("REMOVE ATTRIBUTE");
 }
 
+future<std::vector<cql3::description>> maintenance_socket_role_manager::describe_role_grants() {
+    return operation_not_supported_exception<std::vector<cql3::description>>("DESCRIBE SCHEMA WITH INTERNALS");
 }
+
+} // namespace auth

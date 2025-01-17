@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -16,8 +16,6 @@
 #include "mutation_consumer_concepts.hh"
 #include "range_tombstone_change_generator.hh"
 #include "schema/schema.hh"
-
-#include <span>
 
 class mutation;
 class mutation_reader;
@@ -240,19 +238,17 @@ struct frozen_mutation_and_schema {
     schema_ptr s;
 };
 
-// Can receive streamed_mutation in reversed order.
 class streamed_mutation_freezer {
     const schema& _schema;
     partition_key _key;
-    bool _reversed;
 
     tombstone _partition_tombstone;
     std::optional<static_row> _sr;
     std::deque<clustering_row> _crs;
     range_tombstone_list _rts;
 public:
-    streamed_mutation_freezer(const schema& s, const partition_key& key, bool reversed = false)
-        : _schema(s), _key(key), _reversed(reversed), _rts(s) { }
+    streamed_mutation_freezer(const schema& s, const partition_key& key)
+        : _schema(s), _key(key), _rts(s) { }
 
     stop_iteration consume(tombstone pt);
 

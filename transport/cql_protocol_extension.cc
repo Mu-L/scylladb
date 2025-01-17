@@ -3,10 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include "transport/cql_protocol_extension.hh"
 #include "cql3/result_set.hh"
 #include "exceptions/exceptions.hh"

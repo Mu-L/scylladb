@@ -3,10 +3,9 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/range/algorithm/transform.hpp>
 #include <iterator>
 #include <random>
 #include <seastar/core/thread.hh>
@@ -28,10 +27,11 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/coroutine.hh>
 #include "service/migration_manager.hh"
+#include "service/qos/raft_service_level_distributed_data_accessor.hh"
 #include "service/tablet_allocator.hh"
 #include "compaction/compaction_manager.hh"
 #include "message/messaging_service.hh"
-#include "service/raft/raft_address_map.hh"
+#include "gms/gossip_address_map.hh"
 #include "service/raft/raft_group_registry.hh"
 #include "service/storage_service.hh"
 #include "service/storage_proxy.hh"
@@ -44,7 +44,6 @@
 #include "schema/schema_builder.hh"
 #include "test/lib/tmpdir.hh"
 #include "test/lib/log.hh"
-#include "unit_test_service_levels_accessor.hh"
 #include "db/view/view_builder.hh"
 #include "db/view/node_view_update_backlog.hh"
 #include "db/view/view_update_generator.hh"
@@ -53,10 +52,12 @@
 #include "message/messaging_service.hh"
 #include "gms/gossiper.hh"
 #include "gms/feature_service.hh"
+#include "service/qos/service_level_controller.hh"
 #include "db/system_keyspace.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "db/sstables-format-selector.hh"
 #include "repair/row_level.hh"
+#include "utils/assert.hh"
 #include "utils/class_registrator.hh"
 #include "utils/cross-shard-barrier.hh"
 #include "streaming/stream_manager.hh"
@@ -68,6 +69,7 @@
 #include "sstables/sstables_manager.hh"
 #include "init.hh"
 #include "lang/manager.hh"
+#include "utils/disk_space_monitor.hh"
 
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -138,6 +140,7 @@ private:
     sharded<service::migration_notifier> _mnotifier;
     sharded<qos::service_level_controller> _sl_controller;
     sharded<service::topology_state_machine> _topology_state_machine;
+    sharded<utils::walltime_compressor_tracker> _compressor_tracker;
     sharded<service::migration_manager> _mm;
     sharded<db::batchlog_manager> _batchlog_manager;
     sharded<gms::gossiper> _gossiper;
@@ -153,6 +156,7 @@ private:
     sharded<locator::shared_token_metadata> _token_metadata;
     sharded<locator::effective_replication_map_factory> _erm_factory;
     sharded<sstables::directory_semaphore> _sst_dir_semaphore;
+    std::optional<utils::disk_space_monitor> _disk_space_monitor_shard0;
     sharded<lang::manager> _lang_manager;
     sharded<cql3::cql_config> _cql_config;
     sharded<service::endpoint_lifecycle_notifier> _elc_notif;
@@ -161,7 +165,7 @@ private:
     sharded<streaming::stream_manager> _stream_manager;
     sharded<service::mapreduce_service> _mapreduce_service;
     sharded<direct_failure_detector::failure_detector> _fd;
-    sharded<service::raft_address_map> _raft_address_map;
+    sharded<gms::gossip_address_map> _gossip_address_map;
     sharded<service::direct_fd_pinger> _fd_pinger;
     sharded<cdc::cdc_service> _cdc;
 
@@ -171,8 +175,8 @@ private:
     struct core_local_state {
         service::client_state client_state;
 
-        core_local_state(auth::service& auth_service, qos::service_level_controller& sl_controller)
-            : client_state(service::client_state::external_tag{}, auth_service, &sl_controller, infinite_timeout_config)
+        core_local_state(auth::service& auth_service, qos::service_level_controller& sl_controller, timeout_config timeout)
+            : client_state(service::client_state::external_tag{}, auth_service, &sl_controller, timeout)
         {
             client_state.set_login(auth::authenticated_user(testing_superuser));
         }
@@ -183,6 +187,12 @@ private:
     };
     distributed<core_local_state> _core_local;
 private:
+    cql3::dialect test_dialect() {
+        return cql3::dialect{
+            .duplicate_bind_variable_names_refer_to_same_variable = _db.local().get_config().cql_duplicate_bind_variable_names_refer_to_same_variable(),
+        };
+    }
+
     auto make_query_state() {
         if (_db.local().has_keyspace(ks_name)) {
             _core_local.local().client_state.set_keyspace(_db.local(), ks_name);
@@ -214,23 +224,23 @@ public:
         adjust_rlimit();
     }
 
-    virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_cql(sstring_view text) override {
+    virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_cql(std::string_view text) override {
         testlog.trace("{}(\"{}\")", __FUNCTION__, text);
         auto qs = make_query_state();
         auto qo = make_shared<cql3::query_options>(cql3::query_options::DEFAULT);
-        return local_qp().execute_direct_without_checking_exception_message(text, *qs, *qo).then([qs, qo] (auto msg) {
+        return local_qp().execute_direct_without_checking_exception_message(text, *qs, test_dialect(), *qo).then([qs, qo] (auto msg) {
             return cql_transport::messages::propagate_exception_as_future(std::move(msg));
         });
     }
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_cql(
-        sstring_view text,
+        std::string_view text,
         std::unique_ptr<cql3::query_options> qo) override
     {
         testlog.trace("{}(\"{}\")", __FUNCTION__, text);
         auto qs = make_query_state();
         auto& lqo = *qo;
-        return local_qp().execute_direct_without_checking_exception_message(text, *qs, lqo).then([qs, qo = std::move(qo)] (auto msg) {
+        return local_qp().execute_direct_without_checking_exception_message(text, *qs, test_dialect(), lqo).then([qs, qo = std::move(qo)] (auto msg) {
             return cql_transport::messages::propagate_exception_as_future(std::move(msg));
         });
     }
@@ -238,9 +248,9 @@ public:
     virtual future<cql3::prepared_cache_key_type> prepare(sstring query) override {
         return qp().invoke_on_all([query, this] (auto& local_qp) {
             auto qs = this->make_query_state();
-            return local_qp.prepare(query, *qs).finally([qs] {}).discard_result();
+            return local_qp.prepare(query, *qs, test_dialect()).finally([qs] {}).discard_result();
         }).then([query, this] {
-            return local_qp().compute_id(query, ks_name);
+            return local_qp().compute_id(query, ks_name, test_dialect());
         });
     }
 
@@ -270,7 +280,7 @@ public:
         }
         auto stmt = prepared->statement;
 
-        assert(stmt->get_bound_terms() == qo->get_values_count());
+        SCYLLA_ASSERT(stmt->get_bound_terms() == qo->get_values_count());
         qo->prepare(prepared->bound_names);
 
         auto qs = make_query_state();
@@ -283,7 +293,7 @@ public:
 
     virtual future<std::vector<mutation>> get_modification_mutations(const sstring& text) override {
         auto qs = make_query_state();
-        auto cql_stmt = local_qp().get_statement(text, qs->get_client_state())->statement;
+        auto cql_stmt = local_qp().get_statement(text, qs->get_client_state(), test_dialect())->statement;
         auto modif_stmt = dynamic_pointer_cast<cql3::statements::modification_statement>(std::move(cql_stmt));
         if (!modif_stmt) {
             throw std::runtime_error(format("get_stmt_mutations: not a modification statement: {}", text));
@@ -389,6 +399,18 @@ public:
         return _sstm;
     }
 
+    virtual sharded<service::storage_service>& get_storage_service() override {
+        return _ss;
+    }
+
+    virtual sharded<tasks::task_manager>& get_task_manager() override {
+        return _task_manager;
+    }
+
+    virtual sharded<locator::shared_token_metadata>& get_shared_token_metadata() override {
+        return _token_metadata;
+    }
+
     virtual future<> refresh_client_state() override {
         return _core_local.invoke_on_all([] (core_local_state& state) {
             return state.client_state.maybe_update_per_service_level_params();
@@ -396,7 +418,7 @@ public:
     }
 
     future<> create_keyspace(const cql_test_config& cfg, std::string_view name) {
-        auto query = format("create keyspace {} with replication = {{ 'class' : 'org.apache.cassandra.locator.NetworkTopologyStrategy', 'replication_factor' : 1}}{};", name,
+        auto query = seastar::format("create keyspace {} with replication = {{ 'class' : 'org.apache.cassandra.locator.NetworkTopologyStrategy', 'replication_factor' : 1}}{};", name,
                             cfg.initial_tablets ? format(" and tablets = {{'initial' : {}}}", *cfg.initial_tablets) : "");
         return execute_cql(query).discard_result();
     }
@@ -411,13 +433,15 @@ public:
             auto deactivate = defer([] {
                 bool old_active = true;
                 auto success = active.compare_exchange_strong(old_active, false);
-                assert(success);
+                SCYLLA_ASSERT(success);
             });
 
             // FIXME: make the function storage non static
             auto clear_funcs = defer([] {
                 smp::invoke_on_all([] () {
-                    cql3::functions::functions::clear_functions();
+                    cql3::functions::change_batch batch;
+                    batch.clear_functions();
+                    batch.commit();
                 }).get();
             });
 
@@ -451,6 +475,12 @@ private:
             }
             if (!cfg->reader_concurrency_semaphore_kill_limit_multiplier.is_set()) {
                 cfg->reader_concurrency_semaphore_kill_limit_multiplier.set(std::numeric_limits<uint32_t>::max());
+            }
+            if (!cfg->view_update_reader_concurrency_semaphore_serialize_limit_multiplier.is_set()) {
+                cfg->view_update_reader_concurrency_semaphore_serialize_limit_multiplier.set(std::numeric_limits<uint32_t>::max());
+            }
+            if (!cfg->view_update_reader_concurrency_semaphore_kill_limit_multiplier.is_set()) {
+                cfg->view_update_reader_concurrency_semaphore_kill_limit_multiplier.set(std::numeric_limits<uint32_t>::max());
             }
             tmpdir data_dir;
             auto data_dir_path = data_dir.path().string();
@@ -552,6 +582,16 @@ private:
                 _task_manager.stop().get();
             });
 
+            utils::disk_space_monitor::config dsm_cfg = {
+                .sched_group = scheduling_groups.streaming_scheduling_group,
+                .normal_polling_interval = cfg->disk_space_monitor_normal_polling_interval_in_seconds,
+                .high_polling_interval = cfg->disk_space_monitor_high_polling_interval_in_seconds,
+                .polling_interval_threshold = cfg->disk_space_monitor_polling_interval_threshold,
+            };
+            _disk_space_monitor_shard0.emplace(abort_sources.local(), data_dir_path, dsm_cfg);
+            _disk_space_monitor_shard0->start().get();
+            auto stop_dsm = defer([this] { _disk_space_monitor_shard0->stop().get(); });
+
             // get_cm_cfg is called on each shard when starting a sharded<compaction_manager>
             // we need the getter since updateable_value is not shard-safe (#7316)
             auto get_cm_cfg = sharded_parameter([&] {
@@ -561,6 +601,7 @@ private:
                     .available_memory = dbcfg.available_memory,
                     .static_shares = cfg->compaction_static_shares,
                     .throughput_mb_per_sec = cfg->compaction_throughput_mb_per_sec,
+                    .flush_all_tables_before_major = cfg->compaction_flush_all_tables_before_major_seconds() * 1s,
                 };
             });
             _cm.start(std::move(get_cm_cfg), std::ref(abort_sources), std::ref(_task_manager)).get();
@@ -568,6 +609,10 @@ private:
 
             _sstm.start(std::ref(*cfg), sstables::storage_manager::config{}).get();
             auto stop_sstm = deferred_stop(_sstm);
+
+            _sl_controller.start(std::ref(_auth_service), std::ref(_token_metadata), std::ref(abort_sources), qos::service_level_options{.shares = 1000}, scheduling_groups.statement_scheduling_group).get();
+            auto stop_sl_controller = defer([this] { _sl_controller.stop().get(); });
+            _sl_controller.invoke_on_all(&qos::service_level_controller::start).get();
 
             lang::manager::config lang_config;
             lang_config.lua.max_bytes = cfg->user_defined_function_allocation_limit_bytes();
@@ -589,12 +634,12 @@ private:
             _lang_manager.invoke_on_all(&lang::manager::start).get();
 
 
-            _db.start(std::ref(*cfg), dbcfg, std::ref(_mnotifier), std::ref(_feature_service), std::ref(_token_metadata), std::ref(_cm), std::ref(_sstm), std::ref(_lang_manager), std::ref(_sst_dir_semaphore), utils::cross_shard_barrier()).get();
+            _db.start(std::ref(*cfg), dbcfg, std::ref(_mnotifier), std::ref(_feature_service), std::ref(_token_metadata), std::ref(_cm), std::ref(_sstm), std::ref(_lang_manager), std::ref(_sst_dir_semaphore), std::ref(abort_sources), utils::cross_shard_barrier()).get();
             auto stop_db = defer([this] {
                 _db.stop().get();
             });
 
-            _db.invoke_on_all(&replica::database::start).get();
+            _db.invoke_on_all(&replica::database::start, std::ref(_sl_controller)).get();
 
             smp::invoke_on_all([blocked_reactor_notify_ms] {
                 engine().update_blocked_reactor_notify_ms(blocked_reactor_notify_ms);
@@ -635,12 +680,12 @@ private:
 
             set_abort_on_internal_error(true);
             const gms::inet_address listen("127.0.0.1");
-            _sl_controller.start(std::ref(_auth_service), std::ref(_token_metadata), std::ref(abort_sources), qos::service_level_options{}).get();
-            auto stop_sl_controller = defer([this] { _sl_controller.stop().get(); });
-            _sl_controller.invoke_on_all(&qos::service_level_controller::start).get();
 
             _sys_ks.start(std::ref(_qp), std::ref(_db)).get();
-            auto stop_sys_kd = defer([this] { _sys_ks.stop().get(); });
+            auto stop_sys_kd = defer([this] {
+                _sys_ks.invoke_on_all(&db::system_keyspace::shutdown).get();
+                _sys_ks.stop().get();
+            });
 
             replica::distributed_loader::init_system_keyspace(_sys_ks, _erm_factory, _db).get();
             _db.local().init_schema_commitlog();
@@ -657,35 +702,76 @@ private:
                 host_id = linfo.host_id;
                 _sys_ks.local().save_local_info(std::move(linfo), _snitch.local()->get_location(), my_address, my_address).get();
             }
-            locator::shared_token_metadata::mutate_on_all_shards(_token_metadata, [hostid = host_id, &cfg_in] (locator::token_metadata& tm) {
+            locator::shared_token_metadata::mutate_on_all_shards(_token_metadata, [hostid = host_id] (locator::token_metadata& tm) {
                 auto& topo = tm.get_topology();
                 topo.set_host_id_cfg(hostid);
                 topo.add_or_update_endpoint(hostid,
-                                            cfg_in.broadcast_address,
                                             std::nullopt,
                                             locator::node::state::normal,
                                             smp::count);
                 return make_ready_future<>();
             }).get();
 
-            uint16_t port = 7000;
-            if (cfg_in.ms_listen) {
-               std::random_device rd;
-               std::mt19937 gen(rd());
-               std::uniform_int_distribution<> distrib(27000, 37000);
-               port = distrib(gen);
-            }
-            // Don't start listening so tests can be run in parallel if cfg_in.ms_listen is not set to true explicitly.
-            _ms.start(host_id, listen, std::move(port)).get();
-            auto stop_ms = defer([this] { _ms.stop().get(); });
+            _gossip_address_map.start().get();
+            auto stop_gossip_address_map = defer([this] {
+                _gossip_address_map.stop().get();
+            });
 
-            if (cfg_in.ms_listen) {
-                _ms.invoke_on_all(&netw::messaging_service::start_listen, std::ref(_token_metadata)).get();
-            }
+            auto arct_cfg = [&] {
+                return utils::advanced_rpc_compressor::tracker::config{
+                    .zstd_quota_fraction{1.0},
+                    .register_metrics = true,
+                };
+            };
+            _compressor_tracker.start(arct_cfg).get();
+            auto stop_compressor_tracker = defer([this] { _compressor_tracker.stop().get(); });
+
+            uint16_t port = 7000;
+            seastar::server_socket tmp;
+
+            // #20543 - if we should actually use message_server::listen, we need to find an unused port.
+            // Create a dummy socket to pick the port for us. Unfortunately, due to reactor::posix_reuseport_detect()
+            // currently giving back false always, we can't simply do this though. Thus this ugly loop.
+            // Adding the stop defer before actually creating the service should be fine.
+
+            auto stop_ms_func = [this] { _ms.stop().get(); };
+            using stop_type = decltype(stop_ms_func);
+            std::optional<decltype(defer(stop_type(stop_ms_func)))> stop_ms;
+
+            do {
+                stop_ms = std::nullopt;
+                try {
+                    if (cfg_in.ms_listen) {
+                       tmp = seastar::listen(seastar::socket_address(listen, 0), listen_options{true});
+                       port = tmp.local_address().port();
+                    }
+                    // Don't start listening so tests can be run in parallel if cfg_in.ms_listen is not set to true explicitly.
+                    _ms.start(host_id, listen, std::move(port), std::ref(_feature_service),
+                              std::ref(_gossip_address_map), std::ref(_compressor_tracker),
+                              std::ref(_sl_controller)).get();
+                    stop_ms = defer(stop_type(stop_ms_func));
+
+                    if (cfg_in.ms_listen) {
+                        // FIXME: should not need to do this - it makes this whole thing unsafe. But
+                        // reactor::posix_reuseport_detect() currently always returns false, thus
+                        // trying to grab a port and reusing it properly here does _not_ work at all.
+                        // Once the seastar issue is fixed, we can just keep the tmp socket aliva across
+                        // the listen invoke below.
+                        tmp = {};
+                        _ms.invoke_on_all(&netw::messaging_service::start_listen, std::ref(_token_metadata), [host_id] (gms::inet_address ip) {return host_id; }).get();
+                    }
+                } catch (std::system_error& e) {
+                    // if we still hit a used port (quick other process), just shut down ms and try again.
+                    if (port != 7000 && e.code().category() == std::system_category() && e.code().value() == EADDRINUSE) {
+                        continue;
+                    }
+                    throw;
+                }
+            } while (false);
 
             // Normally the auth server is already stopped in here,
             // but if there is an initialization failure we have to
-            // make sure to stop it now or ~sharded will assert.
+            // make sure to stop it now or ~sharded will SCYLLA_ASSERT.
             auto stop_auth_server = defer([this] {
                 _auth_service.stop().get();
             });
@@ -713,18 +799,13 @@ private:
             gcfg.seeds = std::move(seeds);
             gcfg.skip_wait_for_gossip_to_settle = 0;
             gcfg.shutdown_announce_ms = 0;
-            _gossiper.start(std::ref(abort_sources), std::ref(_token_metadata), std::ref(_ms), std::move(gcfg)).get();
+            _gossiper.start(std::ref(abort_sources), std::ref(_token_metadata), std::ref(_ms), std::move(gcfg), std::ref(_gossip_address_map)).get();
             auto stop_ms_fd_gossiper = defer([this] {
                 _gossiper.stop().get();
             });
             _gossiper.invoke_on_all(&gms::gossiper::start).get();
 
-            _raft_address_map.start().get();
-            auto stop_address_map = defer([this] {
-                _raft_address_map.stop().get();
-            });
-
-            _fd_pinger.start(std::ref(_ms), std::ref(_raft_address_map)).get();
+            _fd_pinger.start(std::ref(_ms)).get();
             auto stop_fd_pinger = defer([this] { _fd_pinger.stop().get(); });
 
             service::direct_fd_clock fd_clock;
@@ -739,7 +820,6 @@ private:
 
             _group0_registry.start(
                 raft::server_id{host_id.id},
-                std::ref(_raft_address_map),
                 std::ref(_ms), std::ref(_fd)).get();
             auto stop_raft_gr = deferred_stop(_group0_registry);
 
@@ -754,7 +834,7 @@ private:
             auto stop_mapreduce_service =  defer([this] { _mapreduce_service.stop().get(); });
 
             // gropu0 client exists only on shard 0
-            service::raft_group0_client group0_client(_group0_registry.local(), _sys_ks.local(), maintenance_mode_enabled::no);
+            service::raft_group0_client group0_client(_group0_registry.local(), _sys_ks.local(), _token_metadata.local(), maintenance_mode_enabled::no);
 
             _mm.start(std::ref(_mnotifier), std::ref(_feature_service), std::ref(_ms), std::ref(_proxy), std::ref(_gossiper), std::ref(group0_client), std::ref(_sys_ks)).get();
             auto stop_mm = defer([this] { _mm.stop().get(); });
@@ -773,6 +853,8 @@ private:
                     abort_sources.local(), _group0_registry.local(), _ms,
                     _gossiper.local(), _feature_service.local(), _sys_ks.local(), group0_client, scheduling_groups.gossip_scheduling_group};
 
+            auto compression_dict_updated_callback = [] { return make_ready_future<>(); };
+
             _ss.start(std::ref(abort_sources), std::ref(_db),
                 std::ref(_gossiper),
                 std::ref(_sys_ks),
@@ -789,7 +871,11 @@ private:
                 std::ref(_view_builder),
                 std::ref(_qp),
                 std::ref(_sl_controller),
-                std::ref(_topology_state_machine)).get();
+                std::ref(_topology_state_machine),
+                std::ref(_task_manager),
+                std::ref(_gossip_address_map),
+                compression_dict_updated_callback
+            ).get();
             auto stop_storage_service = defer([this] { _ss.stop().get(); });
 
             _mnotifier.local().register_listener(&_ss.local());
@@ -844,9 +930,6 @@ private:
             }
 
             group0_client.init().get();
-            auto stop_system_keyspace = defer([this] {
-                _sys_ks.invoke_on_all(&db::system_keyspace::shutdown).get();
-            });
 
             auto shutdown_db = defer([this] {
                 _db.invoke_on_all(&replica::database::shutdown).get();
@@ -867,13 +950,13 @@ private:
 
             _sys_dist_ks.start(std::ref(_qp), std::ref(_mm), std::ref(_proxy)).get();
 
-            _view_builder.start(std::ref(_db), std::ref(_sys_ks), std::ref(_sys_dist_ks), std::ref(_mnotifier), std::ref(_view_update_generator)).get();
+            _view_builder.start(std::ref(_db), std::ref(_sys_ks), std::ref(_sys_dist_ks), std::ref(_mnotifier), std::ref(_view_update_generator), std::ref(group0_client), std::ref(_qp)).get();
             auto stop_view_builder = defer([this] {
                 _view_builder.stop().get();
             });
 
             if (cfg_in.need_remote_proxy) {
-                _proxy.invoke_on_all(&service::storage_proxy::start_remote, std::ref(_ms), std::ref(_gossiper), std::ref(_mm), std::ref(_sys_ks)).get();
+                _proxy.invoke_on_all(&service::storage_proxy::start_remote, std::ref(_ms), std::ref(_gossiper), std::ref(_mm), std::ref(_sys_ks), std::ref(group0_client), std::ref(_topology_state_machine)).get();
             }
             auto stop_proxy_remote = defer([this, need = cfg_in.need_remote_proxy] {
                 if (need) {
@@ -881,10 +964,10 @@ private:
                 }
             });
 
-            _sl_controller.invoke_on_all([this] (qos::service_level_controller& service) {
+            _sl_controller.invoke_on_all([this, &group0_client] (qos::service_level_controller& service) {
                 qos::service_level_controller::service_level_distributed_data_accessor_ptr service_level_data_accessor =
                         ::static_pointer_cast<qos::service_level_controller::service_level_distributed_data_accessor>(
-                                make_shared<qos::unit_test_service_levels_accessor>(_sl_controller, _sys_dist_ks));
+                                make_shared<qos::raft_service_level_distributed_data_accessor>(_qp.local(), group0_client));
                 return service.set_distributed_data_accessor(std::move(service_level_data_accessor));
             }).get();
 
@@ -915,10 +998,8 @@ private:
 
             _ss.local().set_group0(group0_service);
 
-            const auto generation_number = gms::generation_type(_sys_ks.local().increment_and_get_generation().get());
-
             // Load address_map from system.peers and subscribe to gossiper events to keep it updated.
-            _ss.local().init_address_map(_raft_address_map.local(), generation_number).get();
+            _ss.local().init_address_map(_gossip_address_map.local()).get();
             auto cancel_address_map_subscription = defer([this] {
                 _ss.local().uninit_address_map().get();
             });
@@ -929,8 +1010,10 @@ private:
 
             group0_service.setup_group0_if_exist(_sys_ks.local(), _ss.local(), _qp.local(), _mm.local()).get();
 
+            const auto generation_number = gms::generation_type(_sys_ks.local().increment_and_get_generation().get());
+
             try {
-                _ss.local().join_cluster(_sys_dist_ks, _proxy, _gossiper, service::start_hint_manager::no, generation_number).get();
+                _ss.local().join_cluster(_sys_dist_ks, _proxy, service::start_hint_manager::no, generation_number).get();
             } catch (std::exception& e) {
                 // if any of the defers crashes too, we'll never see
                 // the error
@@ -958,7 +1041,11 @@ private:
             }).get();
 
             auto deinit_storage_service_server = defer([this] {
-                _gossiper.invoke_on_all(&gms::gossiper::shutdown).get();
+                // #21159 don't shutdown gossip here - we don't in main.cc, and we should
+                // strive to keep the two paths aligned. Doing a gossip::shutdown here
+                // can, if we've provoked a storage_manager::isolate, cause parallel 
+                // double execution of the shutdown method, which causes waiting for 
+                // an invalid future if we're unlucky.
                 _auth_service.stop().get();
             });
 
@@ -974,6 +1061,9 @@ private:
             _view_builder.invoke_on_all([this] (db::view::view_builder& vb) {
                 return vb.start(_mm.local());
             }).get();
+            auto drain_view_builder = defer([this] {
+                _view_builder.invoke_on_all(&db::view::view_builder::drain).get();
+            });
 
             // Create the testing user.
             try {
@@ -981,7 +1071,7 @@ private:
                 config.is_superuser = true;
                 config.can_login = true;
 
-                auto as = &abort_sources.local();
+                auto& as   = abort_sources.local();
                 auto guard = group0_client.start_operation(as).get();
                 service::group0_batch mc{std::move(guard)};
                 auth::create_role(
@@ -990,7 +1080,7 @@ private:
                         config,
                         auth::authentication_options(),
                         mc).get();
-                std::move(mc).commit(group0_client, *as, ::service::raft_timeout{}).get();
+                std::move(mc).commit(group0_client, as, ::service::raft_timeout{}).get();
             } catch (const auth::role_already_exists&) {
                 // The default user may already exist if this `cql_test_env` is starting with previously populated data.
             }
@@ -999,7 +1089,7 @@ private:
 
             _group0_client = &group0_client;
 
-            _core_local.start(std::ref(_auth_service), std::ref(_sl_controller)).get();
+            _core_local.start(std::ref(_auth_service), std::ref(_sl_controller), cfg_in.query_timeout.value_or(infinite_timeout_config)).get();
             auto stop_core_local = defer([this] { _core_local.stop().get(); });
 
             if (!local_db().has_keyspace(ks_name)) {
@@ -1013,12 +1103,12 @@ private:
 
 public:
     future<::shared_ptr<cql_transport::messages::result_message>> execute_batch(
-        const std::vector<sstring_view>& queries, std::unique_ptr<cql3::query_options> qo) override {
+        const std::vector<std::string_view>& queries, std::unique_ptr<cql3::query_options> qo) override {
         using cql3::statements::batch_statement;
         using cql3::statements::modification_statement;
         std::vector<batch_statement::single_statement> modifications;
-        boost::transform(queries, back_inserter(modifications), [this](const auto& query) {
-            auto stmt = local_qp().get_statement(query, _core_local.local().client_state);
+        std::ranges::transform(queries, back_inserter(modifications), [this](const auto& query) {
+            auto stmt = local_qp().get_statement(query, _core_local.local().client_state, test_dialect());
             if (!dynamic_cast<modification_statement*>(stmt->statement.get())) {
                 throw exceptions::invalid_request_exception(
                     "Invalid statement in batch: only UPDATE, INSERT and DELETE statements are allowed.");
@@ -1035,6 +1125,10 @@ public:
         return local_qp().execute_batch_without_checking_exception_message(batch, *qs, lqo, {}).then([qs, batch, qo = std::move(qo)] (auto msg) {
             return cql_transport::messages::propagate_exception_as_future(std::move(msg));
         });
+    }
+
+    virtual sharded<qos::service_level_controller>& service_level_controller_service() override {
+        return _sl_controller;
     }
 };
 
@@ -1056,7 +1150,7 @@ future<> do_with_cql_env_thread(std::function<void(cql_test_env&)> func, cql_tes
 void do_with_mc(cql_test_env& env, std::function<void(service::group0_batch&)> func) {
     seastar::abort_source as;
     auto& g0 = env.get_raft_group0_client();
-    auto guard = g0.start_operation(&as).get();
+    auto guard = g0.start_operation(as).get();
     auto mc = service::group0_batch(std::move(guard));
     func(mc);
     std::move(mc).commit(g0, as, std::nullopt).get();

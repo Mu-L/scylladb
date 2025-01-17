@@ -1,28 +1,6 @@
 # Keeping sstables on S3
 
-## Endpoints config file
-
-First one need to describe endpoints where sstables can be stored. This is done
-in a yaml file with the following format:
-
-```yaml
-endpoints:
-  - name: $endpoint_address_or_domain_name
-    port: $port_number
-    https: optional True or False
-    aws_region: optional region name, e.g. us-east-1
-    aws_access_key_id: optional AWS access key ID
-    aws_secret_access_key: optional AWS secret access key
-    aws_session_token: optional AWS session token
-```
-
-The last three items must be all present or all absent. When set the values are
-used by the S3 client to sign requests. If not set requests are sent unsigned
-which may not always accepted by the server.
-
-By default Scylla tries to read it from the `object_storage.yaml` file
-located in the same directory with the `scylla.yaml`. Optionally, the
-`--object-storage-config-file $path` option can be specified.
+On of the ways to use object storage is to keep sstables directly on it as objects.
 
 ## Enabling the feature
 
@@ -74,3 +52,25 @@ CREATE KEYSPACE ks
    'bucket' : 'bucket-for-testing'
   };
 ```
+
+# Copying sstables on S3 (backup)
+
+It's possible to upload sstables from data/ directory on S3 via API. This is good
+to do because in that case all the resources that are needed for that operation (like
+disk IO bandwidth and IOPS, CPU time, networking bandwidth) will be under Seastar's
+control and regular Scylla workload will not be randomly affected.
+
+The API endpoint name is `/storage_service/backup` and its Swagger description can be
+found [here](./api/api-doc/storage_service.json). Accepted parameters are
+
+* *keyspace*: the keyspace to copy sstables from
+* *table*: the table to copy sstables from
+* *snapshot*: the snapshot name to copy sstables from
+* *endpoint*: the key in the object storage configuration file
+* *bucket*: bucket name to put sstables' files in
+* *prefix*: prefix to put sstables' files under
+
+Currently only snapshot backup is possible, so first one needs to take [snapshot](docs/kb/snapshots.rst)
+
+All tables in a keyspace are uploaded, the destination object names will look like
+`s3://bucket/some/prefix/to/store/data/.../sstable`

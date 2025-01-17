@@ -6,7 +6,7 @@ target_link_libraries(test-raft-helper
   test-lib
   Seastar::seastar_testing)
 
-add_library(test-raft)
+add_library(test-raft STATIC)
 target_sources(test-raft
   PRIVATE
     replication.cc)
@@ -30,8 +30,6 @@ add_scylla_test(fsm_test
 add_scylla_test(many_test
   KIND SEASTAR
   LIBRARIES test-raft)
-add_scylla_test(raft_address_map_test
-  KIND SEASTAR)
 add_scylla_test(raft_server_test
   KIND SEASTAR
   LIBRARIES test-raft)

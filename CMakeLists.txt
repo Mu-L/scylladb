@@ -2,8 +2,6 @@ cmake_minimum_required(VERSION 3.27)
 
 project(scylla)
 
-include(CTest)
-
 list(APPEND CMAKE_MODULE_PATH
   ${CMAKE_CURRENT_SOURCE_DIR}/cmake
   ${CMAKE_CURRENT_SOURCE_DIR}/seastar/cmake)
@@ -24,8 +22,11 @@ if(DEFINED CMAKE_BUILD_TYPE)
     endif()
 endif(DEFINED CMAKE_BUILD_TYPE)
 
+option(Scylla_ENABLE_LTO "Turn on link-time optimization for the 'release' mode." ON)
+
 include(mode.common)
-if(CMAKE_CONFIGURATION_TYPES)
+get_property(is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(is_multi_config)
     foreach(config ${CMAKE_CONFIGURATION_TYPES})
         include(mode.${config})
         list(APPEND scylla_build_modes ${scylla_build_mode_${config}})
@@ -43,32 +44,81 @@ else()
 endif()
 
 include(limit_jobs)
+
 # Configure Seastar compile options to align with Scylla
 set(CMAKE_CXX_STANDARD "23" CACHE INTERNAL "")
 set(CMAKE_CXX_EXTENSIONS ON CACHE INTERNAL "")
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF CACHE INTERNAL "")
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
-set(Seastar_TESTING ON CACHE BOOL "" FORCE)
-set(Seastar_API_LEVEL 7 CACHE STRING "" FORCE)
-set(Seastar_DEPRECATED_OSTREAM_FORMATTERS OFF CACHE BOOL "" FORCE)
-set(Seastar_APPS ON CACHE BOOL "" FORCE)
-set(Seastar_EXCLUDE_APPS_FROM_ALL ON CACHE BOOL "" FORCE)
-set(Seastar_EXCLUDE_TESTS_FROM_ALL ON CACHE BOOL "" FORCE)
-set(Seastar_UNUSED_RESULT_ERROR ON CACHE BOOL "" FORCE)
-add_subdirectory(seastar)
+if(is_multi_config)
+    find_package(Seastar)
+    # this is atypical compared to standard ExternalProject usage:
+    # - Seastar's build system should already be configured at this point.
+    # - We maintain separate project variants for each configuration type.
+    #
+    # Benefits of this approach:
+    # - Allows the parent project to consume the compile options exposed by
+    #   .pc file. as the compile options vary from one config to another.
+    # - Allows application of config-specific settings
+    # - Enables building Seastar within the parent project's build system
+    # - Facilitates linking of artifacts with the external project target,
+    #   establishing proper dependencies between them
+    include(ExternalProject)
+
+    ExternalProject_Add(Seastar
+        SOURCE_DIR "${PROJECT_SOURCE_DIR}/seastar"
+        BINARY_DIR "${CMAKE_BINARY_DIR}/$<CONFIG>/seastar"
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR>
+          --target seastar
+          --target seastar_testing
+          --target seastar_perf_testing
+          --target app_iotune
+        BUILD_ALWAYS ON
+        BUILD_BYPRODUCTS
+          <BINARY_DIR>/libseastar.$<IF:$<CONFIG:Debug,Dev>,so,a>
+          <BINARY_DIR>/libseastar_testing.$<IF:$<CONFIG:Debug,Dev>,so,a>
+          <BINARY_DIR>/libseastar_perf_testing.$<IF:$<CONFIG:Debug,Dev>,so,a>
+          <BINARY_DIR>/apps/iotune/iotune
+          <BINARY_DIR>/gen/include/seastar/http/chunk_parsers.hh
+          <BINARY_DIR>/gen/include/seastar/http/request_parser.hh
+          <BINARY_DIR>/gen/include/seastar/http/response_parser.hh
+        INSTALL_COMMAND "")
+    add_dependencies(Seastar::seastar Seastar)
+    add_dependencies(Seastar::seastar_testing Seastar)
+else()
+    set(Seastar_TESTING ON CACHE BOOL "" FORCE)
+    set(Seastar_API_LEVEL 7 CACHE STRING "" FORCE)
+    set(Seastar_DEPRECATED_OSTREAM_FORMATTERS OFF CACHE BOOL "" FORCE)
+    set(Seastar_APPS ON CACHE BOOL "" FORCE)
+    set(Seastar_EXCLUDE_APPS_FROM_ALL ON CACHE BOOL "" FORCE)
+    set(Seastar_EXCLUDE_TESTS_FROM_ALL ON CACHE BOOL "" FORCE)
+    set(Seastar_IO_URING ON CACHE BOOL "" FORCE)
+    set(Seastar_SCHEDULING_GROUPS_COUNT 19 CACHE STRING "" FORCE)
+    set(Seastar_UNUSED_RESULT_ERROR ON CACHE BOOL "" FORCE)
+    add_subdirectory(seastar)
+    target_compile_definitions (seastar
+      PRIVATE
+        SEASTAR_NO_EXCEPTION_HACK)
+endif()
+
 set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
 
+if(Scylla_ENABLE_LTO)
+    list(APPEND absl_cxx_flags $<$<CONFIG:RelWithDebInfo>:${CMAKE_CXX_COMPILE_OPTIONS_IPO};-ffat-lto-objects>)
+endif()
+
 find_package(Sanitizers QUIET)
-set(sanitizer_cxx_flags
-    $<$<IN_LIST:$<CONFIG>,Debug;Sanitize>:$<TARGET_PROPERTY:Sanitizers::address,INTERFACE_COMPILE_OPTIONS>;$<TARGET_PROPERTY:Sanitizers::undefined_behavior,INTERFACE_COMPILE_OPTIONS>>)
+list(APPEND absl_cxx_flags
+    $<$<CONFIG:Debug,Sanitize>:$<TARGET_PROPERTY:Sanitizers::address,INTERFACE_COMPILE_OPTIONS>;$<TARGET_PROPERTY:Sanitizers::undefined_behavior,INTERFACE_COMPILE_OPTIONS>>)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set(ABSL_GCC_FLAGS ${sanitizer_cxx_flags})
+    list(APPEND ABSL_GCC_FLAGS ${absl_cxx_flags})
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    set(ABSL_LLVM_FLAGS ${sanitizer_cxx_flags})
+    list(APPEND ABSL_LLVM_FLAGS ${absl_cxx_flags})
 endif()
 set(ABSL_DEFAULT_LINKOPTS
-    $<$<IN_LIST:$<CONFIG>,Debug;Sanitize>:$<TARGET_PROPERTY:Sanitizers::address,INTERFACE_LINK_LIBRARIES>;$<TARGET_PROPERTY:Sanitizers::undefined_behavior,INTERFACE_LINK_LIBRARIES>>)
+    $<$<CONFIG:Debug,Sanitize>:$<TARGET_PROPERTY:Sanitizers::address,INTERFACE_LINK_LIBRARIES>;$<TARGET_PROPERTY:Sanitizers::undefined_behavior,INTERFACE_LINK_LIBRARIES>>)
 add_subdirectory(abseil)
 add_library(absl-headers INTERFACE)
 target_include_directories(absl-headers SYSTEM INTERFACE
@@ -95,13 +145,16 @@ target_link_libraries(Boost::regex
 find_package(Lua REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(ICU COMPONENTS uc i18n REQUIRED)
-find_package(fmt 9.0.0 REQUIRED)
+find_package(fmt 10.0.0 REQUIRED)
 find_package(libdeflate REQUIRED)
 find_package(libxcrypt REQUIRED)
+find_package(p11-kit REQUIRED)
 find_package(Snappy REQUIRED)
 find_package(RapidJSON REQUIRED)
 find_package(xxHash REQUIRED)
+find_package(yaml-cpp REQUIRED)
 find_package(zstd REQUIRED)
+find_package(lz4 REQUIRED)
 
 set(scylla_gen_build_dir "${CMAKE_BINARY_DIR}/gen")
 file(MAKE_DIRECTORY "${scylla_gen_build_dir}")
@@ -138,6 +191,7 @@ target_sources(scylla-main
     keys.cc
     multishard_mutation_query.cc
     mutation_query.cc
+    node_ops/task_manager_module.cc
     partition_slice_builder.cc
     querier.cc
     query.cc
@@ -146,11 +200,13 @@ target_sources(scylla-main
     tombstone_gc_options.cc
     tombstone_gc.cc
     reader_concurrency_semaphore.cc
+    reader_concurrency_semaphore_group.cc
     row_cache.cc
     schema_mutations.cc
     serializer.cc
     sstables_loader.cc
     table_helper.cc
+    tasks/task_handler.cc
     tasks/task_manager.cc
     timeout_config.cc
     unimplemented.cc
@@ -167,7 +223,10 @@ target_link_libraries(scylla-main
     Seastar::seastar
     Snappy::snappy
     systemd
-    ZLIB::ZLIB)
+    ZLIB::ZLIB
+    lz4::lz4_static
+    zstd::zstd_static
+)
 
 option(Scylla_CHECK_HEADERS
   "Add check-headers target for checking the self-containness of headers")
@@ -194,8 +253,15 @@ include(check_headers)
 check_headers(check-headers scylla-main
   GLOB ${CMAKE_CURRENT_SOURCE_DIR}/*.hh)
 
+option(Scylla_DIST
+  "Build dist targets"
+  ON)
+
+add_custom_target(compiler-training)
+
 add_subdirectory(api)
 add_subdirectory(alternator)
+add_subdirectory(audit)
 add_subdirectory(db)
 add_subdirectory(auth)
 add_subdirectory(cdc)
@@ -203,6 +269,7 @@ add_subdirectory(compaction)
 add_subdirectory(cql3)
 add_subdirectory(data_dictionary)
 add_subdirectory(dht)
+add_subdirectory(ent)
 add_subdirectory(gms)
 add_subdirectory(idl)
 add_subdirectory(index)
@@ -233,7 +300,8 @@ add_version_library(scylla_version
 
 add_executable(scylla
   main.cc)
-target_link_libraries(scylla PRIVATE
+set(scylla_libs
+    audit
     scylla-main
     api
     auth
@@ -244,10 +312,12 @@ target_link_libraries(scylla PRIVATE
     cql3
     data_dictionary
     dht
+    encryption
     gms
     idl
     index
     lang
+    ldap
     locator
     message
     mutation
@@ -268,14 +338,36 @@ target_link_libraries(scylla PRIVATE
     transport
     types
     utils)
+target_link_libraries(scylla PRIVATE
+    ${scylla_libs})
+
+if(Scylla_ENABLE_LTO)
+  include(enable_lto)
+  foreach(target scylla ${scylla_libs})
+    enable_lto(${target})
+  endforeach()
+endif()
 
 target_link_libraries(scylla PRIVATE
-    seastar
+    p11-kit::p11-kit
+    Seastar::seastar
     absl::headers
+    yaml-cpp::yaml-cpp
     Boost::program_options)
 
 target_include_directories(scylla PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${scylla_gen_build_dir}")
 
-add_subdirectory(dist)
+add_custom_target(maybe-scylla
+  DEPENDS $<$<CONFIG:Dev>:$<TARGET_FILE:scylla>>)
+add_dependencies(compiler-training
+  maybe-scylla)
+
+if(Scylla_DIST)
+  add_subdirectory(dist)
+endif()
+
+if(Scylla_BUILD_INSTRUMENTED)
+  add_subdirectory(pgo)
+endif()

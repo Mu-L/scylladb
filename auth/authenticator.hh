@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -43,6 +43,11 @@ struct certificate_info {
 
 using session_dn_func = std::function<future<std::optional<certificate_info>>()>;
 
+class unsupported_authentication_operation : public std::invalid_argument {
+public:
+    using std::invalid_argument::invalid_argument;
+};
+
 ///
 /// Abstract client for authenticating role identity.
 ///
@@ -61,6 +66,12 @@ public:
     /// The name of the key to be used for the password part of password authentication with \ref authenticate.
     ///
     static const sstring PASSWORD_KEY;
+
+    /// Service for SASL authentication.
+    static const sstring SERVICE_KEY;
+
+    /// Realm for SASL authentication.
+    static const sstring REALM_KEY;
 
     using credentials_map = std::unordered_map<sstring, sstring>;
 
@@ -128,6 +139,19 @@ public:
     /// If no options are set the result is an empty container.
     ///
     virtual future<custom_options> query_custom_options(std::string_view role_name) const = 0;
+
+    virtual bool uses_password_hashes() const {
+        return false;
+    }
+
+    ///
+    /// Query the password hash corresponding to a given role.
+    ///
+    /// If the authenticator doesn't use password hashes, throws an `unsupported_authentication_operation` exception.
+    ///
+    virtual future<std::optional<sstring>> get_password_hash(std::string_view role_name) const {
+        return make_exception_future<std::optional<sstring>>(unsupported_authentication_operation("get_password_hash is not implemented"));
+    }
 
     ///
     /// System resources used internally as part of the implementation. These are made inaccessible to users.

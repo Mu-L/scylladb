@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,6 +12,8 @@
 #include "schema/schema_fwd.hh"
 #include "gc_clock.hh"
 #include "mutation/atomic_cell.hh"
+#include "mutation/compact_and_expire_result.hh"
+#include "compaction/compaction_garbage_collector.hh"
 #include <iosfwd>
 #include <forward_list>
 
@@ -34,7 +36,7 @@ struct collection_mutation_description {
 
     // Expires cells based on query_time. Expires tombstones based on max_purgeable and gc_before.
     // Removes cells covered by tomb or this->tomb.
-    bool compact_and_expire(column_id id, row_tombstone tomb, gc_clock::time_point query_time,
+    compact_and_expire_result compact_and_expire(column_id id, row_tombstone tomb, gc_clock::time_point query_time,
         can_gc_fn&, gc_clock::time_point gc_before, compaction_garbage_collector* collector = nullptr);
 
     // Packs the data to a serialized blob.

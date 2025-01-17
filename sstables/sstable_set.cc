@@ -3,15 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <algorithm>
+
+#include "utils/assert.hh"
 #include <seastar/util/defer.hh>
 
 #include <boost/icl/interval_map.hpp>
 #include <boost/range/adaptor/map.hpp>
 #include <boost/range/algorithm/remove_if.hpp>
-#include <boost/range/algorithm/sort.hpp>
+#include <boost/range/algorithm/copy.hpp>
+#include <boost/range/numeric.hpp>
 
 #include "sstables.hh"
 
@@ -89,11 +93,11 @@ void sstable_run::erase(shared_sstable sst) {
 }
 
 uint64_t sstable_run::data_size() const {
-    return boost::accumulate(_all | boost::adaptors::transformed(std::mem_fn(&sstable::data_size)), uint64_t(0));
+    return std::ranges::fold_left(_all | std::views::transform(std::mem_fn(&sstable::data_size)), uint64_t(0), std::plus{});
 }
 
 double sstable_run::estimate_droppable_tombstone_ratio(const gc_clock::time_point& compaction_time, const tombstone_gc_state& gc_state, const schema_ptr& s) const {
-    auto estimate_sum = boost::accumulate(_all | boost::adaptors::transformed(std::bind(&sstable::estimate_droppable_tombstone_ratio, std::placeholders::_1, compaction_time, gc_state, s)), double(0));
+    auto estimate_sum = std::ranges::fold_left(_all | std::views::transform(std::bind(&sstable::estimate_droppable_tombstone_ratio, std::placeholders::_1, compaction_time, gc_state, s)), double(0), std::plus{});
     return _all.size() ? estimate_sum / _all.size() : double(0);
 }
 
@@ -109,9 +113,9 @@ std::ostream& operator<<(std::ostream& os, const sstables::sstable_run& run) {
         os << format("  Identifier: {}\n", (*run.all().begin())->run_identifier());
     }
 
-    auto frags = boost::copy_range<std::vector<shared_sstable>>(run.all());
-    boost::sort(frags, [] (const shared_sstable& x, const shared_sstable& y) {
-        return x->get_first_decorated_key().token() < y->get_first_decorated_key().token();
+    auto frags = run.all() | std::ranges::to<std::vector<shared_sstable>>();
+    std::ranges::sort(frags, std::ranges::less(), [] (const shared_sstable& x) {
+        return x->get_first_decorated_key().token();
     });
     os << "  Fragments = {\n";
     for (auto& frag : frags) {
@@ -155,7 +159,7 @@ sstable_set::all_sstable_runs() const {
 
 std::vector<frozen_sstable_run>
 partitioned_sstable_set::all_sstable_runs() const {
-    return boost::copy_range<std::vector<frozen_sstable_run>>(_all_runs | boost::adaptors::map_values);
+    return _all_runs | std::views::values | std::ranges::to<std::vector<frozen_sstable_run>>();
 }
 
 lw_shared_ptr<const sstable_list>
@@ -300,9 +304,9 @@ partitioned_sstable_set::partitioned_sstable_set(schema_ptr schema, bool use_lev
 }
 
 static std::unordered_map<run_id, shared_sstable_run> clone_runs(const std::unordered_map<run_id, shared_sstable_run>& runs) {
-    return boost::copy_range<std::unordered_map<run_id, shared_sstable_run>>(runs | boost::adaptors::transformed([] (auto& p) {
+    return runs | std::views::transform([] (auto& p) {
         return std::make_pair(p.first, make_lw_shared<sstable_run>(*p.second));
-    }));
+    }) | std::ranges::to<std::unordered_map<run_id, shared_sstable_run>>();
 }
 
 partitioned_sstable_set::partitioned_sstable_set(schema_ptr schema, const std::vector<shared_sstable>& unleveled_sstables, const interval_map_type& leveled_sstables,
@@ -506,11 +510,11 @@ std::unique_ptr<sstable_set_impl> time_series_sstable_set::clone() const {
 }
 
 std::vector<shared_sstable> time_series_sstable_set::select(const dht::partition_range& range) const {
-    return boost::copy_range<std::vector<shared_sstable>>(*_sstables | boost::adaptors::map_values);
+    return *_sstables | std::views::values | std::ranges::to<std::vector>();
 }
 
 lw_shared_ptr<const sstable_list> time_series_sstable_set::all() const {
-    return make_lw_shared<const sstable_list>(boost::copy_range<const sstable_list>(*_sstables | boost::adaptors::map_values));
+    return make_lw_shared<const sstable_list>(*_sstables | std::views::values | std::ranges::to<sstable_list>());
 }
 
 size_t
@@ -693,8 +697,8 @@ public:
 
         // by !empty(bound) and `_it` invariant:
         //      _it != _end, _it->first <= bound, and filter(*_it->second) == true
-        assert(_cmp(_it->first, bound) <= 0);
-        // we don't assert(filter(*_it->second)) due to the requirement that `filter` is called at most once for each sstable
+        SCYLLA_ASSERT(_cmp(_it->first, bound) <= 0);
+        // we don't SCYLLA_ASSERT(filter(*_it->second)) due to the requirement that `filter` is called at most once for each sstable
 
         // Find all sstables with the same position as `_it` (they form a contiguous range in the container).
         auto next = std::find_if(std::next(_it), _end, [this] (const value_t& v) { return _cmp(v.first, _it->first) != 0; });
@@ -795,7 +799,7 @@ public:
             const dht::partition_range& pr,
             tracing::trace_state_ptr trace_state,
             sstable_reader_factory_type fn)
-        : reader_selector(s, pr.start() ? pr.start()->value() : dht::ring_position_view::min())
+        : reader_selector(s, pr.start() ? pr.start()->value() : dht::ring_position_view::min(), sstables->size())
         , _pr(&pr)
         , _sstables(std::move(sstables))
         , _trace_state(std::move(trace_state))
@@ -826,9 +830,9 @@ public:
             irclogger.trace("{}: {} sstables to consider, advancing selector to {}", fmt::ptr(this), selection.sstables.size(),
                     _selector_position);
 
-            readers = boost::copy_range<std::vector<mutation_reader>>(selection.sstables
-                    | boost::adaptors::filtered([this] (auto& sst) { return _read_sstable_gens.emplace(sst->generation()).second; })
-                    | boost::adaptors::transformed([this] (auto& sst) { return this->create_reader(sst); }));
+            readers = std::ranges::to<std::vector<mutation_reader>>(selection.sstables
+                    | std::views::filter([this] (auto& sst) { return _read_sstable_gens.emplace(sst->generation()).second; })
+                    | std::views::transform([this] (auto& sst) { return this->create_reader(sst); }));
         } while (!_selector_position.is_max() && readers.empty() && (!pos || dht::ring_position_tri_compare(*_s, *pos, _selector_position) >= 0));
 
         irclogger.trace("{}: created {} new readers", fmt::ptr(this), readers.size());
@@ -948,13 +952,12 @@ sstable_set_impl::create_single_key_sstable_reader(
     if (!num_sstables) {
         return make_empty_flat_reader_v2(schema, permit);
     }
-    auto readers = boost::copy_range<std::vector<mutation_reader>>(
-        filter_sstable_for_reader_by_ck(std::move(selected_sstables), *cf, schema, slice)
-        | boost::adaptors::transformed([&] (const shared_sstable& sstable) {
+    auto readers = filter_sstable_for_reader_by_ck(std::move(selected_sstables), *cf, schema, slice)
+        | std::views::transform([&] (const shared_sstable& sstable) {
             tracing::trace(trace_state, "Reading key {} from sstable {}", pos, seastar::value_of([&sstable] { return sstable->get_filename(); }));
             return sstable->make_reader(schema, permit, pr, slice, trace_state, fwd);
-        })
-    );
+          })
+        | std::ranges::to<std::vector<mutation_reader>>();
 
     // If filter_sstable_for_reader_by_ck filtered any sstable that contains the partition
     // we want to emit partition_start/end if no rows were found,
@@ -1111,7 +1114,7 @@ lw_shared_ptr<const sstable_list> compound_sstable_set::all() const {
     }
 
     auto ret = make_lw_shared<sstable_list>();
-    for (auto& set : boost::make_iterator_range(sets.begin(), it)) {
+    for (auto& set : std::ranges::subrange(sets.begin(), it)) {
         auto ssts = set->all();
         ret->reserve(ret->size() + ssts->size());
         ret->insert(ssts->begin(), ssts->end());
@@ -1147,12 +1150,12 @@ bool compound_sstable_set::erase(shared_sstable sst) {
 
 size_t
 compound_sstable_set::size() const noexcept {
-    return boost::accumulate(_sets | boost::adaptors::transformed(std::mem_fn(&sstable_set::size)), size_t(0));
+    return std::ranges::fold_left(_sets | std::views::transform(std::mem_fn(&sstable_set::size)), size_t(0), std::plus{});
 }
 
 uint64_t
 compound_sstable_set::bytes_on_disk() const noexcept {
-    return boost::accumulate(_sets | boost::adaptors::transformed(std::mem_fn(&sstable_set::bytes_on_disk)), uint64_t(0));
+    return std::ranges::fold_left(_sets | std::views::transform(std::mem_fn(&sstable_set::bytes_on_disk)), uint64_t(0), std::plus{});
 }
 
 class compound_sstable_set::incremental_selector : public incremental_selector_impl {
@@ -1161,9 +1164,9 @@ class compound_sstable_set::incremental_selector : public incremental_selector_i
     std::vector<sstable_set::incremental_selector> _selectors;
 private:
     std::vector<sstable_set::incremental_selector> make_selectors(const std::vector<lw_shared_ptr<sstable_set>>& sets) {
-        return boost::copy_range<std::vector<sstable_set::incremental_selector>>(_sets | boost::adaptors::transformed([] (const auto& set) {
+        return _sets | std::views::transform([] (const auto& set) {
             return set->make_incremental_selector();
-        }));
+        }) | std::ranges::to<std::vector<sstable_set::incremental_selector>>();
     }
 public:
     incremental_selector(const schema& schema, const std::vector<lw_shared_ptr<sstable_set>>& sets)
@@ -1243,12 +1246,11 @@ compound_sstable_set::create_single_key_sstable_reader(
         return non_empty_set->create_single_key_sstable_reader(cf, std::move(schema), std::move(permit), sstable_histogram, pr, slice, trace_state, fwd, fwd_mr, predicate);
     }
 
-    auto readers = boost::copy_range<std::vector<mutation_reader>>(
-        boost::make_iterator_range(sets.begin(), it)
-        | boost::adaptors::transformed([&] (const lw_shared_ptr<sstable_set>& non_empty_set) {
+    auto readers = std::ranges::subrange(sets.begin(), it)
+        | std::views::transform([&] (const lw_shared_ptr<sstable_set>& non_empty_set) {
             return non_empty_set->create_single_key_sstable_reader(cf, schema, permit, sstable_histogram, pr, slice, trace_state, fwd, fwd_mr, predicate);
-        })
-    );
+          })
+        | std::ranges::to<std::vector<mutation_reader>>();
     return make_combined_reader(std::move(schema), std::move(permit), std::move(readers), fwd, fwd_mr);
 }
 
@@ -1264,7 +1266,7 @@ sstable_set::create_single_key_sstable_reader(
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr,
         const sstable_predicate& predicate) const {
-    assert(pr.is_singular() && pr.start()->value().has_key());
+    SCYLLA_ASSERT(pr.is_singular() && pr.start()->value().has_key());
     return _impl->create_single_key_sstable_reader(cf, std::move(schema),
             std::move(permit), sstable_histogram, pr, slice, std::move(trace_state), fwd, fwd_mr, predicate);
 }
@@ -1339,11 +1341,12 @@ sstable_set::make_range_sstable_reader(
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr,
-        read_monitor_generator& monitor_generator) const
+        read_monitor_generator& monitor_generator,
+        integrity_check integrity) const
 {
-    auto reader_factory_fn = [s, permit, &slice, trace_state, fwd, fwd_mr, &monitor_generator]
+    auto reader_factory_fn = [s, permit, &slice, trace_state, fwd, fwd_mr, &monitor_generator, integrity]
             (shared_sstable& sst, const dht::partition_range& pr) mutable {
-        return sst->make_reader(s, permit, pr, slice, trace_state, fwd, fwd_mr, monitor_generator(sst));
+        return sst->make_reader(s, permit, pr, slice, trace_state, fwd, fwd_mr, monitor_generator(sst), integrity);
     };
     return make_combined_reader(s, std::move(permit), std::make_unique<incremental_reader_selector>(s,
                     shared_from_this(),
@@ -1364,15 +1367,17 @@ sstable_set::make_local_shard_sstable_reader(
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr,
         read_monitor_generator& monitor_generator,
-        const sstable_predicate& predicate) const
+        const sstable_predicate& predicate,
+        combined_reader_statistics* statistics,
+        integrity_check integrity) const
 {
-    auto reader_factory_fn = [s, permit, &slice, trace_state, fwd, fwd_mr, &monitor_generator, &predicate]
+    auto reader_factory_fn = [s, permit, &slice, trace_state, fwd, fwd_mr, &monitor_generator, &predicate, integrity]
             (shared_sstable& sst, const dht::partition_range& pr) mutable {
-        assert(!sst->is_shared());
+        SCYLLA_ASSERT(!sst->is_shared());
         if (!predicate(*sst)) {
             return make_empty_flat_reader_v2(s, permit);
         }
-        auto reader = sst->make_reader(s, permit, pr, slice, trace_state, fwd, fwd_mr, monitor_generator(sst));
+        auto reader = sst->make_reader(s, permit, pr, slice, trace_state, fwd, fwd_mr, monitor_generator(sst), integrity);
         // Auto-closed sstable reader is only enabled in the context of fast-forward to partition ranges
         if (!fwd && fwd_mr) {
             return make_auto_closed_sstable_reader(sst, std::move(reader), permit);
@@ -1390,17 +1395,20 @@ sstable_set::make_local_shard_sstable_reader(
                     std::move(trace_state),
                     std::move(reader_factory_fn)),
             fwd,
-            fwd_mr);
+            fwd_mr,
+            statistics);
 }
 
-mutation_reader sstable_set::make_crawling_reader(
+mutation_reader sstable_set::make_full_scan_reader(
         schema_ptr schema,
         reader_permit permit,
         tracing::trace_state_ptr trace_ptr,
-        read_monitor_generator& monitor_generator) const {
+        read_monitor_generator& monitor_generator,
+        integrity_check integrity) const {
     std::vector<mutation_reader> readers;
+    readers.reserve(size());
     for_each_sstable([&] (const shared_sstable& sst) mutable {
-        readers.emplace_back(sst->make_crawling_reader(schema, permit, trace_ptr, monitor_generator(sst)));
+        readers.emplace_back(sst->make_full_scan_reader(schema, permit, trace_ptr, monitor_generator(sst), integrity));
     });
     return make_combined_reader(schema, std::move(permit), std::move(readers), streamed_mutation::forwarding::no, mutation_reader::forwarding::no);
 }

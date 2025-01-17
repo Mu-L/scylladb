@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "cql3/type_json.hh"
@@ -253,7 +253,7 @@ static bytes from_json_object_aux(const user_type_impl& ut, const rjson::value& 
     }
 
     if (!remaining_names.empty()) {
-        throw marshal_exception(format(
+        throw marshal_exception(seastar::format(
                 "Extraneous field definition for user type {}: {}", ut.get_name_as_string(), *remaining_names.begin()));
     }
     return ut.build_value(std::move(raw_tuple));

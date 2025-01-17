@@ -5,14 +5,14 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "gms/endpoint_state.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
-#include <ostream>
+#include <seastar/core/on_internal_error.hh>
 #include <boost/lexical_cast.hpp>
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace gms {
 
@@ -75,9 +75,6 @@ std::unordered_set<dht::token> endpoint_state::get_tokens() const {
     std::unordered_set<dht::token> ret;
     if (auto app_state = get_application_state_ptr(application_state::TOKENS)) {
         ret = versioned_value::tokens_from_string(app_state->value());
-        if (ret.empty()) {
-            on_internal_error_noexcept(logger, format("Node {} has empty tokens state", get_host_id()));
-        }
     }
     return ret;
 }

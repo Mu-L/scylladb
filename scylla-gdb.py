@@ -6,6 +6,7 @@ import gdb.printing
 import uuid
 import argparse
 import datetime
+import functools
 import re
 from operator import attrgetter
 from collections import defaultdict
@@ -18,6 +19,7 @@ import subprocess
 import time
 import socket
 import string
+import math
 
 
 def align_up(ptr, alignment):
@@ -60,6 +62,13 @@ def get_field_offset(gdb_type, name):
         if field.name == name:
             return int(field.bitpos / 8)
 
+@functools.cache
+def size_t():
+    return gdb.lookup_type('size_t')
+
+@functools.cache
+def _vptr_type():
+    return gdb.lookup_type('uintptr_t').pointer()
 
 # Defer initialization to first use
 # Don't prevent loading `scylla-gdb.py` due to any problem in the init code.
@@ -117,8 +126,6 @@ def downcast_vptr(ptr):
 
 
 class intrusive_list:
-    size_t = gdb.lookup_type('size_t')
-
     def __init__(self, list_ref, link=None):
         list_type = list_ref.type.strip_typedefs()
         self.node_type = list_type.template_argument(0)
@@ -135,7 +142,7 @@ class intrusive_list:
             if not member_hook:
                 member_hook = get_template_arg_with_prefix(list_type, "struct boost::intrusive::member_hook")
             if member_hook:
-                self.link_offset = member_hook.template_argument(2).cast(self.size_t)
+                self.link_offset = member_hook.template_argument(2).cast(size_t())
             else:
                 self.link_offset = get_base_class_offset(self.node_type, "boost::intrusive::list_base_hook")
                 if self.link_offset is None:
@@ -144,7 +151,7 @@ class intrusive_list:
     def __iter__(self):
         hook = self.root['next_']
         while hook and hook != self.root.address:
-            node_ptr = hook.cast(self.size_t) - self.link_offset
+            node_ptr = hook.cast(size_t()) - self.link_offset
             yield node_ptr.cast(self.node_type.pointer()).dereference()
             hook = hook['next_']
 
@@ -159,8 +166,6 @@ class intrusive_list:
 
 
 class intrusive_slist:
-    size_t = gdb.lookup_type('size_t')
-
     def __init__(self, list_ref, link=None):
         list_type = list_ref.type.strip_typedefs()
         self.node_type = list_type.template_argument(0)
@@ -172,7 +177,7 @@ class intrusive_slist:
         else:
             member_hook = get_template_arg_with_prefix(list_type, "struct boost::intrusive::member_hook")
             if member_hook:
-                self.link_offset = member_hook.template_argument(2).cast(self.size_t)
+                self.link_offset = member_hook.template_argument(2).cast(size_t())
             else:
                 self.link_offset = get_base_class_offset(self.node_type, "boost::intrusive::slist_base_hook")
                 if self.link_offset is None:
@@ -181,7 +186,7 @@ class intrusive_slist:
     def __iter__(self):
         hook = self.root['next_']
         while hook != self.root.address:
-            node_ptr = hook.cast(self.size_t) - self.link_offset
+            node_ptr = hook.cast(size_t()) - self.link_offset
             yield node_ptr.cast(self.node_type.pointer()).dereference()
             hook = hook['next_']
 
@@ -200,19 +205,13 @@ class std_optional:
         self.ref = ref
 
     def get(self):
-        try:
-            return self.ref['_M_payload']['_M_payload']['_M_value']
-        except gdb.error:
-            return self.ref['_M_payload'] # Scylla 3.0 compatibility
+        return self.ref['_M_payload']['_M_payload']['_M_value']
 
     def __bool__(self):
         return self.__nonzero__()
 
     def __nonzero__(self):
-        try:
-            return bool(self.ref['_M_payload']['_M_engaged'])
-        except gdb.error:
-            return bool(self.ref['_M_engaged']) # Scylla 3.0 compatibility
+        return bool(self.ref['_M_payload']['_M_engaged'])
 
 
 class std_tuple:
@@ -239,8 +238,6 @@ class std_tuple:
 
 
 class intrusive_set:
-    size_t = gdb.lookup_type('size_t')
-
     def __init__(self, ref, link=None):
         container_type = ref.type.strip_typedefs()
         self.node_type = container_type.template_argument(0)
@@ -250,7 +247,7 @@ class intrusive_set:
             member_hook = get_template_arg_with_prefix(container_type, "boost::intrusive::member_hook")
             if not member_hook:
                 raise Exception('Expected member_hook<> option not found in container\'s template parameters')
-            self.link_offset = member_hook.template_argument(2).cast(self.size_t)
+            self.link_offset = member_hook.template_argument(2).cast(size_t())
         self.root = ref['holder']['root']['parent_']
 
     def __visit(self, node):
@@ -258,7 +255,7 @@ class intrusive_set:
             for n in self.__visit(node['left_']):
                 yield n
 
-            node_ptr = node.cast(self.size_t) - self.link_offset
+            node_ptr = node.cast(size_t()) - self.link_offset
             yield node_ptr.cast(self.node_type.pointer()).dereference()
 
             for n in self.__visit(node['right_']):
@@ -427,8 +424,6 @@ class std_variant:
 
 
 class std_map:
-    size_t = gdb.lookup_type('size_t')
-
     def __init__(self, ref):
         container_type = ref.type.strip_typedefs()
         kt = container_type.template_argument(0)
@@ -444,6 +439,32 @@ class std_map:
 
             value = (node + 1).cast(self.value_type.pointer()).dereference()
             yield value['first'], value['second']
+
+            for n in self.__visit(node['_M_right']):
+                yield n
+
+    def __iter__(self):
+        for n in self.__visit(self.root):
+            yield n
+
+    def __len__(self):
+        return self.size
+
+
+class std_set:
+    def __init__(self, ref):
+        container_type = ref.type.strip_typedefs()
+        self.value_type = gdb.parse_and_eval(f'(({container_type}::value_type*)0)').type.target()
+        self.root = ref['_M_t']['_M_impl']['_M_header']['_M_parent']
+        self.size = int(ref['_M_t']['_M_impl']['_M_node_count'])
+
+    def __visit(self, node):
+        if node:
+            for n in self.__visit(node['_M_left']):
+                yield n
+
+            value = (node + 1).cast(self.value_type.pointer()).dereference()
+            yield value
 
             for n in self.__visit(node['_M_right']):
                 yield n
@@ -617,7 +638,10 @@ class absl_container:
                 break
             if ctrl_t >= 0:
                 # NOTE: this only works for flat_hash_map
-                yield slots[i]['key'], slots[i]['value']
+                if slots[i]['value'].type.name.find("::map_slot_type") != -1:
+                    yield slots[i]['key'], slots[i]['value']['second']
+                else:
+                    yield slots[i]['key'], slots[i]['value']
 
     def __nonzero__(self):
         return self.size > 0
@@ -704,13 +728,7 @@ class static_vector:
     def __iter__(self):
         t = self.ref.type.strip_typedefs()
         value_type = t.template_argument(0)
-        try:
-            data = self.ref['m_holder']['storage']['data'].cast(value_type.pointer())
-        except:
-            try:
-                data = self.ref['m_holder']['storage']['dummy']['dummy'].cast(value_type.pointer()) # Scylla 3.1 compatibility
-            except gdb.error:
-                data = self.ref['m_holder']['storage']['dummy'].cast(value_type.pointer()) # Scylla 3.0 compatibility
+        data = self.ref['m_holder']['storage']['data'].cast(value_type.pointer())
         for i in range(self.__len__()):
             yield data[i]
 
@@ -832,6 +850,74 @@ class chunked_managed_vector:
         for chunk in managed_vector(self._ref['_chunks']):
             for e in managed_vector(chunk):
                 yield e
+
+
+class chunked_fifo:
+    class chunk:
+        def __init__(self, ref):
+            self.items = ref['items']
+            self.begin = ref['begin']
+            self.end = ref['end']
+            self.next_one = ref['next']
+
+        def __len__(self):
+            return self.end - self.begin
+
+    class iterator:
+        def __init__(self, fifo, chunk):
+            self.fifo = fifo
+            self.chunk = chunk
+            self.index = self.chunk.begin if chunk else 0
+
+        def __next__(self):
+            if self.index == 0:
+                raise StopIteration
+            if self.index == self.chunk.end:
+                if not self.chunk.next_one:
+                    raise StopIteration
+                self.chunk = chunked_fifo.chunk(self.chunk.next_one)
+                self.index = self.chunk.begin
+            index = self.index
+            self.index += 1
+            return self.chunk.items[self.fifo.mask(index)]['data']
+
+    def __init__(self, ref):
+        self._ref = ref
+        # try to access the member variable, so the constructor throws if the
+        # inspected variable is of the wrong type
+        _ = self.front_chunk
+
+    def mask(self, index):
+        return index & (self.items_per_chunk - 1)
+
+    @property
+    def items_per_chunk(self):
+        return self._ref.type.template_argument(1)
+
+    @property
+    def front_chunk(self):
+        return self._ref['_front_chunk']
+
+    @property
+    def back_chunk(self):
+        return self._ref['_back_chunk']
+
+    def __len__(self):
+        if not self.front_chunk:
+            return 0
+        if self.back_chunk == self.front_chunk:
+            front_chunk = self.chunk(self.front_chunk.dereference())
+            return len(front_chunk)
+        else:
+            front_chunk = self.chunk(self.front_chunk.dereference())
+            back_chunk = self.chunk(self.back_chunk.dereference())
+            num_chunks = self._ref['_nchunks'] - 2
+            return (len(front_chunk) +
+                    len(back_chunk) +
+                    num_chunks * self.items_per_chunk)
+
+    def __iter__(self):
+        return self.iterator(self, self.front_chunk)
 
 
 class sstring:
@@ -1141,10 +1227,7 @@ class boost_intrusive_list_printer(gdb.printing.PrettyPrinter):
 
 class interval_printer(gdb.printing.PrettyPrinter):
     def __init__(self, val):
-        try:
-            self.val = val['_interval']
-        except gdb.error: # 4.1 compatibility
-            self.val = val['_range']
+        self.val = val['_interval']
 
     def inspect_bound(self, bound_opt):
         bound = std_optional(bound_opt)
@@ -1158,6 +1241,9 @@ class interval_printer(gdb.printing.PrettyPrinter):
     def to_string(self):
         has_start, start_inclusive, start_value = self.inspect_bound(self.val['_start'])
         has_end, end_inclusive, end_value = self.inspect_bound(self.val['_end'])
+
+        if self.val['_singular']:
+            return '{{{}}}'.format(str(start_value))
 
         return '{}{}, {}{}'.format(
             '[' if start_inclusive else '(',
@@ -1979,16 +2065,10 @@ class dirty_mem_mgr():
         self.ref = ref
 
     def real_dirty(self):
-        try:
-            return int(self.ref['_region_group']['_real_total_memory'])
-        except gdb.error: # backward compatibility with <= 5.1
-            return int(self.ref['_real_region_group']['_total_memory'])
+        return int(self.ref['_region_group']['_real_total_memory'])
 
     def unspooled(self):
-        try:
-            return int(self.ref['_region_group']['_unspooled_total_memory'])
-        except gdb.error: # backward compatibility with <= 5.1
-            return int(self.ref['_virtual_region_group']['_total_memory'])
+        return int(self.ref['_region_group']['_unspooled_total_memory'])
 
 
 def find_instances(type_name):
@@ -2163,10 +2243,7 @@ class scylla_memory(gdb.Command):
         per_sg_stats = {}
         reactor = gdb.parse_and_eval('seastar::local_engine')
         for tq in get_local_task_queues():
-            try:
-                sched_group_specific = std_array(reactor['_scheduling_group_specific_data']['per_scheduling_group_data'])[int(tq['_id'])]['specific_vals']
-            except gdb.error: # 4.0 backwards compatibility
-                sched_group_specific = tq['_scheduling_group_specific_vals']
+            sched_group_specific = std_array(reactor['_scheduling_group_specific_data']['per_scheduling_group_data'])[int(tq['_id'])]['specific_vals']
             stats = std_vector(sched_group_specific)[key_id].reinterpret_cast(stats_ptr_type).dereference()
             if int(stats['writes']) == 0 and int(stats['background_writes']) == 0 and int(stats['foreground_reads']) == 0 and int(stats['reads']) == 0:
                 continue
@@ -2184,11 +2261,7 @@ class scylla_memory(gdb.Command):
             return
         global_sp_stats, per_sg_sp_stats = scylla_memory.summarize_storage_proxy_coordinator_stats(sp)
 
-        try:
-            # 4.4 compatibility
-            hm = std_optional(sp['_hints_manager']).get()
-        except gdb.error:
-            hm = sp['_hints_manager']
+        hm = sp['_hints_manager']
         view_hm = sp['_hints_for_views_manager']
 
         gdb.write('Coordinator:\n'
@@ -2229,10 +2302,7 @@ class scylla_memory(gdb.Command):
         initial_memory = int(semaphore["_initial_resources"]["memory"])
         used_count = initial_count - int(semaphore["_resources"]["count"])
         used_memory = initial_memory - int(semaphore["_resources"]["memory"])
-        try:
-            waiters = int(semaphore["_stats"]["waiters"])
-        except gdb.error: # 5.1 compatibility
-            waiters = int(semaphore["_wait_list"]["_size"])
+        waiters = int(semaphore["_stats"]["waiters"])
         return f'{semaphore_name:<16} {used_count:>3}/{initial_count:>3}, {used_memory:>13}/{initial_memory:>13}, queued: {waiters}'
 
     @staticmethod
@@ -2241,12 +2311,21 @@ class scylla_memory(gdb.Command):
         if not db:
             return
 
+        per_service_level_sem = []
+        for sg, sem in unordered_map(db["_reader_concurrency_semaphores_group"]["_semaphores"]):
+            per_service_level_sem.append(scylla_memory.format_semaphore_stats(sem["sem"]))
+
+        per_service_level_vu_sem = []
+        for sg, sem in unordered_map(db["_view_update_read_concurrency_semaphores_group"]["_semaphores"]):
+            per_service_level_vu_sem.append(scylla_memory.format_semaphore_stats(sem["sem"]))
+
         database_typename = lookup_type(['replica::database', 'database'])[1].name
         gdb.write('Replica:\n')
-        gdb.write('  Read Concurrency Semaphores:\n    {}\n    {}\n    {}\n'.format(
-                scylla_memory.format_semaphore_stats(db['_read_concurrency_sem']),
+        gdb.write('  Read Concurrency Semaphores:\n    {}\n    {}\n    {}\n    {}\n'.format(
+                '\n    '.join(per_service_level_sem),
                 scylla_memory.format_semaphore_stats(db['_streaming_concurrency_sem']),
-                scylla_memory.format_semaphore_stats(db['_system_read_concurrency_sem'])))
+                scylla_memory.format_semaphore_stats(db['_system_read_concurrency_sem']),
+                '\n    '.join(per_service_level_vu_sem)))
 
         gdb.write('  Execution Stages:\n')
         for es_path in [('_apply_stage',)]:
@@ -3785,7 +3864,10 @@ class scylla_io_queues(gdb.Command):
                 for pclass_ptr in handles:
                     self._print_io_priority_class(fq_pclass(pclass_ptr), names_from_ptrs)
 
-            pending = circular_buffer(ioq['_sink']['_pending_io'])
+            try:
+                pending = chunked_fifo(ioq['_sink']['_pending_io'])
+            except gdb.error:
+                pending = circular_buffer(ioq['_sink']['_pending_io'])
             gdb.write("\tPending in sink: ({})\n".format(len(pending)))
             for op in pending:
                 gdb.write("Completion {}\n".format(op['_completion']))
@@ -3817,7 +3899,6 @@ class scylla_fiber(gdb.Command):
 
     def __init__(self):
         gdb.Command.__init__(self, 'scylla fiber', gdb.COMMAND_USER, gdb.COMPLETE_NONE, True)
-        self._vptr_type = gdb.lookup_type('uintptr_t').pointer()
         self._task_symbol_matcher = task_symbol_matcher()
         self._thread_map = None
 
@@ -3845,7 +3926,7 @@ class scylla_fiber(gdb.Command):
             ptr_meta = None
 
         try:
-            maybe_vptr = int(gdb.Value(ptr).reinterpret_cast(self._vptr_type).dereference())
+            maybe_vptr = int(gdb.Value(ptr).reinterpret_cast(_vptr_type()).dereference())
             self._maybe_log("\t-> 0x{:016x}\n".format(maybe_vptr), verbose)
         except gdb.MemoryError:
             self._maybe_log("\tNot a pointer\n", verbose)
@@ -3867,7 +3948,7 @@ class scylla_fiber(gdb.Command):
         # So if the task is a coroutine, we should be able to find the resume function via offsetting by -2.
         # AFAIK both major compilers respect this convention.
         if resolved_symbol.startswith('vtable for seastar::internal::coroutine_traits_base'):
-            if block := gdb.block_for_pc((gdb.Value(ptr).cast(self._vptr_type) - 2).dereference()):
+            if block := gdb.block_for_pc((gdb.Value(ptr).cast(_vptr_type()) - 2).dereference()):
                 resume = block.function
                 resolved_symbol += f" ({resume.print_name} at {resume.symtab.filename}:{resume.line})"
             else:
@@ -3902,13 +3983,13 @@ class scylla_fiber(gdb.Command):
             region_start = pr.address
             region_end = region_start + pr.type.sizeof
         else:
-            region_start = ptr + self._vptr_type.sizeof # ignore our own vtable
-            region_end = region_start + (ptr_meta.size - ptr_meta.size % self._vptr_type.sizeof)
+            region_start = ptr + _vptr_type().sizeof # ignore our own vtable
+            region_end = region_start + (ptr_meta.size - ptr_meta.size % _vptr_type().sizeof)
 
         self._maybe_log("Scanning task #{} @ 0x{:016x}: {}\n".format(i, ptr, str(ptr_meta)), verbose)
 
-        for it in range(region_start, region_end, self._vptr_type.sizeof):
-            maybe_tptr = int(gdb.Value(it).reinterpret_cast(self._vptr_type).dereference())
+        for it in range(region_start, region_end, _vptr_type().sizeof):
+            maybe_tptr = int(gdb.Value(it).reinterpret_cast(_vptr_type()).dereference())
             self._maybe_log("0x{:016x}+0x{:04x} -> 0x{:016x}\n".format(ptr, it - ptr, maybe_tptr), verbose)
 
             res = self._probe_pointer(maybe_tptr, scanned_region_size, using_seastar_allocator, verbose)
@@ -3936,7 +4017,7 @@ class scylla_fiber(gdb.Command):
             self._maybe_log("Current task is a thread, trying to find the thread_wake_task on its stack: 0x{:x}\n".format(stack_ptr), verbose)
             stack_meta = scylla_ptr.analyze(stack_ptr)
             # stack grows downwards, so walk from end of buffer towards the beginning
-            for maybe_tptr in range(stack_ptr + stack_meta.size - self._vptr_type.sizeof, stack_ptr - self._vptr_type.sizeof, -self._vptr_type.sizeof):
+            for maybe_tptr in range(stack_ptr + stack_meta.size - _vptr_type().sizeof, stack_ptr - _vptr_type().sizeof, -_vptr_type().sizeof):
                 res = self._probe_pointer(maybe_tptr, scanned_region_size, using_seastar_allocator, verbose)
                 if res is not None and 'thread_wake_task' in res[2]:
                     return res
@@ -3960,7 +4041,7 @@ class scylla_fiber(gdb.Command):
             # Casts to templates with lambda template arguments just don't work.
             # We know the offset of the message queue reference in
             # async_work_item (first field) so we calculate and cast a pointer to it.
-            q_ptr = align_up(int(ptr_meta.ptr) + work_item_type.sizeof, self._vptr_type.sizeof)
+            q_ptr = align_up(int(ptr_meta.ptr) + work_item_type.sizeof, _vptr_type().sizeof)
             q = gdb.Value(q_ptr).reinterpret_cast(smp_mmessage_queue_ptr_type.pointer()).dereference()
             shard = int(q['_pending']['remote']['_id'])
             self._maybe_log("Deduced shard is {} (message queue 0x{:x} @ 0x{:x} + {})\n".format(shard, int(q), int(ptr_meta.ptr), q_ptr - int(ptr_meta.ptr)), verbose)
@@ -4099,7 +4180,7 @@ class scylla_find(gdb.Command):
       thread 1, small (size <= 512), live (0x6000000f3800 +48)
       thread 1, small (size <= 56), live (0x6000008a1230 +32)
     """
-    _vptr_type = gdb.lookup_type('uintptr_t').pointer()
+
     _size_char_to_size = {
         'b': 8,
         'h': 16,
@@ -4180,7 +4261,7 @@ class scylla_find(gdb.Command):
             else:
                 formatted_offset = ""
             if args.resolve:
-                maybe_vptr = int(gdb.Value(ptr_meta.obj_ptr).reinterpret_cast(scylla_find._vptr_type).dereference())
+                maybe_vptr = int(gdb.Value(ptr_meta.obj_ptr).reinterpret_cast(_vptr_type()).dereference())
                 symbol = resolve(maybe_vptr, cache=False)
                 if symbol is None:
                     gdb.write('{}{}\n'.format(formatted_offset, ptr_meta))
@@ -4355,18 +4436,13 @@ def find_sstables_attached_to_tables():
 
 def find_sstables():
     """A generator which yields pointers to all live sstable objects on current shard."""
-    try:
-        db = find_db(current_shard())
-        user_sstables_manager = std_unique_ptr(db["_user_sstables_manager"]).get()
-        system_sstables_manager = std_unique_ptr(db["_system_sstables_manager"]).get()
-        for manager in (user_sstables_manager, system_sstables_manager):
-            for sst_list_name in ("_active", "_undergoing_close"):
-                for sst in intrusive_list(manager[sst_list_name], link="_manager_list_link"):
-                    yield sst.address
-    except gdb.error:
-        # Scylla Enterprise 2020.1 compatibility
-        for sst in intrusive_list(gdb.parse_and_eval('sstables::tracker._sstables'), link='_tracker_link'):
-            yield sst.address
+    db = find_db(current_shard())
+    user_sstables_manager = std_unique_ptr(db["_user_sstables_manager"]).get()
+    system_sstables_manager = std_unique_ptr(db["_system_sstables_manager"]).get()
+    for manager in (user_sstables_manager, system_sstables_manager):
+        for sst_list_name in ("_active", "_undergoing_close"):
+            for sst in intrusive_list(manager[sst_list_name], link="_manager_list_link"):
+                yield sst.address
 
 
 class scylla_sstables(gdb.Command):
@@ -4505,6 +4581,17 @@ class scylla_memtables(gdb.Command):
             gdb.write('table %s:\n' % schema_ptr(table['_schema']).table_name())
             try:
                 sg_manager = std_unique_ptr(table["_sg_manager"]).get().dereference()
+                for (sg_id, sg_ptr) in absl_container(sg_manager["_storage_groups"]):
+                    sg = seastar_lw_shared_ptr(sg_ptr).get()
+                    scylla_memtables.dump_compaction_group_memtables(seastar_lw_shared_ptr(sg["_main_cg"]).get())
+                    for cg_ptr in std_vector(sg["_split_ready_groups"]):
+                        scylla_memtables.dump_compaction_group_memtables(seastar_lw_shared_ptr(cg_ptr).get())
+                return
+            except gdb.error:
+                pass
+
+            try:
+                sg_manager = std_unique_ptr(table["_sg_manager"]).get().dereference()
                 for cg in intrusive_list(sg_manager["_compaction_groups"], link='_list_hook'):
                     scylla_memtables.dump_compaction_group_memtables(cg)
                 return
@@ -4532,10 +4619,7 @@ class scylla_memtables(gdb.Command):
             except gdb.error:
                 pass
 
-            try:
-                scylla_memtables.dump_compaction_group_memtables(std_unique_ptr(table["_compaction_group"]).get())
-            except gdb.error:
-                scylla_memtables.dump_memtable_list(seastar_lw_shared_ptr(table['_memtables']).get()) # Scylla 5.1 compatibility
+            scylla_memtables.dump_compaction_group_memtables(std_unique_ptr(table["_compaction_group"]).get())
 
 def escape_html(s):
     return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
@@ -4904,7 +4988,6 @@ class scylla_small_objects(gdb.Command):
             self._resolve_symbols = resolve_symbols
 
             self._text_ranges = get_text_ranges()
-            self._vptr_type = gdb.lookup_type('uintptr_t').pointer()
             self._free_object_ptr = gdb.lookup_type('void').pointer().pointer()
             self._page_size = int(gdb.parse_and_eval('\'seastar::memory::page_size\''))
             self._free_in_pool = set()
@@ -4954,7 +5037,7 @@ class scylla_small_objects(gdb.Command):
                 obj = self._next_obj()
 
             if self._resolve_symbols:
-                addr = gdb.Value(obj).reinterpret_cast(self._vptr_type).dereference()
+                addr = gdb.Value(obj).reinterpret_cast(_vptr_type()).dereference()
                 if addr_in_ranges(self._text_ranges, addr):
                     return (obj, resolve(addr))
                 else:
@@ -5079,6 +5162,113 @@ class scylla_small_objects(gdb.Command):
             gdb.write("[{}] 0x{:x} {}\n".format(offset + i, obj, sym_text))
 
 
+class scylla_large_objects(gdb.Command):
+    """List live objects from one of the seastar allocator's large pools
+
+    The pool is selected with the `-o|--object-size` flag. Results are paginated by
+    default as there can be thousands of objects. Default page size is 20.
+    To list a certain page, use the `-p|--page` flag. To find out the number of
+    total objects and pages, use `--summarize`.
+    To sample random pages, use `--random-page`.
+
+    For usage see: scylla large-objects --help
+
+    Examples:
+
+    (gdb) scylla large-objects -o 32768 --summarize
+    number of objects: 9737
+    page size        : 20
+    number of pages  : 487
+
+    (gdb) scylla large-objects -o 131072 --random-page
+    [40] 0x60001cb40000
+    [41] 0x60001cb60000
+    [42] 0x60001cb80000
+    [43] 0x60001cba0000
+    [44] 0x60001cbc0000
+    [45] 0x60001cbe0000
+    [46] 0x60001cc00000
+    [47] 0x60001cc20000
+    [48] 0x60001cc40000
+    [49] 0x60001cc60000
+    [50] 0x60001cc80000
+    [51] 0x60001cca0000
+    [52] 0x60001ccc0000
+    [53] 0x60001cce0000
+    [54] 0x60001cd00000
+    [55] 0x60001cd20000
+    [56] 0x60001cd40000
+    [57] 0x60001cd60000
+    [58] 0x60001cd80000
+    [59] 0x60001cda0000
+    """
+
+    def __init__(self):
+        gdb.Command.__init__(self, 'scylla large-objects', gdb.COMMAND_USER, gdb.COMPLETE_COMMAND)
+        self._parser = None
+        self._objects = None
+        self._object_size = None
+
+    def init_parser(self):
+        parser = argparse.ArgumentParser(description="scylla large-objects")
+        parser.add_argument("-o", "--object-size", action="store", type=int, required=True,
+                            help="Object size, valid sizes are powers of two, above {}".format(int(gdb.parse_and_eval("seastar::memory::max_small_allocation"))))
+        parser.add_argument("-p", "--page", action="store", type=int, default=0, help="Page to show.")
+        parser.add_argument("-s", "--page-size", action="store", type=int, default=20,
+                help="Number of objects in a page. A page size of 0 turns off paging.")
+        parser.add_argument("--random-page", action="store_true", help="Show a random page.")
+        parser.add_argument("--summarize", action="store_true",
+                help="Print the number of objects and pages in the pool.")
+        parser.add_argument("--verbose", action="store_true",
+                help="Print additional details on what is going on.")
+
+        self._parser = parser
+
+    def invoke(self, arg, from_tty):
+        if self._parser is None:
+            self.init_parser()
+
+        try:
+            args = self._parser.parse_args(arg.split())
+        except SystemExit:
+            return
+
+        object_size = int(args.object_size / int(gdb.parse_and_eval('\'seastar::memory::page_size\'')))
+
+        if self._objects is None or object_size != self._object_size:
+            if args.verbose:
+                gdb.write(f"Object size changed ({self._object_size} pages -> {object_size} pages), scanning spans.\n")
+            # We materialize all relevant spans. There aren't usually that many
+            # of them. Rewrite this to be lazy if this proves problematic with
+            # certain cores.
+            self._objects = [s for s in spans() if s.is_large() and not s.is_free() and s.size() == object_size]
+
+        self._object_size = object_size
+
+        if args.summarize:
+            gdb.write("number of objects: {}\n"
+                      "page size        : {}\n"
+                      "number of pages  : {}\n"
+                      .format(
+                          len(self._objects),
+                          args.page_size,
+                          math.ceil(len(self._objects) / args.page_size)))
+            return
+
+        if args.random_page:
+            page = random.randint(0, int(len(self._objects) / args.page_size) - 1)
+        else:
+            page = args.page
+
+        if page >= len(self._objects)/args.page_size:
+            return
+
+        start = page * args.page_size
+        end = start + args.page_size
+        for index, span in enumerate(self._objects[start:end]):
+            gdb.write("[{}] 0x{:x}\n".format(start + index, span.start))
+
+
 class scylla_compaction_tasks(gdb.Command):
     """Summarize the compaction::compaction_task_executor instances.
 
@@ -5118,25 +5308,15 @@ class scylla_compaction_tasks(gdb.Command):
             pass
         task_hist = histogram(print_indicators=False)
 
-        task_list = list(std_list(cm['_tasks']))
+        try:
+            task_list = list(intrusive_list(cm['_tasks']))
+        except gdb.error: # 6.2 compatibility
+            task_list = list(std_list(cm['_tasks']))
+
         for task in task_list:
-            try:
-                task = seastar_shared_ptr(task).get().dereference()
-            except:
-                task = seastar_lw_shared_ptr(task).get().dereference() # Scylla 5.0 compatibility
-
-            try:
-                schema = schema_ptr(task['_compacting_table'].dereference()['_schema'])
-            except:
-                try:
-                    schema = schema_ptr(task['compacting_table'].dereference()['_schema']) # Scylla 5.0 compatibility
-                except:
-                    schema = schema_ptr(task['compacting_cf'].dereference()['_schema']) # Scylla 4.6 compatibility
-
-            try:
-                key = 'type={}, state={:5}, {}'.format(task['_type'], str(task['_state']), schema.table_name())
-            except:
-                key = 'type={}, running={:5}, {}'.format(task['type'], str(task['compaction_running']), schema.table_name()) # Scylla 5.0 compatibility
+            task = seastar_shared_ptr(task).get().dereference()
+            schema = schema_ptr(task['_compacting_table'].dereference()['_schema'])
+            key = 'type={}, state={:5}, {}'.format(task['_type'], str(task['_state']), schema.table_name())
             task_hist.add(key)
 
         task_hist.print_to_console()
@@ -5441,6 +5621,95 @@ class scylla_sstable_index_cache(gdb.Command):
         gdb.write("Total: {} page(s) ({} loaded, {} loading)\n".format(loaded_pages + loading_pages, loaded_pages, loading_pages))
 
 
+class cached_file:
+    def __init__(self, file):
+        self.file = file
+        self.pages = dict((int(page['idx']), page['_lsa_buf']['_buf']) for page in bplus_tree(file['_cache']))
+        self.page_size = 4096
+
+    def has_page(self, page):
+        return page in self.pages
+
+    def read(self, offset, size):
+        page = offset // self.page_size
+        page_offset = offset % self.page_size
+        if page_offset + size > self.page_size:
+            size1 = self.page_size - page_offset
+            return self.read(offset, size1) + self.read(offset + size1, size - size1)
+        return self.get_page(page)[page_offset:page_offset + size]
+
+    def get_page(self, page_idx):
+        inf = gdb.selected_inferior()
+        return bytes(inf.read_memory(self.pages[page_idx], self.page_size))
+
+
+class scylla_sstable_promoted_index(gdb.Command):
+    """
+    Prints promoted index contents using cached index file contents
+
+    Usage:
+
+        $1 = (sstables::cached_promoted_index*) 0x7f7f7f7f7f7f
+        (gdb) scylla sstable-promoted-index *$1
+
+    """
+
+    def __init__(self):
+        gdb.Command.__init__(self, 'scylla sstable-promoted-index', gdb.COMMAND_USER, gdb.COMPLETE_NONE, True)
+
+    def invoke(self, arg, for_tty):
+        pi = gdb.parse_and_eval(arg)
+
+        pi_start = int(pi['_promoted_index_start'])
+
+        offsets_end = pi_start + int(pi['_promoted_index_size'])
+        offsets_start = offsets_end - int(pi['_blocks_count']) * 4
+        cf = cached_file(pi['_cached_file'])
+
+        idx = 0
+        offsets = dict()
+        for off in range(offsets_start, offsets_end, 4):
+            try:
+                offset_bytes = cf.read(off, 4)
+                offsets[idx] = int.from_bytes(offset_bytes, byteorder='big')
+            except KeyError:
+                pass
+            idx += 1
+
+        last_block = int(pi['_blocks_count']) - 1
+        for i, off in offsets.items():
+            if i == last_block:
+                end = offsets_end
+            elif not i + 1 in offsets:
+                continue
+            else:
+                end = offsets[i + 1]
+            try:
+                idx_off = pi_start + off
+                buf = cf.read(idx_off, end - off)
+                gdb.write(f'[{i}] offset={off} {buf.hex()}\n')
+            except KeyError:
+                pass
+
+
+class scylla_sstable_dump_cached_index(gdb.Command):
+    """
+    Dumps cached index contents to a file named "index.dump"
+    Uncached pages will contain zeros.
+    """
+    def __init__(self):
+        gdb.Command.__init__(self, 'scylla sstable-dump-cached-index', gdb.COMMAND_USER, gdb.COMPLETE_NONE, True)
+
+    def invoke(self, arg, for_tty):
+        pi = gdb.parse_and_eval(arg)
+        cf = cached_file(pi['_cached_file'])
+
+        with open('./index.dump', 'wb') as file:
+            for i in cf.pages.keys():
+                file.seek(i * cf.page_size)
+                file.write(cf.get_page(i))
+
+
 class permit_stats:
     def __init__(self, *args):
         if len(args) == 2:
@@ -5492,10 +5761,6 @@ class scylla_read_stats(gdb.Command):
             gdb.write("Scylla version doesn't seem to have the permits linked yet, cannot list reads.")
             raise
 
-        if not permit_list.type.strip_typedefs().name.startswith('boost::intrusive::list'):
-            # 4.5 compatibility
-            permit_list = std_unique_ptr(permit_list).get().dereference()['permits']
-
         state_prefix_len = len('reader_permit::state::')
 
         # (table, description, state) -> stats
@@ -5528,17 +5793,8 @@ class scylla_read_stats(gdb.Command):
         semaphore_name = str(semaphore['_name'])[1:-1]
         initial_count = int(semaphore['_initial_resources']['count'])
         initial_memory = int(semaphore['_initial_resources']['memory'])
-        if semaphore['_inactive_reads'].type.name.startswith('std::map'):
-            # 4.4 compatibility
-            inactive_read_count = len(std_map(semaphore['_inactive_reads']))
-        else:
-            inactive_read_count = len(intrusive_list(semaphore['_inactive_reads']))
-
-
-        try:
-            waiters = int(semaphore["_stats"]["waiters"])
-        except gdb.error: # 5.1 compatibility
-            waiters = int(semaphore["_wait_list"]["_size"])
+        inactive_read_count = len(intrusive_list(semaphore['_inactive_reads']))
+        waiters = int(semaphore["_stats"]["waiters"])
 
         gdb.write("Semaphore {} with: {}/{} count and {}/{} memory resources, queued: {}, inactive={}\n".format(
                 semaphore_name,
@@ -5561,11 +5817,17 @@ class scylla_read_stats(gdb.Command):
             semaphores = [gdb.parse_and_eval(arg) for arg in args.split(' ')]
         else:
             db = find_db()
-            semaphores = [db["_read_concurrency_sem"], db["_streaming_concurrency_sem"], db["_system_read_concurrency_sem"]]
+            semaphores = [db["_streaming_concurrency_sem"], db["_system_read_concurrency_sem"]]
+            semaphores.append(db["_compaction_concurrency_sem"])
             try:
-                semaphores.append(db["_compaction_concurrency_sem"])
+                semaphores += [weighted_sem["sem"] for (_, weighted_sem) in unordered_map(db["_reader_concurrency_semaphores_group"]["_semaphores"])]
             except gdb.error:
-                # 2020.1 compatibility
+                # compatibility with code before per-scheduling-group semaphore
+                pass
+            try:
+                semaphores += [weighted_sem["sem"] for (_, weighted_sem) in unordered_map(db["_view_update_read_concurrency_semaphores_group"]["_semaphores"])]
+            except gdb.error:
+                # 2024.2 compatibility
                 pass
 
         for semaphore in semaphores:
@@ -5921,6 +6183,79 @@ class scylla_gdb_func_variant_member(gdb.Function):
     def invoke(self, obj):
         return std_variant(obj).get()
 
+class scylla_gdb_func_coro_frame(gdb.Function):
+    """Given a seastar::task* pointing to a coroutine task, convert it to a pointer to the coroutine frame.
+
+    Usage:
+    $coro_frame($ptr)
+
+    Where:
+    $ptr - any expression that evaluates to an integer. It will be interpreted as seastar::task*.
+
+    Returns:
+    The (typed) pointer to the coroutine frame.
+
+    Example:
+
+    1. Print the task chain:
+
+    (gdb) scylla fiber seastar::local_engine->_current_task
+    [shard  1] #0  (task*) 0x0000601008e8e970 0x000000000047aae0 vtable for seastar::internal::coroutine_traits_base<void>::promise_type + 16  (sstables::parse<unsigned int, std::pair<sstables::metadata_type, unsigned int> >(schema const&, sstables::sstable_version_types, sstables::random_access_reader&, sstables::disk_array<unsigned int, std::pair<sstables::metadata_type, unsigned int> >&) at sstables/sstables.cc:352)
+    [shard  1] #1  (task*) 0x00006010092acf10 0x000000000047aae0 vtable for seastar::internal::coroutine_traits_base<void>::promise_type + 16  (sstables::parse(schema const&, sstables::sstable_version_types, sstables::random_access_reader&, sstables::statistics&) at sstables/sstables.cc:570)
+    ...
+
+    2. Examine the coroutine frame of task #1:
+
+    (gdb) p *$coro_frame(0x00006010092acf10)
+    $1 = {
+      __resume_fn = 0x2485f80 <sstables::parse(schema const&, sstables::sstable_version_types, sstables::random_access_reader&, sstables::statistics&)>,
+      ...
+      PointerType_7 = 0x601008e67880,
+      PointerType_8 = 0x601008e64900,
+      ...
+      __int_32_23 = 4,
+      ...
+      __coro_index = 0 '\000'
+      ...
+
+    3. Examine coroutine arguments.
+    (Needs some know-how. They should be at lowest-indexed PointerType* or __int* entries, depending on their type. Not so easy to automate):
+
+    (gdb) p $downcast_vptr($coro_frame(0x00006010092acf10)->PointerType_7)
+    $2 = (schema *) 0x601008e67880
+    (gdb) p (sstables::sstable_version_types)($coro_frame(0x00006010092acf10)->__int_32_23)
+    $3 = sstables::sstable_version_types::me
+    (gdb) p $downcast_vptr($coro_frame(0x00006010092acf10)->PointerType_8)
+    $4 = (sstables::file_random_access_reader *) 0x601008e64900
+    """
+
+    def __init__(self):
+        super(scylla_gdb_func_coro_frame, self).__init__('coro_frame')
+
+    def invoke(self, ptr_raw):
+        vptr_type = gdb.lookup_type('uintptr_t').pointer()
+        ptr = gdb.Value(ptr_raw).reinterpret_cast(vptr_type)
+        maybe_vptr = int(ptr.dereference())
+
+        # Validate that the task is a coroutine.
+        with gdb.with_parameter("print demangle", "on"):
+            symname = gdb.execute(f"info symbol {maybe_vptr}", False, True)
+        if not symname.startswith('vtable for seastar::internal::coroutine_traits_base'):
+            gdb.write(f"0x{maybe_vptr:x} does not seem to point to a coroutine task.")
+            return None
+
+        # The promise object starts on the third `uintptr_t` in the frame.
+        # The resume_fn pointer is the first `uintptr_t`.
+        # So if the task is a coroutine, we should be able to find the resume function via offsetting by -2.
+        # AFAIK both major compilers respect this convention.
+        block = gdb.block_for_pc((ptr - 2).dereference())
+
+        # Look up the coroutine frame type.
+        # I don't understand why, but gdb has problems looking up the coro_frame_ty type if demangling is enabled.
+        with gdb.with_parameter("demangle-style", "none"):
+            coro_ty = gdb.lookup_type(f"{block.function.linkage_name}.coro_frame_ty").pointer()
+
+        return (ptr - 2).cast(coro_ty)
 
 # Commands
 scylla()
@@ -5963,12 +6298,15 @@ scylla_smp_queues()
 scylla_features()
 scylla_repairs()
 scylla_small_objects()
+scylla_large_objects()
 scylla_compaction_tasks()
 scylla_set_schema()
 scylla_schema()
 scylla_read_stats()
 scylla_get_config_value()
 scylla_range_tombstones()
+scylla_sstable_promoted_index()
+scylla_sstable_dump_cached_index()
 
 
 # Convenience functions
@@ -5980,6 +6318,7 @@ scylla_range_tombstones()
 #   (gdb) help function $function_name
 scylla_gdb_func_dereference_smart_ptr()
 scylla_gdb_func_downcast_vptr()
+scylla_gdb_func_coro_frame()
 scylla_gdb_func_collection_element()
 scylla_gdb_func_sharded_local()
 scylla_gdb_func_variant_member()

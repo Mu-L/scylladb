@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "sstable_mutation_reader.hh"
@@ -13,7 +13,6 @@
 #include "utils/fragment_range.hh"
 #include "utils/to_string.hh"
 
-#include <boost/range/algorithm/stable_partition.hpp>
 #include <boost/intrusive/list.hpp>
 
 namespace sstables {
@@ -131,7 +130,7 @@ std::vector<column_translation::column_info> column_translation::state::build(
         cols.reserve(src.size());
         for (auto&& desc : src) {
             const bytes& type_name = desc.type_name.value;
-            data_type type = db::marshal::type_parser::parse(to_sstring_view(type_name));
+            data_type type = db::marshal::type_parser::parse(to_string_view(type_name));
             if (!features.is_enabled(CorrectUDTsInCollections) && is_certainly_scylla_sstable(features)) {
                 // See #6130.
                 type = freeze_types_in_collections(std::move(type));
@@ -155,7 +154,7 @@ std::vector<column_translation::column_info> column_translation::state::build(
                 schema_mismatch
             });
         }
-        boost::range::stable_partition(cols, [](const column_info& column) { return !column.is_collection; });
+        std::ranges::stable_partition(cols, [](const column_info& column) { return !column.is_collection; });
     }
     return cols;
 }
@@ -171,6 +170,17 @@ position_in_partition_view get_slice_upper_bound(const schema& s, const query::p
         return position_in_partition_view::for_range_end(ranges.front());
     }
     return position_in_partition_view::for_range_end(ranges.back());
+}
+
+position_in_partition_view get_slice_lower_bound(const schema& s, const query::partition_slice& slice, dht::ring_position_view key) {
+    const auto& ranges = slice.row_ranges(s, *key.key());
+    if (ranges.empty()) {
+        return position_in_partition_view::for_static_row();
+    }
+    if (slice.is_reversed()) {
+        return position_in_partition_view::for_range_start(ranges.back());
+    }
+    return position_in_partition_view::for_range_start(ranges.front());
 }
 
 } // namespace sstables

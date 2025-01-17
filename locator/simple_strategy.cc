@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/coroutine.hh>
@@ -11,6 +11,7 @@
 
 #include "simple_strategy.hh"
 #include "exceptions/exceptions.hh"
+#include "utils/assert.hh"
 #include "utils/class_registrator.hh"
 #include <boost/algorithm/string.hpp>
 
@@ -50,7 +51,7 @@ future<host_id_set> simple_strategy::calculate_natural_endpoints(const token& t,
         }
 
         auto ep = tm.get_endpoint(token);
-        assert(ep);
+        SCYLLA_ASSERT(ep);
 
         endpoints.push_back(*ep);
         co_await coroutine::maybe_yield();
@@ -69,10 +70,23 @@ void simple_strategy::validate_options(const gms::feature_service&) const {
         throw exceptions::configuration_exception("SimpleStrategy requires a replication_factor strategy option.");
     }
     parse_replication_factor(it->second);
+    if (_uses_tablets) {
+        throw exceptions::configuration_exception("SimpleStrategy doesn't support tablet replication");
+    }
 }
 
 std::optional<std::unordered_set<sstring>>simple_strategy::recognized_options(const topology&) const {
     return {{ "replication_factor" }};
+}
+
+sstring simple_strategy::sanity_check_read_replicas(const effective_replication_map& erm, const host_id_vector_replica_set& read_replicas) const {
+    if (read_replicas.size() > _replication_factor) {
+        return seastar::format("ERM inconsistency, the read replica set for simple strategy has higher count of"
+                               " read replicas [{}] than its replication factor [{}]",
+                               read_replicas.size(),
+                               _replication_factor);
+    }
+    return {};
 }
 
 using registry = class_registrator<abstract_replication_strategy, simple_strategy, replication_strategy_params>;

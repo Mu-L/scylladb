@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "token_metadata.hh"
@@ -11,7 +11,7 @@
 #include "locator/snitch_base.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "locator/tablets.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "partition_range_compat.hh"
 #include <unordered_map>
 #include <algorithm>
@@ -19,10 +19,10 @@
 #include <boost/icl/interval_map.hpp>
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
-#include <boost/range/adaptors.hpp>
 #include <seastar/core/smp.hh>
+#include "utils/assert.hh"
 #include "utils/stall_free.hh"
-
+#include "gms/gossiper.hh"
 namespace locator {
 
 static logging::logger tlogger("token_metadata");
@@ -92,7 +92,7 @@ private:
     struct shallow_copy {};
 public:
     token_metadata_impl(shallow_copy, const token_metadata_impl& o) noexcept
-        : _topology(topology::config{})
+        : _topology(topology::shallow_copy{}, topology::config{})
     {}
     token_metadata_impl(token_metadata::config cfg) noexcept : _topology(std::move(cfg.topo_cfg)) {};
     token_metadata_impl(const token_metadata_impl&) = delete; // it's too huge for direct copy, use clone_async()
@@ -116,7 +116,7 @@ public:
     }
 
     void update_topology(host_id id, std::optional<endpoint_dc_rack> opt_dr, std::optional<node::state> opt_st, std::optional<shard_id> shard_count = std::nullopt) {
-        _topology.add_or_update_endpoint(id, std::nullopt, std::move(opt_dr), std::move(opt_st), std::move(shard_count));
+        _topology.add_or_update_endpoint(id, std::move(opt_dr), std::move(opt_st), std::move(shard_count));
     }
 
     /**
@@ -127,9 +127,9 @@ public:
      *
      * @return The requested range (see the description above)
      */
-    boost::iterator_range<token_metadata::tokens_iterator> ring_range(const token& start) const;
+    std::ranges::subrange<token_metadata::tokens_iterator> ring_range(const token& start) const;
 
-    boost::iterator_range<token_metadata::tokens_iterator> ring_range(dht::ring_position_view pos) const;
+    std::ranges::subrange<token_metadata::tokens_iterator> ring_range(dht::ring_position_view pos) const;
 
     topology& get_topology() {
         return _topology;
@@ -141,29 +141,8 @@ public:
 
     void debug_show() const;
 
-    /**
-     * Store an end-point to host ID mapping.  Each ID must be unique, and
-     * cannot be changed after the fact.
-     *
-     * @param hostId
-     * @param endpoint
-     */
-    void update_host_id(const host_id& host_id, inet_address endpoint);
-
-    /** Return the unique host ID for an end-point. */
-    host_id get_host_id(inet_address endpoint) const;
-
-    /// Return the unique host ID for an end-point or nullopt if not found.
-    std::optional<host_id> get_host_id_if_known(inet_address endpoint) const;
-
-    /** Return the end-point for a unique host ID or nullopt if not found.*/
-    std::optional<inet_address> get_endpoint_for_host_id_if_known(host_id) const;
-
-    /** Return the end-point for a unique host ID.*/
-    inet_address get_endpoint_for_host_id(host_id) const;
-
-    /** @return a copy of the endpoint-to-id map for read-only operations */
-    std::unordered_map<inet_address, host_id> get_endpoint_to_host_id_map_for_reading() const;
+    /** @return a copy of host id set for read-only operations */
+    std::unordered_set<host_id> get_host_ids() const;
 
     void add_bootstrap_token(token t, host_id endpoint);
 
@@ -245,17 +224,30 @@ public:
 
     token get_predecessor(token t) const;
 
-    // Returns nodes that are officially part of the ring. It does not include
-    // node that is still joining the cluster, e.g., a node that is still
+    // Returns nodes that are officially part of the ring. It does not include:
+    // - nodes that are still joining the cluster, e.g., a node that is still
     // streaming data before it finishes the bootstrap process and turns into
-    // NORMAL status.
-    const std::unordered_set<host_id>& get_all_endpoints() const noexcept {
+    // NORMAL status,
+    // - zero-token nodes (the ones with join_ring=false).
+    const std::unordered_set<host_id>& get_normal_token_owners() const noexcept {
         return _normal_token_owners;
     }
+
+    void for_each_token_owner(std::function<void(const node&)> func) const;
 
     /* Returns the number of different endpoints that own tokens in the ring.
      * Bootstrapping tokens are not taken into account. */
     size_t count_normal_token_owners() const;
+
+    std::unordered_map<sstring, std::unordered_set<host_id>> get_datacenter_token_owners() const;
+
+    std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<host_id>>>
+    get_datacenter_racks_token_owners() const;
+
+    std::unordered_map<sstring, std::unordered_set<std::reference_wrapper<const node>>> get_datacenter_token_owners_nodes() const;
+
+    std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<std::reference_wrapper<const node>>>>
+    get_datacenter_racks_token_owners_nodes() const;
 private:
     future<> update_normal_token_owners();
 public:
@@ -297,21 +289,21 @@ public:
 
 thread_local long token_metadata_impl::_static_ring_version;
 
-token_metadata::tokens_iterator::tokens_iterator(const token& start, const token_metadata_impl* token_metadata)
+tokens_iterator::tokens_iterator(const token& start, const token_metadata_impl* token_metadata)
     : _token_metadata(token_metadata) {
     _cur_it = _token_metadata->sorted_tokens().begin() + _token_metadata->first_token_index(start);
     _remaining = _token_metadata->sorted_tokens().size();
 }
 
-bool token_metadata::tokens_iterator::operator==(const tokens_iterator& it) const {
+bool tokens_iterator::operator==(const tokens_iterator& it) const {
     return _remaining == it._remaining;
 }
 
-const token& token_metadata::tokens_iterator::operator*() const {
+const token& tokens_iterator::operator*() const {
     return *_cur_it;
 }
 
-token_metadata::tokens_iterator& token_metadata::tokens_iterator::operator++() {
+tokens_iterator& tokens_iterator::operator++() {
     ++_cur_it;
     if (_cur_it == _token_metadata->sorted_tokens().end()) {
         _cur_it = _token_metadata->sorted_tokens().begin();
@@ -325,11 +317,11 @@ host_id token_metadata::get_my_id() const {
 }
 
 inline
-boost::iterator_range<token_metadata::tokens_iterator>
+std::ranges::subrange<token_metadata::tokens_iterator>
 token_metadata_impl::ring_range(const token& start) const {
     auto begin = token_metadata::tokens_iterator(start, this);
     auto end = token_metadata::tokens_iterator();
-    return boost::make_iterator_range(begin, end);
+    return std::ranges::subrange(begin, end);
 }
 
 future<std::unique_ptr<token_metadata_impl>> token_metadata_impl::clone_async() const noexcept {
@@ -359,7 +351,7 @@ future<std::unique_ptr<token_metadata_impl>> token_metadata_impl::clone_only_tok
         ret->_sorted_tokens = _sorted_tokens;
         co_await coroutine::maybe_yield();
     }
-    ret->_tablets = _tablets;
+    ret->_tablets = co_await _tablets.copy();
     ret->_read_new = _read_new;
     co_return ret;
 }
@@ -515,58 +507,11 @@ void token_metadata_impl::debug_show() const {
     reporter->arm_periodic(std::chrono::seconds(1));
 }
 
-void token_metadata_impl::update_host_id(const host_id& host_id, inet_address endpoint) {
-    _topology.add_or_update_endpoint(host_id, endpoint);
-}
-
-host_id token_metadata_impl::get_host_id(inet_address endpoint) const {
-    if (const auto* node = _topology.find_node(endpoint)) [[likely]] {
-        return node->host_id();
-    } else {
-        on_internal_error(tlogger, format("host_id for endpoint {} is not found", endpoint));
-    }
-}
-
-std::optional<host_id> token_metadata_impl::get_host_id_if_known(inet_address endpoint) const {
-    if (const auto* node = _topology.find_node(endpoint)) [[likely]] {
-        return node->host_id();
-    } else {
-        return std::nullopt;
-    }
-}
-
-std::optional<inet_address> token_metadata_impl::get_endpoint_for_host_id_if_known(host_id host_id) const {
-    if (const auto* node = _topology.find_node(host_id)) [[likely]] {
-        return node->endpoint();
-    } else {
-        return std::nullopt;
-    }
-}
-
-inet_address token_metadata_impl::get_endpoint_for_host_id(host_id host_id) const {
-    if (const auto* node = _topology.find_node(host_id)) [[likely]] {
-        return node->endpoint();
-    } else {
-        on_internal_error(tlogger, format("endpoint for host_id {} is not found", host_id));
-    }
-}
-
-std::unordered_map<inet_address, host_id> token_metadata_impl::get_endpoint_to_host_id_map_for_reading() const {
-    const auto& nodes = _topology.get_nodes_by_endpoint();
-    std::unordered_map<inet_address, host_id> map;
-    map.reserve(nodes.size());
-    for (const auto& [endpoint, node] : nodes) {
-        // Restrict to token-owners
-        if (!(node->is_normal() || node->is_leaving())) {
-            continue;
-        }
-        if (const auto& host_id = node->host_id()) {
-            map[endpoint] = host_id;
-        } else {
-            tlogger.info("get_endpoint_to_host_id_map_for_reading: endpoint {} has null host_id: state={}", endpoint, node->get_state());
-        }
-    }
-    return map;
+std::unordered_set<host_id> token_metadata_impl::get_host_ids() const {
+    return _topology.get_nodes() |
+            std::views::filter([&] (const node& n) { return !n.left() && !n.is_none(); }) |
+            std::views::transform([] (const node& n) { return n.host_id(); }) |
+            std::ranges::to<std::unordered_set>();
 }
 
 bool token_metadata_impl::is_normal_token_owner(host_id endpoint) const {
@@ -578,7 +523,7 @@ void token_metadata_impl::add_bootstrap_token(token t, host_id endpoint) {
     add_bootstrap_tokens(tokens, endpoint);
 }
 
-boost::iterator_range<token_metadata::tokens_iterator>
+std::ranges::subrange<token_metadata::tokens_iterator>
 token_metadata_impl::ring_range(const dht::ring_position_view start) const {
     return ring_range(start.token());
 }
@@ -782,6 +727,60 @@ size_t token_metadata_impl::count_normal_token_owners() const {
     return _normal_token_owners.size();
 }
 
+void token_metadata_impl::for_each_token_owner(std::function<void(const node&)> func) const {
+    _topology.for_each_node([this, func = std::move(func)] (const node& node) {
+        if (is_normal_token_owner(node.host_id())) {
+            func(node);
+        }
+    });
+}
+
+std::unordered_map<sstring, std::unordered_set<host_id>>
+token_metadata_impl::get_datacenter_token_owners() const {
+    std::unordered_map<sstring, std::unordered_set<host_id>> datacenter_token_owners;
+    _topology.for_each_node([&] (const node& n) {
+        if (is_normal_token_owner(n.host_id())) {
+            datacenter_token_owners[n.dc_rack().dc].insert(n.host_id());
+        }
+    });
+    return datacenter_token_owners;
+}
+
+std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<host_id>>>
+token_metadata_impl::get_datacenter_racks_token_owners() const {
+    std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<host_id>>> dc_racks_token_owners;
+    _topology.for_each_node([&] (const node& n) {
+        const auto& dc_rack = n.dc_rack();
+        if (is_normal_token_owner(n.host_id())) {
+            dc_racks_token_owners[dc_rack.dc][dc_rack.rack].insert(n.host_id());
+        }
+    });
+    return dc_racks_token_owners;
+}
+
+std::unordered_map<sstring, std::unordered_set<std::reference_wrapper<const node>>>
+token_metadata_impl::get_datacenter_token_owners_nodes() const {
+    std::unordered_map<sstring, std::unordered_set<std::reference_wrapper<const node>>> datacenter_token_owners;
+    _topology.for_each_node([&] (const node& n) {
+        if (is_normal_token_owner(n.host_id())) {
+            datacenter_token_owners[n.dc_rack().dc].insert(std::cref(n));
+        }
+    });
+    return datacenter_token_owners;
+}
+
+std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<std::reference_wrapper<const node>>>>
+token_metadata_impl::get_datacenter_racks_token_owners_nodes() const {
+    std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<std::reference_wrapper<const node>>>> dc_racks_token_owners;
+    _topology.for_each_node([&] (const node& n) {
+        const auto& dc_rack = n.dc_rack();
+        if (is_normal_token_owner(n.host_id())) {
+            dc_racks_token_owners[dc_rack.dc][dc_rack.rack].insert(std::cref(n));
+        }
+    });
+    return dc_racks_token_owners;
+}
+
 future<> token_metadata_impl::update_normal_token_owners() {
     std::unordered_set<host_id> eps;
     for (auto [t, ep]: _token_to_endpoint_map) {
@@ -801,7 +800,7 @@ void token_metadata_impl::del_leaving_endpoint(host_id endpoint) {
 
 void token_metadata_impl::add_replacing_endpoint(host_id existing_node, host_id replacing_node) {
     if (existing_node == replacing_node) {
-        on_internal_error(tlogger, format("Can't replace node {} with itself", existing_node));
+        on_internal_error(tlogger, seastar::format("Can't replace node {} with itself", existing_node));
     }
     tlogger.info("Added node {} as pending replacing endpoint which replaces existing node {}",
             replacing_node, existing_node);
@@ -896,24 +895,24 @@ token_metadata::update_topology(host_id ep, std::optional<endpoint_dc_rack> opt_
     _impl->update_topology(ep, std::move(opt_dr), std::move(opt_st), std::move(shard_count));
 }
 
-boost::iterator_range<token_metadata::tokens_iterator>
+std::ranges::subrange<token_metadata::tokens_iterator>
 token_metadata::ring_range(const token& start) const {
     return _impl->ring_range(start);
 }
 
-boost::iterator_range<token_metadata::tokens_iterator>
+std::ranges::subrange<token_metadata::tokens_iterator>
 token_metadata::ring_range(dht::ring_position_view start) const {
     return _impl->ring_range(start);
 }
 
 class token_metadata_ring_splitter : public locator::token_range_splitter {
     token_metadata_ptr _tmptr;
-    boost::iterator_range<token_metadata::tokens_iterator> _range;
+    std::ranges::subrange<token_metadata::tokens_iterator> _range;
 public:
     token_metadata_ring_splitter(token_metadata_ptr tmptr)
         : _tmptr(std::move(tmptr))
         , _range(_tmptr->sorted_tokens().empty() // ring_range() throws if the ring is empty
-                ? boost::make_iterator_range(token_metadata::tokens_iterator(), token_metadata::tokens_iterator())
+                ? std::ranges::subrange(token_metadata::tokens_iterator(), token_metadata::tokens_iterator())
                 : _tmptr->ring_range(dht::minimum_token()))
     { }
 
@@ -926,7 +925,7 @@ public:
             return std::nullopt;
         }
         auto t = *_range.begin();
-        _range.drop_front();
+        _range.advance(1);
         return t;
     }
 };
@@ -950,34 +949,9 @@ token_metadata::debug_show() const {
     _impl->debug_show();
 }
 
-void
-token_metadata::update_host_id(const host_id& host_id, inet_address endpoint) {
-    _impl->update_host_id(host_id, endpoint);
-}
-
-host_id
-token_metadata::get_host_id(inet_address endpoint) const {
-    return _impl->get_host_id(endpoint);
-}
-
-std::optional<host_id>
-token_metadata::get_host_id_if_known(inet_address endpoint) const {
-    return _impl->get_host_id_if_known(endpoint);
-}
-
-std::optional<token_metadata::inet_address>
-token_metadata::get_endpoint_for_host_id_if_known(host_id host_id) const {
-    return _impl->get_endpoint_for_host_id_if_known(host_id);
-}
-
-token_metadata::inet_address
-token_metadata::get_endpoint_for_host_id(host_id host_id) const {
-    return _impl->get_endpoint_for_host_id(host_id);
-}
-
-std::unordered_map<inet_address, host_id>
-token_metadata::get_endpoint_to_host_id_map_for_reading() const {
-    return _impl->get_endpoint_to_host_id_map_for_reading();
+std::unordered_set<host_id>
+token_metadata::get_host_ids() const {
+    return _impl->get_host_ids();
 }
 
 void
@@ -1093,23 +1067,35 @@ token_metadata::get_predecessor(token t) const {
 }
 
 const std::unordered_set<host_id>&
-token_metadata::get_all_endpoints() const {
-    return _impl->get_all_endpoints();
+token_metadata::get_normal_token_owners() const {
+    return _impl->get_normal_token_owners();
 }
 
-std::unordered_set<gms::inet_address> token_metadata::get_all_ips() const {
-    const auto& host_ids = _impl->get_all_endpoints();
-    std::unordered_set<gms::inet_address> result;
-    result.reserve(host_ids.size());
-    for (const auto& id: host_ids) {
-        result.insert(_impl->get_endpoint_for_host_id(id));
-    }
-    return result;
+void token_metadata::for_each_token_owner(std::function<void(const node&)> func) const {
+    return _impl->for_each_token_owner(func);
 }
 
 size_t
 token_metadata::count_normal_token_owners() const {
     return _impl->count_normal_token_owners();
+}
+
+std::unordered_map<sstring, std::unordered_set<host_id>> token_metadata::get_datacenter_token_owners() const {
+    return _impl->get_datacenter_token_owners();
+}
+
+std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<host_id>>>
+token_metadata::get_datacenter_racks_token_owners() const {
+    return _impl->get_datacenter_racks_token_owners();
+}
+
+std::unordered_map<sstring, std::unordered_set<std::reference_wrapper<const node>>> token_metadata::get_datacenter_token_owners_nodes() const {
+    return _impl->get_datacenter_token_owners_nodes();
+}
+
+std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<std::reference_wrapper<const node>>>>
+token_metadata::get_datacenter_racks_token_owners_nodes() const {
+    return _impl->get_datacenter_racks_token_owners_nodes();
 }
 
 void
@@ -1214,9 +1200,18 @@ future<> shared_token_metadata::mutate_token_metadata(seastar::noncopyable_funct
     set(make_token_metadata_ptr(std::move(tm)));
 }
 
+void shared_token_metadata::mutate_token_metadata_for_test(seastar::noncopyable_function<void (token_metadata&)> func) {
+    auto& tm = *_shared;
+    // bump the token_metadata ring_version
+    // to invalidate cached token/replication mappings
+    // when the modified token_metadata is committed.
+    tm.invalidate_cached_rings();
+    func(tm);
+}
+
 future<> shared_token_metadata::mutate_on_all_shards(sharded<shared_token_metadata>& stm, seastar::noncopyable_function<future<> (token_metadata&)> func) {
     auto base_shard = this_shard_id();
-    assert(base_shard == 0);
+    SCYLLA_ASSERT(base_shard == 0);
     auto lk = co_await stm.local().get_lock();
 
     std::vector<mutable_token_metadata_ptr> pending_token_metadata_ptr;
@@ -1269,22 +1264,22 @@ host_id_or_endpoint::host_id_or_endpoint(const sstring& s, param_type restrict) 
     }
 }
 
-host_id host_id_or_endpoint::resolve_id(const token_metadata& tm) const {
+host_id host_id_or_endpoint::resolve_id(const gms::gossiper& g) const {
     if (has_host_id()) {
         return id();
     }
-    auto opt_id = tm.get_host_id_if_known(endpoint());
-    if (!opt_id) {
+    try {
+        return g.get_host_id(endpoint());
+    } catch (...) {
         throw std::runtime_error(format("Host inet address {} not found in the cluster", endpoint()));
     }
-    return *opt_id;
 }
 
-gms::inet_address host_id_or_endpoint::resolve_endpoint(const token_metadata& tm) const {
+gms::inet_address host_id_or_endpoint::resolve_endpoint(const gms::gossiper& g) const {
     if (has_endpoint()) {
         return endpoint();
     }
-    auto endpoint_opt = tm.get_endpoint_for_host_id_if_known(id());
+    auto endpoint_opt = g.get_address_map().find(id());
     if (!endpoint_opt) {
         throw std::runtime_error(format("Host ID {} not found in the cluster", id()));
     }

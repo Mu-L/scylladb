@@ -3,25 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/on_internal_error.hh>
 #include <map>
+#include "cql3/description.hh"
 #include "db/view/view.hh"
 #include "timestamp.hh"
+#include "utils/assert.hh"
 #include "utils/UUID_gen.hh"
 #include "cql3/column_identifier.hh"
 #include "cql3/util.hh"
 #include "schema.hh"
 #include "schema_builder.hh"
-#include <boost/algorithm/cxx11/any_of.hpp>
-#include <boost/range/adaptor/transformed.hpp>
 #include "db/marshal/type_parser.hh"
 #include "schema_registry.hh"
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/algorithm.hpp>
-#include <boost/algorithm/cxx11/any_of.hpp>
 #include <type_traits>
 #include "view_info.hh"
 #include "partition_slice_builder.hh"
@@ -35,10 +32,61 @@
 #include "db/per_partition_rate_limit_extension.hh"
 #include "db/tags/utils.hh"
 #include "db/tags/extension.hh"
+#include "index/target_parser.hh"
+#include "utils/hashing.hh"
+#include "utils/hashers.hh"
 
 constexpr int32_t schema::NAME_LENGTH;
 
 extern logging::logger dblog;
+
+sstring
+speculative_retry::to_sstring() const {
+    if (_t == type::NONE) {
+        return "NONE";
+    } else if (_t == type::ALWAYS) {
+        return "ALWAYS";
+    } else if (_t == type::CUSTOM) {
+        return format("{:.2f}ms", _v);
+    } else if (_t == type::PERCENTILE) {
+        return format("{:.1f}PERCENTILE", 100 * _v);
+    } else {
+        throw std::invalid_argument(format("unknown type: {:d}\n", uint8_t(_t)));
+    }
+}
+
+speculative_retry
+speculative_retry::from_sstring(sstring str) {
+    std::transform(str.begin(), str.end(), str.begin(), ::toupper);
+
+    sstring ms("MS");
+    sstring percentile("PERCENTILE");
+
+    auto convert = [&str] (sstring& t) {
+        try {
+            return boost::lexical_cast<double>(str.substr(0, str.size() - t.size()));
+        } catch (boost::bad_lexical_cast& e) {
+            throw std::invalid_argument(format("cannot convert {} to speculative_retry\n", str));
+        }
+    };
+
+    type t;
+    double v = 0;
+    if (str == "NONE") {
+        t = type::NONE;
+    } else if (str == "ALWAYS") {
+        t = type::ALWAYS;
+    } else if (str.compare(str.size() - ms.size(), ms.size(), ms) == 0) {
+        t = type::CUSTOM;
+        v = convert(ms);
+    } else if (str.compare(str.size() - percentile.size(), percentile.size(), percentile) == 0) {
+        t = type::PERCENTILE;
+        v = convert(percentile) / 100;
+    } else {
+        throw std::invalid_argument(format("cannot convert {} to speculative_retry\n", str));
+    }
+    return speculative_retry(t, v);
+}
 
 sstring to_sstring(column_kind k) {
     switch (k) {
@@ -88,7 +136,7 @@ bool operator==(const column_mapping& lhs, const column_mapping& rhs) {
 }
 
 const column_mapping_entry& column_mapping::column_at(column_kind kind, column_id id) const {
-    assert(kind == column_kind::regular_column || kind == column_kind::static_column);
+    SCYLLA_ASSERT(kind == column_kind::regular_column || kind == column_kind::static_column);
     return kind == column_kind::regular_column ? regular_column_at(id) : static_column_at(id);
 }
 
@@ -128,10 +176,10 @@ auto fmt::formatter<column_mapping>::format(const column_mapping& cm, fmt::forma
         return fmt::format("{{id={}, name=0x{}, type={}}}", i, e.name(), e.type()->name());
     };
     return fmt::format_to(ctx.out(), "{{static=[{}], regular=[{}]}}",
-               fmt::join(boost::irange<column_id>(0, n_static) |
-                         boost::adaptors::transformed([&] (column_id i) { return pr_entry(i, cm.static_column_at(i)); }), ", "),
-               fmt::join(boost::irange<column_id>(0, n_regular) |
-                         boost::adaptors::transformed([&] (column_id i) { return pr_entry(i, cm.regular_column_at(i)); }), ", "));
+               fmt::join(std::views::iota(column_id(0), n_static) |
+                         std::views::transform([&] (column_id i) { return pr_entry(i, cm.static_column_at(i)); }), ", "),
+               fmt::join(std::views::iota(column_id(0), n_regular) |
+                         std::views::transform([&] (column_id i) { return pr_entry(i, cm.regular_column_at(i)); }), ", "));
 }
 
 thread_local std::map<sstring, std::unique_ptr<dht::i_partitioner>> partitioners;
@@ -322,14 +370,14 @@ void schema::rebuild() {
 
     {
         std::vector<column_mapping_entry> cm_columns;
-        for (const column_definition& def : boost::range::join(static_columns(), regular_columns())) {
+        for (const column_definition& def : std::views::join(std::array{static_columns(), regular_columns()})) {
             cm_columns.emplace_back(column_mapping_entry{def.name(), def.type});
         }
         _column_mapping = column_mapping(std::move(cm_columns), static_columns_count());
     }
 
     if (is_counter()) {
-        for (auto&& cdef : boost::range::join(static_columns(), regular_columns())) {
+        for (auto&& cdef : std::views::join(std::array{static_columns(), regular_columns()})) {
             if (!cdef.type->is_counter()) {
                 throw exceptions::configuration_exception(format("Cannot add a non counter column ({}) in a counter column family", cdef.name_as_text()));
             }
@@ -344,6 +392,7 @@ void schema::rebuild() {
 
     _v3_columns = v3_columns::from_v2_schema(*this);
     _full_slice = make_shared<query::partition_slice>(partition_slice_builder(*this).build());
+    compute_all_columns_in_select_order();
 }
 
 const column_mapping& schema::get_column_mapping() const {
@@ -356,7 +405,7 @@ schema::raw_schema::raw_schema(table_id id)
     , _sharder(::get_sharder(smp::count, default_partitioner_ignore_msb))
 { }
 
-schema::schema(private_tag, const raw_schema& raw, std::optional<raw_view_info> raw_view_info, const schema_static_props& props)
+schema::schema(private_tag, const raw_schema& raw, const schema_static_props& props)
     : _raw(raw)
     , _static_props(props)
     , _offsets([this] {
@@ -403,7 +452,7 @@ schema::schema(private_tag, const raw_schema& raw, std::optional<raw_view_info> 
     column_id id = 0;
     for (auto& def : _raw._columns) {
         def.column_specification = make_column_specification(def);
-        assert(!def.id || def.id == id - column_offset(def.kind));
+        SCYLLA_ASSERT(!def.id || def.id == id - column_offset(def.kind));
         def.ordinal_id = static_cast<ordinal_column_id>(id);
         def.id = id - column_offset(def.kind);
 
@@ -439,8 +488,8 @@ schema::schema(private_tag, const raw_schema& raw, std::optional<raw_view_info> 
     }
 
     rebuild();
-    if (raw_view_info) {
-        _view_info = std::make_unique<::view_info>(*this, *raw_view_info);
+    if (_raw._view_info) {
+        _view_info = std::make_unique<::view_info>(*this, *_raw._view_info);
     }
 }
 
@@ -481,27 +530,6 @@ schema::schema(reversed_tag, const schema& o)
 {
 }
 
-lw_shared_ptr<const schema> make_shared_schema(std::optional<table_id> id, std::string_view ks_name,
-    std::string_view cf_name, std::vector<schema::column> partition_key, std::vector<schema::column> clustering_key,
-    std::vector<schema::column> regular_columns, std::vector<schema::column> static_columns,
-    data_type regular_column_name_type, sstring comment) {
-    schema_builder builder(std::move(ks_name), std::move(cf_name), std::move(id), std::move(regular_column_name_type));
-    for (auto&& column : partition_key) {
-        builder.with_column(std::move(column.name), std::move(column.type), column_kind::partition_key);
-    }
-    for (auto&& column : clustering_key) {
-        builder.with_column(std::move(column.name), std::move(column.type), column_kind::clustering_key);
-    }
-    for (auto&& column : regular_columns) {
-        builder.with_column(std::move(column.name), std::move(column.type));
-    }
-    for (auto&& column : static_columns) {
-        builder.with_column(std::move(column.name), std::move(column.type), column_kind::static_column);
-    }
-    builder.set_comment(comment);
-    return builder.build();
-}
-
 schema::~schema() {
     if (_registry_entry) {
         _registry_entry->detach_schema();
@@ -515,7 +543,7 @@ schema::registry_entry() const noexcept {
 
 bool
 schema::has_multi_cell_collections() const {
-    return boost::algorithm::any_of(all_columns(), [] (const column_definition& cdef) {
+    return std::ranges::any_of(all_columns(), [] (const column_definition& cdef) {
         return cdef.type->is_collection() && cdef.type->is_multi_cell();
     });
 }
@@ -554,9 +582,94 @@ bool operator==(const schema& x, const schema& y)
         && x._raw._indices_by_name == y._raw._indices_by_name
         && x._raw._is_counter == y._raw._is_counter
         ;
-#if 0
-        && Objects.equal(triggers, other.triggers)
-#endif
+}
+
+
+template<>
+struct appending_hash<index_metadata>  {
+    template<typename H>
+    requires Hasher<H>
+    void operator()(H& h, const index_metadata& x) const noexcept {
+        feed_hash(h, x.id());
+        feed_hash(h, x.name());
+        feed_hash(h, x.kind());
+        feed_hash(h, x.options());
+    }
+};
+
+
+template<>
+struct appending_hash<column_definition>  {
+    template<typename H>
+    requires Hasher<H>
+    void operator()(H& h, const column_definition& x) const noexcept {
+        feed_hash(h, x.name());
+        feed_hash(h, x.type);
+        feed_hash(h, x.id);
+        feed_hash(h, x.kind);
+        feed_hash(h, x.dropped_at());
+    }
+};
+
+template<>
+struct appending_hash<raw_view_info>  {
+    template<typename H>
+    requires Hasher<H>
+    void operator()(H& h, const raw_view_info& x) const noexcept {
+        feed_hash(h, x.base_id());
+        feed_hash(h, x.base_name());
+        feed_hash(h, x.include_all_columns());
+        feed_hash(h, x.where_clause());
+    }
+};
+
+template<>
+struct appending_hash<schema::dropped_column> {
+    template<typename H>
+    requires Hasher<H>
+    void operator()(H& h, const schema::dropped_column& x) const noexcept {
+        feed_hash(h, x.type);
+        feed_hash(h, x.timestamp);
+    }
+};
+
+table_schema_version schema::calculate_digest(const schema::raw_schema& r) {
+    md5_hasher h;
+    feed_hash(h, r._id);
+    feed_hash(h, r._ks_name);
+    feed_hash(h, r._cf_name);
+    feed_hash(h, r._columns);
+    feed_hash(h, r._comment);
+    feed_hash(h, r._default_time_to_live.count());
+    feed_hash(h, r._regular_column_name_type);
+    feed_hash(h, r._bloom_filter_fp_chance);
+    feed_hash(h, r._compressor_params.get_options());
+    feed_hash(h, r._is_dense);
+    feed_hash(h, r._is_compound);
+    feed_hash(h, r._gc_grace_seconds);
+    feed_hash(h, r._paxos_grace_seconds);
+    feed_hash(h, r._min_compaction_threshold);
+    feed_hash(h, r._max_compaction_threshold);
+    feed_hash(h, r._min_index_interval);
+    feed_hash(h, r._max_index_interval);
+    feed_hash(h, r._memtable_flush_period);
+    feed_hash(h, r._speculative_retry.to_sstring());
+    feed_hash(h, r._compaction_strategy);
+    feed_hash(h, r._compaction_strategy_options);
+    feed_hash(h, r._compaction_enabled);
+    feed_hash(h, r._caching_options.to_map());
+    feed_hash(h, r._dropped_columns);
+    feed_hash(h, r._collections);
+    feed_hash(h, r._view_info);
+    feed_hash(h, r._indices_by_name);
+    feed_hash(h, r._is_counter);
+
+    for (auto&& [name, ext] : r._extensions) {
+        feed_hash(h, name);
+        feed_hash(h, ext->options_to_string());
+    }
+
+    return table_schema_version(utils::UUID_gen::get_name_UUID(h.finalize()));
 }
 
 index_metadata::index_metadata(const sstring& name,
@@ -571,6 +684,7 @@ index_metadata::index_metadata(const sstring& name,
 {}
 
 bool index_metadata::operator==(const index_metadata& other) const {
+    // Keep consistent with appending_hash<index_metadata>.
     return _id == other._id
            && _name == other._name
            && _kind == other._kind
@@ -787,7 +901,7 @@ std::ostream& operator<<(std::ostream& os, const schema& s) {
 std::string schema_extension::options_to_string() const {
     std::ostringstream ss;
     ss << '{';
-    map_as_cql_param(ss, ser::deserialize_from_buffer(serialize(), boost::type<default_map_type>(), 0));
+    map_as_cql_param(ss, ser::deserialize_from_buffer(serialize(), std::type_identity<default_map_type>(), 0));
     ss << '}';
     return ss.str();
 }
@@ -802,52 +916,73 @@ static std::ostream& column_definition_as_cql_key(std::ostream& os, const column
     return os;
 }
 
-static bool is_global_index(replica::database& db, const table_id& id, const schema& s) {
-    return  db.find_column_family(id).get_index_manager().is_global_index(s);
-}
-
-static bool is_index(replica::database& db, const table_id& id, const schema& s) {
-    return  db.find_column_family(id).get_index_manager().is_index(s);
-}
-
-sstring schema::element_type(replica::database& db) const {
-    if (is_view()) {
-        if (is_index(db, view_info()->base_id(), *this)) {
-            return "index";
-        } else {
-            return "view";
-        }
+static void describe_index_columns(std::ostream& os, bool is_local, const schema& index_schema, schema_ptr base_schema) {
+    auto index_name = secondary_index::index_name_from_table_name(index_schema.cf_name());
+    if (!base_schema->all_indices().contains(index_name)) {
+        on_internal_error(dblog, format("Couldn't find index {} on table {}", index_name, base_schema->cf_name()));
     }
-    return "table";
+    
+    int n = 0;
+    os << "(";
+
+    if (is_local) {
+        os << "(";
+        for (auto& pk: index_schema.partition_key_columns()) {
+            if (n++ != 0) {
+                os << ", ";
+            }
+            os << pk.name_as_cql_string();
+        }
+        os << "), ";
+    }
+
+    // Global and local indexes may only contain one column.
+    // Local indexes support multi column indexes via custom indexes, but at least
+    // for now, Scylla supports no custom indexes.
+    auto index_metadata = base_schema->all_indices().at(index_name);
+    auto target_str = secondary_index::target_parser::get_target_column_name_from_string(
+        index_metadata.options().at(cql3::statements::index_target::target_option_name)
+    );
+    auto base_column_name = cql3_parser::index_target::column_name_from_target_string(target_str);
+    auto base_column = base_schema->get_column_definition(to_bytes(base_column_name));
+    if (!base_column) {
+        on_internal_error(dblog, format("Couldn't find base column {} in table {} for index {}", base_column_name, base_schema->cf_name(), index_name));
+    }
+    auto bk_type = base_column->type;
+
+    if (bk_type->is_collection() && !bk_type->is_multi_cell()) {
+        // Indexes on frozen collection require full() function but the function is dropped while saving the target.
+        os << "full(" << cql3::util::maybe_quote(base_column_name) << ")";
+    } else if (bk_type->is_set() && target_str.starts_with("keys(")) {
+        // Indexes on set are saved with target keys() but only valid targets when creating the index are values() or just the column name.
+        // Since indexes on list are always printed with values() target (it's always added even if the index is created only with column name),
+        // always add values() target to index to set
+        os << "values(" << cql3::util::maybe_quote(base_column_name) << ")";
+    } else {
+        // Target string is already quoted if needed
+        os << target_str;
+    }
+
+    os << ")";
 }
 
-std::ostream& schema::describe(replica::database& db, std::ostream& os, bool with_internals) const {
+sstring schema::get_create_statement(const schema_describe_helper& helper, bool with_internals) const {
+    std::ostringstream os;
+
     os << "CREATE ";
     int n = 0;
 
     if (is_view()) {
-        if (is_index(db, view_info()->base_id(), *this)) {
-            auto is_local = !is_global_index(db, view_info()->base_id(), *this);
+        if (helper.is_index(view_info()->base_id(), *this)) {
+            auto is_local = !helper.is_global_index(view_info()->base_id(), *this);
 
             os << "INDEX " << cql3::util::maybe_quote(secondary_index::index_name_from_table_name(cf_name())) << " ON "
-                    << cql3::util::maybe_quote(ks_name()) << "." << cql3::util::maybe_quote(view_info()->base_name()) << "(";
-            if (is_local) {
-                os << "(";
-            }
-            for (auto& pk : partition_key_columns()) {
-                if (n++ != 0) {
-                    os << ", ";
-                }
-                os << pk.name_as_cql_string();
-            }
-            if (is_local) {
-                os << ")";
-                if (!clustering_key_columns().empty()) {
-                    os << ", " << clustering_key_columns().front().name_as_cql_string();
-                }
-            }
-            os <<");\n";
-            return os;
+                    << cql3::util::maybe_quote(ks_name()) << "." << cql3::util::maybe_quote(view_info()->base_name());
+
+            describe_index_columns(os, is_local, *this, helper.find_schema(view_info()->base_id()));
+            os << ";\n";
+
+            return std::move(os).str();
         } else {
             os << "MATERIALIZED VIEW " << cql3::util::maybe_quote(ks_name()) << "." << cql3::util::maybe_quote(cf_name()) << " AS\n";
             os << "    SELECT ";
@@ -934,7 +1069,7 @@ std::ostream& schema::describe(replica::database& db, std::ostream& os, bool wit
     if (is_compact_table()) {
         os << "COMPACT STORAGE\n    AND ";
     }
-    schema_properties(db, os);
+    schema_properties(helper, os);
     os << ";\n";
 
     if (with_internals) {
@@ -952,10 +1087,30 @@ std::ostream& schema::describe(replica::database& db, std::ostream& os, bool wit
         }
     }
 
-    return os;
+    return std::move(os).str();
 }
 
-std::ostream& schema::schema_properties(replica::database& db, std::ostream& os) const {
+cql3::description schema::describe(const schema_describe_helper& helper, cql3::describe_option desc_opt) const {
+    const sstring type = std::invoke([&] {
+        if (is_view()) {
+            return helper.is_index(view_info()->base_id(), *this)
+                    ? "index"
+                    : "view";
+        }
+        return "table";
+    });
+
+    return cql3::description {
+        .keyspace = ks_name(),
+        .type = std::move(type),
+        .name = cf_name(),
+        .create_statement = desc_opt == cql3::describe_option::NO_STMTS
+                ? std::nullopt
+                : std::make_optional(get_create_statement(helper, desc_opt == cql3::describe_option::STMTS_AND_INTERNALS))
+    };
+}
+
+std::ostream& schema::schema_properties(const schema_describe_helper& helper, std::ostream& os) const {
     os << "bloom_filter_fp_chance = " << bloom_filter_fp_chance();
     os << "\n    AND caching = {";
     map_as_cql_param(os, caching_options().to_map());
@@ -978,7 +1133,7 @@ std::ostream& schema::schema_properties(replica::database& db, std::ostream& os)
     for (auto& [type, ext] : extensions()) {
         os << "\n    AND " << type << " = " << ext->options_to_string();
     }
-    if (is_view() && !is_index(db, view_info()->base_id(), *this)) {
+    if (is_view() && !helper.is_index(view_info()->base_id(), *this)) {
         auto is_sync_update = db::find_tag(*this, db::SYNCHRONOUS_VIEW_UPDATES_TAG_KEY);
         if (is_sync_update.has_value()) {
             os << "\n    AND synchronous_updates = " << *is_sync_update;
@@ -987,10 +1142,10 @@ std::ostream& schema::schema_properties(replica::database& db, std::ostream& os)
     return os;
 }
 
-std::ostream& schema::describe_alter_with_properties(replica::database& db, std::ostream& os) const {
+std::ostream& schema::describe_alter_with_properties(const schema_describe_helper& helper, std::ostream& os) const {
     os << "ALTER "; 
     if (is_view()) {
-        if (is_index(db, view_info()->base_id(), *this)) {
+        if (helper.is_index(view_info()->base_id(), *this)) {
             on_internal_error(dblog, "ALTER statement is not supported for index");
         }
         
@@ -999,7 +1154,7 @@ std::ostream& schema::describe_alter_with_properties(replica::database& db, std:
         os << "TABLE ";
     }
     os << cql3::util::maybe_quote(ks_name()) << "." << cql3::util::maybe_quote(cf_name()) << " WITH ";
-    schema_properties(db, os);
+    schema_properties(helper, os);
     os << ";\n";
 
     return os;
@@ -1068,11 +1223,11 @@ schema_builder::schema_builder(std::string_view ks_name, std::string_view cf_nam
     // avoided this case in the first place.
     if (ks_name.find_first_of('/') != std::string_view::npos ||
         ks_name.find_first_of('\0') != std::string_view::npos) {
-        throw std::logic_error(format("Tried to create a schema with illegal characters in keyspace name: {}", ks_name));
+        throw std::logic_error(fmt::format("Tried to create a schema with illegal characters in keyspace name: {}", ks_name));
     }
     if (cf_name.find_first_of('/') != std::string_view::npos ||
         cf_name.find_first_of('\0') != std::string_view::npos) {
-        throw std::logic_error(format("Tried to create a schema with illegal characters in table name: {}", cf_name));
+        throw std::logic_error(fmt::format("Tried to create a schema with illegal characters in table name: {}", cf_name));
     }
     _raw._ks_name = sstring(ks_name);
     _raw._cf_name = sstring(cf_name);
@@ -1093,7 +1248,7 @@ schema_builder::schema_builder(const schema::raw_schema& raw)
     static_assert(schema::row_column_ids_are_ordered_by_name::value, "row columns don't need to be ordered by name");
     // Schema builder may add or remove columns and their ids need to be
     // recomputed in build().
-    for (auto& def : _raw._columns | boost::adaptors::filtered([] (auto& def) { return !def.is_primary_key(); })) {
+    for (auto& def : _raw._columns | std::views::filter([] (auto& def) { return !def.is_primary_key(); })) {
             def.id = 0;
             def.ordinal_id = static_cast<ordinal_column_id>(0);
     }
@@ -1167,7 +1322,7 @@ schema_builder& schema_builder::with_computed_column(bytes name, data_type type,
 
 schema_builder& schema_builder::remove_column(bytes name, std::optional<api::timestamp_type> timestamp)
 {
-    auto it = boost::range::find_if(_raw._columns, [&] (auto& column) {
+    auto it = std::ranges::find_if(_raw._columns, [&] (auto& column) {
         return column.name() == name;
     });
     if(it == _raw._columns.end()) {
@@ -1198,7 +1353,7 @@ schema_builder& schema_builder::rename_column(bytes from, bytes to)
     auto it = std::find_if(_raw._columns.begin(), _raw._columns.end(), [&] (auto& col) {
         return col.name() == from;
     });
-    assert(it != _raw._columns.end());
+    SCYLLA_ASSERT(it != _raw._columns.end());
     auto& def = *it;
     column_definition new_def(to, def.type, def.kind, def.component_index());
     _raw._columns.erase(it);
@@ -1207,21 +1362,21 @@ schema_builder& schema_builder::rename_column(bytes from, bytes to)
 
 schema_builder& schema_builder::alter_column_type(bytes name, data_type new_type)
 {
-    auto it = boost::find_if(_raw._columns, [&name] (auto& c) { return c.name() == name; });
-    assert(it != _raw._columns.end());
+    auto it = std::ranges::find_if(_raw._columns, [&name] (auto& c) { return c.name() == name; });
+    SCYLLA_ASSERT(it != _raw._columns.end());
     it->type = new_type;
 
     if (new_type->is_multi_cell()) {
         auto c_it = _raw._collections.find(name);
-        assert(c_it != _raw._collections.end());
+        SCYLLA_ASSERT(c_it != _raw._collections.end());
         c_it->second = new_type;
     }
     return *this;
 }
 
 schema_builder& schema_builder::mark_column_computed(bytes name, column_computation_ptr computation) {
-    auto it = boost::find_if(_raw._columns, [&name] (const column_definition& c) { return c.name() == name; });
-    assert(it != _raw._columns.end());
+    auto it = std::ranges::find_if(_raw._columns, [&name] (const column_definition& c) { return c.name() == name; });
+    SCYLLA_ASSERT(it != _raw._columns.end());
     it->set_computed(std::move(computation));
 
     return *this;
@@ -1240,6 +1395,11 @@ schema_builder& schema_builder::with(compact_storage cs) {
 
 schema_builder& schema_builder::with_version(table_schema_version v) {
     _version = v;
+    return *this;
+}
+
+schema_builder& schema_builder::with_hash_version() {
+    _version = from_hash();
     return *this;
 }
 
@@ -1316,7 +1476,7 @@ void schema_builder::prepare_dense_schema(schema::raw_schema& raw) {
 }
 
 schema_builder& schema_builder::with_view_info(table_id base_id, sstring base_name, bool include_all_columns, sstring where_clause) {
-    _view_info = raw_view_info(std::move(base_id), std::move(base_name), include_all_columns, std::move(where_clause));
+    _raw._view_info = raw_view_info(std::move(base_id), std::move(base_name), include_all_columns, std::move(where_clause));
     return *this;
 }
 
@@ -1364,12 +1524,6 @@ schema_ptr schema_builder::build(schema::raw_schema& new_raw) {
         }
     }
 
-    if (_version) {
-        new_raw._version = *_version;
-    } else {
-        new_raw._version = table_schema_version(utils::UUID_gen::get_time_UUID());
-    }
-
     if (new_raw._is_counter) {
         new_raw._default_validation_class = counter_type;
     }
@@ -1415,7 +1569,19 @@ schema_ptr schema_builder::build(schema::raw_schema& new_raw) {
         new_raw._sharder = get_sharder(1, 0);
     }
 
-    return make_lw_shared<schema>(schema::private_tag{}, new_raw, _view_info, static_props);
+    std::visit(make_visitor(
+        [&] (from_time) {
+            new_raw._version = table_schema_version(utils::UUID_gen::get_time_UUID());
+        },
+        [&] (from_hash) {
+            new_raw._version = schema::calculate_digest(new_raw);
+        },
+        [&] (table_schema_version v) {
+            new_raw._version = v;
+        }
+    ), _version);
+
+    return make_lw_shared<schema>(schema::private_tag{}, new_raw, static_props);
 }
 
 auto schema_builder::static_configurators() -> std::vector<static_configurator>& {
@@ -1518,7 +1684,7 @@ sstring to_sstring(const schema& s) {
     if (s.is_compound()) {
         return compound_name(s);
     } else if (s.clustering_key_size() == 1) {
-        assert(s.is_dense() || s.is_static_compact_table());
+        SCYLLA_ASSERT(s.is_dense() || s.is_static_compact_table());
         return s.clustering_key_columns().front().type->name();
     } else {
         return s.regular_column_name_type()->name();
@@ -1535,7 +1701,7 @@ void read_collections(schema_builder& builder, sstring comparator)
     // The format of collection entries in the comparator is:
     // org.apache.cassandra.db.marshal.ColumnToCollectionType(<name1>:<type1>, ...)
 
-    auto find_closing_parenthesis = [] (sstring_view str, size_t start) {
+    auto find_closing_parenthesis = [] (std::string_view str, size_t start) {
         auto pos = start;
         auto nest_level = 0;
         do {
@@ -1572,10 +1738,10 @@ void read_collections(schema_builder& builder, sstring comparator)
             throw marshal_exception("read_collections - colon not found");
         }
 
-        auto name = from_hex(sstring_view(comparator.c_str() + pos, colon - pos));
+        auto name = from_hex(std::string_view(comparator.c_str() + pos, colon - pos));
 
         colon++;
-        auto type_str = sstring_view(comparator.c_str() + colon, end - colon);
+        auto type_str = std::string_view(comparator.c_str() + colon, end - colon);
         auto type = db::marshal::type_parser::parse(type_str);
 
         builder.with_collection(name, type);
@@ -1602,23 +1768,14 @@ schema::regular_end() const {
     return regular_columns().end();
 }
 
-struct column_less_comparator {
-    bool operator()(const column_definition& def, const bytes& name) {
-        return def.name() < name;
-    }
-    bool operator()(const bytes& name, const column_definition& def) {
-        return name < def.name();
-    }
-};
-
 schema::const_iterator
 schema::regular_lower_bound(const bytes& name) const {
-    return boost::lower_bound(regular_columns(), name, column_less_comparator());
+    return std::ranges::lower_bound(regular_columns(), name, std::ranges::less(), std::mem_fn(&column_definition::name));
 }
 
 schema::const_iterator
 schema::regular_upper_bound(const bytes& name) const {
-    return boost::upper_bound(regular_columns(), name, column_less_comparator());
+    return std::ranges::upper_bound(regular_columns(), name, std::ranges::less(), std::mem_fn(&column_definition::name));
 }
 
 schema::const_iterator
@@ -1633,12 +1790,12 @@ schema::static_end() const {
 
 schema::const_iterator
 schema::static_lower_bound(const bytes& name) const {
-    return boost::lower_bound(static_columns(), name, column_less_comparator());
+    return std::ranges::lower_bound(static_columns(), name, std::ranges::less(), std::mem_fn(&column_definition::name));
 }
 
 schema::const_iterator
 schema::static_upper_bound(const bytes& name) const {
-    return boost::upper_bound(static_columns(), name, column_less_comparator());
+    return std::ranges::upper_bound(static_columns(), name, std::ranges::less(), std::mem_fn(&column_definition::name));
 }
 data_type
 schema::column_name_type(const column_definition& def, const data_type& regular_column_name_type) {
@@ -1712,26 +1869,36 @@ schema::partition_key_size() const {
 
 schema::const_iterator_range_type
 schema::partition_key_columns() const {
-    return boost::make_iterator_range(_raw._columns.begin() + column_offset(column_kind::partition_key)
+    return std::ranges::subrange(_raw._columns.begin() + column_offset(column_kind::partition_key)
             , _raw._columns.begin() + column_offset(column_kind::clustering_key));
 }
 
 schema::const_iterator_range_type
 schema::clustering_key_columns() const {
-    return boost::make_iterator_range(_raw._columns.begin() + column_offset(column_kind::clustering_key)
+    return std::ranges::subrange(_raw._columns.begin() + column_offset(column_kind::clustering_key)
             , _raw._columns.begin() + column_offset(column_kind::static_column));
 }
 
 schema::const_iterator_range_type
 schema::static_columns() const {
-    return boost::make_iterator_range(_raw._columns.begin() + column_offset(column_kind::static_column)
+    return std::ranges::subrange(_raw._columns.begin() + column_offset(column_kind::static_column)
             , _raw._columns.begin() + column_offset(column_kind::regular_column));
 }
 
 schema::const_iterator_range_type
 schema::regular_columns() const {
-    return boost::make_iterator_range(_raw._columns.begin() + column_offset(column_kind::regular_column)
+    return std::ranges::subrange(_raw._columns.begin() + column_offset(column_kind::regular_column)
             , _raw._columns.end());
+}
+
+schema::const_iterator_range_type
+schema::primary_key_columns() const {
+    return std::ranges::subrange(_raw._columns.begin(), _raw._columns.begin() + column_offset(column_kind::static_column));
+}
+
+schema::const_iterator_range_type
+schema::static_and_regular_columns() const {
+    return std::ranges::subrange(_raw._columns.begin() + column_offset(column_kind::static_column), _raw._columns.end());
 }
 
 schema::const_iterator_range_type
@@ -1749,7 +1916,7 @@ schema::columns(column_kind kind) const {
     throw std::invalid_argument(std::to_string(int(kind)));
 }
 
-schema::select_order_range schema::all_columns_in_select_order() const {
+void schema::compute_all_columns_in_select_order() {
     auto is_static_compact_table = this->is_static_compact_table();
     auto no_non_pk_columns = is_compact_table()
                     // Origin: && CompactTables.hasEmptyCompactValue(this);
@@ -1765,7 +1932,9 @@ schema::select_order_range schema::all_columns_in_select_order() const {
                                     column_offset(column_kind::static_column)));
     auto ck_v_range = no_non_pk_columns ? static_columns()
                                         : const_iterator_range_type(static_columns().begin(), all_columns().end());
-    return boost::range::join(pk_range, ck_v_range);
+    auto to_addr = std::views::transform([] (const column_definition& x) { return &x; });
+    std::ranges::copy(pk_range | to_addr, std::back_inserter(_all_columns_in_select_order));
+    std::ranges::copy(ck_v_range | to_addr, std::back_inserter(_all_columns_in_select_order));
 }
 
 uint32_t
@@ -1777,7 +1946,7 @@ schema::position(const column_definition& column) const {
 }
 
 std::optional<index_metadata> schema::find_index_noname(const index_metadata& target) const {
-    const auto& it = boost::find_if(_raw._indices_by_name, [&] (auto&& e) {
+    const auto& it = std::ranges::find_if(_raw._indices_by_name, [&] (auto&& e) {
         return e.second.equals_noname(target);
     });
     if (it != _raw._indices_by_name.end()) {
@@ -1787,7 +1956,7 @@ std::optional<index_metadata> schema::find_index_noname(const index_metadata& ta
 }
 
 std::vector<index_metadata> schema::indices() const {
-    return boost::copy_range<std::vector<index_metadata>>(_raw._indices_by_name | boost::adaptors::map_values);
+    return _raw._indices_by_name | std::views::values | std::ranges::to<std::vector>();
 }
 
 const std::unordered_map<sstring, index_metadata>& schema::all_indices() const {
@@ -1799,7 +1968,7 @@ bool schema::has_index(const sstring& index_name) const {
 }
 
 std::vector<sstring> schema::index_names() const {
-    return boost::copy_range<std::vector<sstring>>(_raw._indices_by_name | boost::adaptors::map_keys);
+    return _raw._indices_by_name | std::views::keys | std::ranges::to<std::vector>();
 }
 
 data_type schema::make_legacy_default_validator() const {
@@ -1811,7 +1980,7 @@ bool schema::is_synced() const {
 }
 
 bool schema::equal_columns(const schema& other) const {
-    return boost::equal(all_columns(), other.all_columns());
+    return std::ranges::equal(all_columns(), other.all_columns());
 }
 
 schema_ptr schema::make_reversed() const {
@@ -1897,7 +2066,7 @@ bytes collection_column_computation::serialize() const {
             break;
     }
     rjson::add(serialized, "type", rjson::from_string(type));
-    rjson::add(serialized, "collection_name", rjson::from_string(to_sstring_view(_collection_name)));
+    rjson::add(serialized, "collection_name", rjson::from_string(to_string_view(_collection_name)));
     return to_bytes(rjson::print(serialized));
 }
 
@@ -2033,6 +2202,7 @@ std::vector<db::view::view_key_and_action> collection_column_computation::comput
 }
 
 bool operator==(const raw_view_info& x, const raw_view_info& y) {
+    // Keep consistent with appending_hash<raw_view_info>
     return x._base_id == y._base_id
         && x._base_name == y._base_name
         && x._include_all_columns == y._include_all_columns

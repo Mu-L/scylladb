@@ -19,18 +19,18 @@ $ git submodule update --init --recursive
 ### Dependencies
 
 Scylla is fairly fussy about its build environment, requiring a very recent
-version of the C++20 compiler and numerous tools and libraries to build.
+version of the C++23 compiler and numerous tools and libraries to build.
 
 Run `./install-dependencies.sh` (as root) to use your Linux distributions's
 package manager to install the appropriate packages on your build machine.
 However, this will only work on very recent distributions. For example,
 currently Fedora users must upgrade to Fedora 32 otherwise the C++ compiler
-will be too old, and not support the new C++20 standard that Scylla uses.
+will be too old, and not support the new C++23 standard that Scylla uses.
 
 Alternatively, to avoid having to upgrade your build machine or install
 various packages on it, we provide another option - the **frozen toolchain**.
 This is a script, `./tools/toolchain/dbuild`, that can execute build or run
-commands inside a Docker image that contains exactly the right build tools and
+commands inside a container that contains exactly the right build tools and
 libraries. The `dbuild` technique is useful for beginners, but is also the way
 in which ScyllaDB produces official releases, so it is highly recommended.
 
@@ -41,6 +41,12 @@ and running Scylla becomes as easy as:
 $ ./tools/toolchain/dbuild ./configure.py
 $ ./tools/toolchain/dbuild ninja build/release/scylla
 $ ./tools/toolchain/dbuild ./build/release/scylla --developer-mode 1
+```
+
+Note: do not mix environemtns - either perform all your work with dbuild, or natively on the host.
+Note2: you can get to an interactive shell within dbuild by running it without any parameters:
+```bash
+$ ./tools/toolchain/dbuild
 ```
 
 ### Build system
@@ -114,6 +120,13 @@ Run all tests through the test execution wrapper with
 
 ```bash
 $ ./test.py --mode={debug,release}
+```
+
+or, if you are using `dbuild`, you need to build the code and the tests and then you can run them at will:
+
+```bash
+$ ./tools/toolchain/dbuild ninja {debug,release,dev}-build
+$ ./tools/toolchain/dbuild ./test.py --mode {debug,release,dev}
 ```
 
 The `--name` argument can be specified to run a particular test.

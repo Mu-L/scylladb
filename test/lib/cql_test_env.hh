@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -16,6 +16,8 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 
+#include "db/view/view_update_generator.hh"
+#include "service/qos/service_level_controller.hh"
 #include "replica/database.hh"
 #include "transport/messages/result_message_base.hh"
 #include "cql3/query_options_fwd.hh"
@@ -97,6 +99,8 @@ public:
     bool ms_listen = false;
     bool run_with_raft_recovery = false;
 
+    std::optional<timeout_config> query_timeout;
+
     cql_test_config();
     cql_test_config(const cql_test_config&);
     cql_test_config(shared_ptr<db::config>);
@@ -111,14 +115,14 @@ class cql_test_env {
 public:
     virtual ~cql_test_env() {};
 
-    virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_cql(sstring_view text) = 0;
+    virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_cql(std::string_view text) = 0;
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_cql(
-            sstring_view text, std::unique_ptr<cql3::query_options> qo) = 0;
+            std::string_view text, std::unique_ptr<cql3::query_options> qo) = 0;
 
     /// Processes queries (which must be modifying queries) as a batch.
     virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_batch(
-        const std::vector<sstring_view>& queries, std::unique_ptr<cql3::query_options> qo) = 0;
+        const std::vector<std::string_view>& queries, std::unique_ptr<cql3::query_options> qo) = 0;
 
     virtual future<cql3::prepared_cache_key_type> prepare(sstring query) = 0;
 
@@ -179,7 +183,15 @@ public:
 
     virtual sharded<sstables::storage_manager>& get_sstorage_manager() = 0;
 
+    virtual sharded<service::storage_service>& get_storage_service() = 0;
+
+    virtual sharded<tasks::task_manager>& get_task_manager() = 0;
+
+    virtual sharded<locator::shared_token_metadata>& get_shared_token_metadata() = 0;
+
     data_dictionary::database data_dictionary();
+
+    virtual sharded<qos::service_level_controller>& service_level_controller_service() = 0;
 };
 
 future<> do_with_cql_env(std::function<future<>(cql_test_env&)> func, cql_test_config = {}, std::optional<cql_test_init_configurables> = {});

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/coroutine.hh>
@@ -31,7 +31,7 @@ using namespace db;
 
 ser::mutation_view frozen_mutation::mutation_view() const {
     auto in = ser::as_input_stream(_bytes);
-    return ser::deserialize(in, boost::type<ser::mutation_view>());
+    return ser::deserialize(in, std::type_identity<ser::mutation_view>());
 }
 
 table_id
@@ -118,15 +118,15 @@ frozen_mutation freeze(const mutation& m) {
 }
 
 std::vector<frozen_mutation> freeze(const std::vector<mutation>& muts) {
-    return boost::copy_range<std::vector<frozen_mutation>>(muts | boost::adaptors::transformed([] (const mutation& m) {
+    return muts | std::views::transform([] (const mutation& m) {
         return freeze(m);
-    }));
+    }) | std::ranges::to<std::vector<frozen_mutation>>();
 }
 
 std::vector<mutation> unfreeze(const std::vector<frozen_mutation>& muts) {
-    return boost::copy_range<std::vector<mutation>>(muts | boost::adaptors::transformed([] (const frozen_mutation& fm) {
+    return muts | std::views::transform([] (const frozen_mutation& fm) {
         return fm.unfreeze(local_schema_registry().get(fm.schema_version()));
-    }));
+    }) | std::ranges::to<std::vector<mutation>>();
 }
 
 
@@ -149,11 +149,7 @@ stop_iteration streamed_mutation_freezer::consume(static_row&& sr) {
 }
 
 stop_iteration streamed_mutation_freezer::consume(clustering_row&& cr) {
-    if (_reversed) {
-        _crs.emplace_front(std::move(cr));
-    } else {
-        _crs.emplace_back(std::move(cr));
-    }
+    _crs.emplace_back(std::move(cr));
     return stop_iteration::no;
 }
 

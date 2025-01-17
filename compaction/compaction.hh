@@ -4,19 +4,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "readers/combined_reader_stats.hh"
 #include "sstables/shared_sstable.hh"
 #include "compaction/compaction_descriptor.hh"
 #include "gc_clock.hh"
-#include "compaction_weight_registration.hh"
 #include "utils/UUID.hh"
-#include "utils/pretty_printers.hh"
 #include "table_state.hh"
-#include <seastar/core/thread.hh>
 #include <seastar/core/abort_source.hh>
 
 using namespace compaction;
@@ -80,6 +78,7 @@ struct compaction_stats {
     uint64_t validation_errors = 0;
     // Bloom filter checks during max purgeable calculation
     uint64_t bloom_filter_checks = 0;
+    combined_reader_statistics reader_statistics;
 
     compaction_stats& operator+=(const compaction_stats& r) {
         ended_at = std::max(ended_at, r.ended_at);

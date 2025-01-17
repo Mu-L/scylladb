@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "schema/schema_registry.hh"
@@ -18,8 +18,6 @@
 #include <fmt/core.h>
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/as_future.hh>
-
-#include <boost/range/adaptor/reversed.hpp>
 
 #include <fmt/ostream.h>
 
@@ -329,7 +327,7 @@ mutation_reader read_context::create_reader(
     auto& rm = _readers[shard];
 
     if (rm.state != reader_state::used && rm.state != reader_state::successful_lookup && rm.state != reader_state::inexistent) {
-        auto msg = format("Unexpected request to create reader for shard {}."
+        auto msg = seastar::format("Unexpected request to create reader for shard {}."
                 " The reader is expected to be in either `used`, `successful_lookup` or `inexistent` state,"
                 " but is in `{}` state instead.", shard, reader_state_to_string(rm.state));
         mmq_log.warn("{}", msg);
@@ -620,7 +618,7 @@ future<> read_context::save_readers(mutation_reader::tracked_buffer unconsumed_b
         tracing::trace(_trace_state, "No compaction state to dismantle, partition exhausted", cs_stats);
     }
 
-    co_await parallel_for_each(boost::irange(0u, smp::count), [this, &last_pos] (shard_id shard) {
+    co_await parallel_for_each(std::views::iota(0u, smp::count), [this, &last_pos] (shard_id shard) {
         auto& rm = _readers[shard];
         if (rm.state == reader_state::successful_lookup || rm.state == reader_state::saving) {
             return save_reader(shard, last_pos);
@@ -986,31 +984,27 @@ public:
 
 future<std::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>> query_mutations_on_all_shards(
         distributed<replica::database>& db,
-        schema_ptr table_schema,
+        schema_ptr query_schema,
         const query::read_command& cmd,
         const dht::partition_range_vector& ranges,
         tracing::trace_state_ptr trace_state,
         db::timeout_clock::time_point timeout) {
-    schema_ptr query_schema = cmd.slice.is_reversed() ? table_schema->make_reversed() : table_schema;
-
     return do_query_on_all_shards<mutation_query_result_builder>(db, query_schema, cmd, ranges, std::move(trace_state), timeout,
-            [table_schema, &cmd] (query::result_memory_accounter&& accounter) {
-        return mutation_query_result_builder(*table_schema, cmd.slice, std::move(accounter));
+            [query_schema, &cmd] (query::result_memory_accounter&& accounter) {
+        return mutation_query_result_builder(*query_schema, cmd.slice, std::move(accounter));
     });
 }
 
 future<std::tuple<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature>> query_data_on_all_shards(
         distributed<replica::database>& db,
-        schema_ptr table_schema,
+        schema_ptr query_schema,
         const query::read_command& cmd,
         const dht::partition_range_vector& ranges,
         query::result_options opts,
         tracing::trace_state_ptr trace_state,
         db::timeout_clock::time_point timeout) {
-    schema_ptr query_schema = cmd.slice.is_reversed() ? table_schema->make_reversed() : table_schema;
-
     return do_query_on_all_shards<data_query_result_builder>(db, query_schema, cmd, ranges, std::move(trace_state), timeout,
-            [table_schema, &cmd, opts] (query::result_memory_accounter&& accounter) {
-        return data_query_result_builder(*table_schema, cmd.slice, opts, std::move(accounter), cmd.tombstone_limit);
+            [query_schema, &cmd, opts] (query::result_memory_accounter&& accounter) {
+        return data_query_result_builder(*query_schema, cmd.slice, opts, std::move(accounter), cmd.tombstone_limit);
     });
 }

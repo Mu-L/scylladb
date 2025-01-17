@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/test/unit_test.hpp>
@@ -14,12 +14,15 @@
 #include "db/view/view_builder.hh"
 #include "compaction/compaction_manager.hh"
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
 #include "test/lib/eventually.hh"
 
 #include "db/config.hh"
+
+BOOST_AUTO_TEST_SUITE(view_complex_test)
 
 using namespace std::literals::chrono_literals;
 
@@ -842,7 +845,7 @@ void test_commutative_row_deletion(cql_test_env& e, std::function<void()>&& mayb
         }});
     });
 
-    e.local_db().get_compaction_manager().perform_major_compaction(e.local_db().find_column_family("ks", "vcf").try_get_table_state_with_static_sharding()).get();
+    e.local_db().get_compaction_manager().perform_major_compaction(e.local_db().find_column_family("ks", "vcf").try_get_table_state_with_static_sharding(), tasks::task_info{}).get();
 }
 
 SEASTAR_TEST_CASE(test_commutative_row_deletion_without_flush) {
@@ -1078,7 +1081,7 @@ void test_update_with_column_timestamp_bigger_than_pk(cql_test_env& e, std::func
         }});
     });
 
-    e.local_db().get_compaction_manager().perform_major_compaction(e.local_db().find_column_family("ks", "vcf").try_get_table_state_with_static_sharding()).get();
+    e.local_db().get_compaction_manager().perform_major_compaction(e.local_db().find_column_family("ks", "vcf").try_get_table_state_with_static_sharding(), tasks::task_info{}).get();
     eventually([&] {
         auto msg = e.execute_cql("select * from vcf limit 1").get();
         assert_that(msg).is_rows().with_rows({{
@@ -1748,3 +1751,5 @@ SEASTAR_TEST_CASE(test_3362_row_deletion_2) {
         });
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

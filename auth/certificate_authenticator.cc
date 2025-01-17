@@ -4,12 +4,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "auth/certificate_authenticator.hh"
 
-#include <regex>
+#include <boost/regex.hpp>
 #include <fmt/ranges.h>
 
 #include "utils/class_registrator.hh"
@@ -76,7 +76,7 @@ auth::certificate_authenticator::certificate_authenticator(cql3::query_processor
                     continue;
                 } catch (std::out_of_range&) {
                     // just fallthrough
-                } catch (std::regex_error&) {
+                } catch (boost::regex_error&) {
                     std::throw_with_nested(std::invalid_argument(fmt::format("Invalid query expression: {}", map.at(cfg_query_attr))));
                 }
             }
@@ -149,7 +149,7 @@ future<std::optional<auth::authenticated_user>> auth::certificate_authenticator:
             co_return username;
         }
     }
-    throw exceptions::authentication_exception(format("Subject '{}'/'{}' does not match any query expression", subject, altname));
+    throw exceptions::authentication_exception(seastar::format("Subject '{}'/'{}' does not match any query expression", subject, altname));
 }
 
 

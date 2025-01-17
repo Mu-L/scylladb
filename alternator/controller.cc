@@ -3,10 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <seastar/core/with_scheduling_group.hh>
 #include <seastar/net/dns.hh>
+
 #include "controller.hh"
 #include "server.hh"
 #include "executor.hh"
@@ -130,10 +132,10 @@ future<> controller::start_server() {
                 std::throw_with_nested(std::runtime_error("Failed to set up Alternator TLS credentials"));
             }
         }
-        bool alternator_enforce_authorization = _config.alternator_enforce_authorization();
         _server.invoke_on_all(
-                [this, addr, alternator_port, alternator_https_port, creds = std::move(creds), alternator_enforce_authorization] (server& server) mutable {
-            return server.init(addr, alternator_port, alternator_https_port, creds, alternator_enforce_authorization,
+                [this, addr, alternator_port, alternator_https_port, creds = std::move(creds)] (server& server) mutable {
+            return server.init(addr, alternator_port, alternator_https_port, creds,
+                    _config.alternator_enforce_authorization,
                     &_memory_limiter.local().get_semaphore(),
                     _config.max_concurrent_requests_per_shard);
         }).handle_exception([this, addr, alternator_port, alternator_https_port] (std::exception_ptr ep) {

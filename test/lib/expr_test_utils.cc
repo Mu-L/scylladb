@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "expr_test_utils.hh"
@@ -53,7 +53,7 @@ raw_value make_bigint_raw(int64_t val) {
     return make_raw(val);
 }
 
-raw_value make_text_raw(const sstring_view& text) {
+raw_value make_text_raw(const std::string_view& text) {
     return raw_value::make_value(utf8_type->decompose(text));
 }
 
@@ -95,7 +95,7 @@ constant make_bigint_const(int64_t val) {
     return make_const(val);
 }
 
-constant make_text_const(const sstring_view& text) {
+constant make_text_const(const std::string_view& text) {
     return constant(make_text_raw(text), utf8_type);
 }
 
@@ -353,7 +353,7 @@ tuple_constructor make_tuple_constructor(std::vector<expression> elements, std::
                              .type = tuple_type_impl::get_instance(std::move(element_types))};
 }
 
-usertype_constructor make_usertype_constructor(std::vector<std::pair<sstring_view, constant>> field_values) {
+usertype_constructor make_usertype_constructor(std::vector<std::pair<std::string_view, constant>> field_values) {
     usertype_constructor::elements_map_type elements_map;
     std::vector<bytes> field_names;
     std::vector<data_type> field_types;
@@ -376,9 +376,9 @@ std::pair<evaluation_inputs, std::unique_ptr<evaluation_inputs_data>> make_evalu
     const schema_ptr& table_schema,
     const column_values& column_vals,
     const std::vector<raw_value>& bind_marker_values) {
-    auto throw_error = [&](const auto&... fmt_args) -> sstring {
-        sstring error_msg = format(fmt_args...);
-        sstring final_msg = format("make_evaluation_inputs error: {}. (table_schema: {}, column_vals: {})", error_msg,
+    auto throw_error = [&]<typename... Args>(fmt::format_string<Args...> fmt, Args&&... args) -> sstring {
+        sstring error_msg = seastar::format(fmt, std::forward<Args>(args)...);
+        sstring final_msg = seastar::format("make_evaluation_inputs error: {}. (table_schema: {}, column_vals: {})", error_msg,
                                    *table_schema, column_vals);
         throw std::runtime_error(final_msg);
     };

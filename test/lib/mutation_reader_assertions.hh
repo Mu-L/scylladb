@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <boost/test/unit_test.hpp>
 #include <seastar/util/backtrace.hh>
 #include "readers/mutation_reader.hh"
@@ -27,7 +28,7 @@ inline bool trim_range_tombstone(const schema& s, range_tombstone& rt, const que
     return relevant;
 }
 
-static inline void match_compacted_mutation(const mutation_opt& mo, const mutation& m, gc_clock::time_point query_time,
+inline void match_compacted_mutation(const mutation_opt& mo, const mutation& m, gc_clock::time_point query_time,
                                             const std::optional<query::clustering_row_ranges>& ck_ranges = {}) {
     // If the passed in mutation is empty, allow for the reader to produce an empty or no partition.
     if (m.partition().empty() && !mo) {
@@ -261,7 +262,7 @@ public:
                 BOOST_FAIL(format("Expected row with column {}, but it is not present", columns[i].name));
             }
             auto& cdef = _reader.schema()->regular_column_at(columns[i].id);
-            assert (!cdef.is_multi_cell());
+            SCYLLA_ASSERT (!cdef.is_multi_cell());
             auto cmp = compare_unsigned(columns[i].value, cell->as_atomic_cell(cdef).value().linearize());
             if (cmp != 0) {
                 BOOST_FAIL(format("Expected row with column {} having value {}, but it has value {}",

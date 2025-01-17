@@ -3,12 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/switch_to.hh>
-#include "log.hh"
+#include "utils/log.hh"
 #include "sstables/sstables_manager.hh"
 #include "sstables/sstables_registry.hh"
 #include "sstables/partition_index_cache.hh"
@@ -16,6 +16,7 @@
 #include "db/config.hh"
 #include "gms/feature.hh"
 #include "gms/feature_service.hh"
+#include "utils/assert.hh"
 #include "utils/s3/client.hh"
 #include "exceptions/exceptions.hh"
 
@@ -24,7 +25,8 @@ namespace sstables {
 logging::logger smlogger("sstables_manager");
 
 sstables_manager::sstables_manager(
-    sstring name, db::large_data_handler& large_data_handler, const db::config& dbcfg, gms::feature_service& feat, cache_tracker& ct, size_t available_memory, directory_semaphore& dir_sem, noncopyable_function<locator::host_id()>&& resolve_host_id, scheduling_group maintenance_sg, storage_manager* shared)
+    sstring name, db::large_data_handler& large_data_handler, const db::config& dbcfg, gms::feature_service& feat, cache_tracker& ct, size_t available_memory, directory_semaphore& dir_sem,
+    noncopyable_function<locator::host_id()>&& resolve_host_id, const abort_source& abort, scheduling_group maintenance_sg, storage_manager* shared)
     : _storage(shared)
     , _available_memory(available_memory)
     , _large_data_handler(large_data_handler), _db_config(dbcfg), _features(feat), _cache_tracker(ct)
@@ -39,14 +41,15 @@ sstables_manager::sstables_manager(
     , _dir_semaphore(dir_sem)
     , _resolve_host_id(std::move(resolve_host_id))
     , _maintenance_sg(std::move(maintenance_sg))
+    , _abort(abort)
 {
     _components_reloader_status = components_reloader_fiber();
 }
 
 sstables_manager::~sstables_manager() {
-    assert(_closing);
-    assert(_active.empty());
-    assert(_undergoing_close.empty());
+    SCYLLA_ASSERT(_closing);
+    SCYLLA_ASSERT(_active.empty());
+    SCYLLA_ASSERT(_undergoing_close.empty());
 }
 
 storage_manager::storage_manager(const db::config& cfg, config stm_cfg)
@@ -120,7 +123,6 @@ bool sstables_manager::uuid_sstable_identifiers() const {
 }
 
 shared_sstable sstables_manager::make_sstable(schema_ptr schema,
-        sstring table_dir,
         const data_dictionary::storage_options& storage,
         generation_type generation,
         sstable_state state,
@@ -129,7 +131,7 @@ shared_sstable sstables_manager::make_sstable(schema_ptr schema,
         gc_clock::time_point now,
         io_error_handler_gen error_handler_gen,
         size_t buffer_size) {
-    return make_lw_shared<sstable>(std::move(schema), std::move(table_dir), storage, generation, state, v, f, get_large_data_handler(), *this, now, std::move(error_handler_gen), buffer_size);
+    return make_lw_shared<sstable>(std::move(schema), storage, generation, state, v, f, get_large_data_handler(), *this, now, std::move(error_handler_gen), buffer_size);
 }
 
 sstable_writer_config sstables_manager::configure_writer(sstring origin) const {
@@ -169,7 +171,9 @@ void sstables_manager::increment_total_reclaimable_memory_and_maybe_reclaim(ssta
     _total_memory_reclaimed += memory_reclaimed;
     _total_reclaimable_memory -= memory_reclaimed;
     _reclaimed.insert(*sst_with_max_memory);
-    smlogger.info("Reclaimed {} bytes of memory from SSTable components. Total memory reclaimed so far is {} bytes", memory_reclaimed, _total_memory_reclaimed);
+    // TODO: As of now only bloom filter is reclaimed. Print actual component names when adding support for more components.
+    smlogger.info("Reclaimed {} bytes of memory from components of {}. Total memory reclaimed so far is {} bytes",
+            memory_reclaimed, sst_with_max_memory->get_filename(), _total_memory_reclaimed);
 }
 
 size_t sstables_manager::get_memory_available_for_reclaimable_components() {
@@ -223,15 +227,25 @@ future<> sstables_manager::components_reloader_fiber() {
     }
 }
 
+void sstables_manager::reclaim_memory_and_stop_tracking_sstable(sstable* sst) {
+    // remove the sstable from the memory tracking metrics
+    _total_reclaimable_memory -= sst->total_reclaimable_memory_size();
+    _total_memory_reclaimed -= sst->total_memory_reclaimed();
+    // reclaim any remaining memory from the sstable
+    sst->reclaim_memory_from_components();
+    // disable further reload of components
+    _reclaimed.erase(*sst);
+    sst->disable_component_memory_reload();
+}
+
 void sstables_manager::add(sstable* sst) {
     _active.push_back(*sst);
 }
 
 void sstables_manager::deactivate(sstable* sst) {
-    // Remove SSTable from the reclaimable memory tracking
-    _total_reclaimable_memory -= sst->total_reclaimable_memory_size();
-    _total_memory_reclaimed -= sst->total_memory_reclaimed();
-    _reclaimed.erase(*sst);
+    // Drop reclaimable components if they are still in memory
+    // and remove SSTable from the reclaimable memory tracking
+    reclaim_memory_and_stop_tracking_sstable(sst);
 
     // At this point, sst has a reference count of zero, since we got here from
     // lw_shared_ptr_deleter<sstables::sstable>::dispose().
@@ -295,16 +309,16 @@ void sstables_manager::unplug_sstables_registry() noexcept {
     _sstables_registry.reset();
 }
 
-future<> sstables_manager::init_table_storage(const data_dictionary::storage_options& so, sstring dir) {
-    return sstables::init_table_storage(so, dir);
+future<lw_shared_ptr<const data_dictionary::storage_options>> sstables_manager::init_table_storage(const schema& s, const data_dictionary::storage_options& so) {
+    return sstables::init_table_storage(*this, s, so);
 }
 
 future<> sstables_manager::init_keyspace_storage(const data_dictionary::storage_options& so, sstring dir) {
-    return sstables::init_keyspace_storage(so, dir);
+    return sstables::init_keyspace_storage(*this, so, dir);
 }
 
-future<> sstables_manager::destroy_table_storage(const data_dictionary::storage_options& so, sstring dir) {
-    return sstables::destroy_table_storage(so, dir);
+future<> sstables_manager::destroy_table_storage(const data_dictionary::storage_options& so) {
+    return sstables::destroy_table_storage(so);
 }
 
 void sstables_manager::validate_new_keyspace_storage_options(const data_dictionary::storage_options& so) {
@@ -321,6 +335,14 @@ void sstables_manager::validate_new_keyspace_storage_options(const data_dictiona
             }
         }
     }, so.value);
+}
+
+std::vector<std::filesystem::path> sstables_manager::get_local_directories(const data_dictionary::storage_options::local& so) const {
+    return sstables::get_local_directories(_db_config, so);
+}
+
+void sstables_manager::on_unlink(sstable* sst) {
+    reclaim_memory_and_stop_tracking_sstable(sst);
 }
 
 sstables_registry::~sstables_registry() = default;

@@ -5,8 +5,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#pragma once
 
 #include "readers/mutation_reader_fwd.hh"
 #include "readers/mutation_reader.hh"

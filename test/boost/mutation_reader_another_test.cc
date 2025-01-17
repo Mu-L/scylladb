@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
@@ -24,6 +24,7 @@
 #include "replica/memtable.hh"
 #include "row_cache.hh"
 #include "mutation/mutation_rebuilder.hh"
+#include "utils/assert.hh"
 #include "utils/to_string.hh"
 
 #include "test/lib/simple_schema.hh"
@@ -310,7 +311,7 @@ SEASTAR_THREAD_TEST_CASE(test_mutation_reader_move_buffer_content_to) {
     auto pkey = s.make_pkey(1);
     auto mut_orig = mutation(s.schema(), pkey);
 
-    auto mf_range = boost::irange(0, 50) | boost::adaptors::transformed([&] (auto n) {
+    auto mf_range = std::views::iota(0, 50) | std::views::transform([&] (auto n) {
         return s.make_row(permit, s.make_ckey(n), "a_16_byte_value_");
     });
     for (auto&& mf : mf_range) {
@@ -374,17 +375,17 @@ SEASTAR_THREAD_TEST_CASE(test_multi_range_reader) {
     auto keys = s.make_pkeys(10);
     auto ring = s.to_ring_positions(keys);
 
-    auto crs = boost::copy_range<std::vector<mutation_fragment>>(boost::irange(0, 3) | boost::adaptors::transformed([&] (auto n) {
+    auto crs = std::views::iota(0, 3) | std::views::transform([&] (auto n) {
         return s.make_row(permit, s.make_ckey(n), "value");
-    }));
+    }) | std::ranges::to<std::vector<mutation_fragment>>();
 
-    auto ms = boost::copy_range<std::vector<mutation>>(keys | boost::adaptors::transformed([&] (auto& key) {
+    auto ms = keys | std::views::transform([&] (auto& key) {
         auto m = mutation(s.schema(), key);
         for (auto& mf : crs) {
             m.apply(mf);
         }
         return m;
-    }));
+    }) | std::ranges::to<std::vector<mutation>>();
 
     auto source = mutation_source([&] (schema_ptr, reader_permit permit, const dht::partition_range& range) {
         return make_mutation_reader_from_mutations_v2(s.schema(), std::move(permit), ms, range);
@@ -574,7 +575,7 @@ void test_flat_stream(schema_ptr s, std::vector<mutation> muts, reversed_partiti
 
     auto consume_fn = [&] (mutation_reader& fmr, flat_stream_consumer fsc) {
         if (thread) {
-            assert(bool(!reversed));
+            SCYLLA_ASSERT(bool(!reversed));
             return fmr.consume_in_thread(std::move(fsc));
         } else {
             if (reversed) {
@@ -662,18 +663,17 @@ SEASTAR_THREAD_TEST_CASE(test_make_forwardable) {
 
     auto keys = s.make_pkeys(10);
 
-    auto crs = boost::copy_range < std::vector <
-               mutation_fragment >> (boost::irange(0, 3) | boost::adaptors::transformed([&](auto n) {
+    auto crs = std::views::iota(0, 3) | std::views::transform([&](auto n) {
                    return s.make_row(permit, s.make_ckey(n), "value");
-               }));
+               }) | std::ranges::to<std::vector<mutation_fragment>>();
 
-    auto ms = boost::copy_range < std::vector < mutation >> (keys | boost::adaptors::transformed([&](auto &key) {
+    auto ms = keys | std::views::transform([&](auto &key) {
         auto m = mutation(s.schema(), key);
         for (auto &mf : crs) {
             m.apply(mf);
         }
         return m;
-    }));
+    }) | std::ranges::to<std::vector<mutation>>();
 
     auto make_reader = [&] (auto& range) {
         return assert_that(
@@ -1095,7 +1095,7 @@ SEASTAR_THREAD_TEST_CASE(test_reverse_reader_reads_in_native_reverse_order) {
     auto compacted = [] (mutation_reader rd) {
         return make_compacting_reader(std::move(rd),
                                       gc_clock::time_point::max(),
-                                      [] (const dht::decorated_key&) { return api::max_timestamp; },
+                                      can_always_purge,
                                       tombstone_gc_state(nullptr));
     };
 
@@ -1131,16 +1131,14 @@ SEASTAR_THREAD_TEST_CASE(test_reverse_reader_v2_is_mutation_source) {
                 streamed_mutation::forwarding fwd_sm,
                 mutation_reader::forwarding fwd_mr) mutable {
             mutation_reader rd(nullptr);
-            std::unique_ptr<query::partition_slice> reversed_slice;
             std::vector<mutation>* selected_muts;
+            auto reversed_slice = std::make_unique<query::partition_slice>(query::reverse_slice(*schema, slice));
 
             schema = schema->make_reversed();
             const auto reversed = slice.is_reversed();
             if (reversed) {
-                reversed_slice = std::make_unique<query::partition_slice>(query::half_reverse_slice(*schema, slice));
                 selected_muts = &muts;
             } else {
-                reversed_slice = std::make_unique<query::partition_slice>(query::reverse_slice(*schema, slice));
                 // We don't want the memtable reader to read in reverse.
                 reversed_slice->options.remove(query::partition_slice::option::reversed);
                 selected_muts = &reverse_muts;

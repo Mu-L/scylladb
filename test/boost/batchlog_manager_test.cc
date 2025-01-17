@@ -3,17 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
 #include <boost/range/irange.hpp>
-#include <boost/range/adaptors.hpp>
 #include <boost/range/algorithm.hpp>
 #include <boost/test/unit_test.hpp>
 #include <stdint.h>
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include "test/lib/cql_test_env.hh"
 
 #include <seastar/core/future-util.hh>
@@ -24,6 +24,8 @@
 #include "db/commitlog/commitlog.hh"
 #include "message/messaging_service.hh"
 #include "service/storage_proxy.hh"
+
+BOOST_AUTO_TEST_SUITE(batchlog_manager_test)
 
 static atomic_cell make_atomic_cell(data_type dt, bytes value) {
     return atomic_cell::make_live(*dt, 0, std::move(value));
@@ -54,7 +56,7 @@ SEASTAR_TEST_CASE(test_execute_batch) {
                 return bp.count_all_batches().then([](auto n) {
                     BOOST_CHECK_EQUAL(n, 1);
                 }).then([&bp] () mutable {
-                    return bp.do_batch_log_replay();
+                    return bp.do_batch_log_replay(db::batchlog_manager::post_replay_cleanup::yes);
                 });
             });
         }).then([&qp] {
@@ -67,3 +69,4 @@ SEASTAR_TEST_CASE(test_execute_batch) {
     });
 }
 
+BOOST_AUTO_TEST_SUITE_END()

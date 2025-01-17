@@ -3,10 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
+#include <unordered_set>
 #include <boost/test/unit_test.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
@@ -17,14 +18,20 @@
 #include <seastar/http/exception.hh>
 #include <seastar/util/closeable.hh>
 #include <seastar/util/short_streams.hh>
+#include <seastar/core/units.hh>
 #include "test/lib/scylla_test_case.hh"
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
 #include "test/lib/test_utils.hh"
+#include "test/lib/tmpdir.hh"
+#include "utils/assert.hh"
 #include "utils/s3/client.hh"
 #include "utils/s3/creds.hh"
 #include "utils/exceptions.hh"
+#include "sstables/checksum_utils.hh"
 #include "gc_clock.hh"
+
+using namespace std::string_view_literals;
 
 // The test can be run on real AWS-S3 bucket. For that, create a bucket with
 // permissive enough policy and then run the test with env set respectively
@@ -38,7 +45,21 @@
 //   export AWS_SESSION_TOKEN=${aws_session_token}
 //   export AWS_DEFAULT_REGION="us-east-2"
 
-s3::endpoint_config_ptr make_minio_config() {
+static shared_ptr<s3::client> make_proxy_client(semaphore& mem) {
+    s3::endpoint_config cfg = {
+        .port = std::stoul(tests::getenv_safe("PROXY_S3_SERVER_PORT")),
+        .use_https = false,
+        .aws = {{
+            .access_key_id = tests::getenv_safe("AWS_ACCESS_KEY_ID"),
+            .secret_access_key = tests::getenv_safe("AWS_SECRET_ACCESS_KEY"),
+            .session_token = ::getenv("AWS_SESSION_TOKEN") ? : "",
+            .region = ::getenv("AWS_DEFAULT_REGION") ? : "local",
+        }},
+    };
+    return s3::client::make(tests::getenv_safe("PROXY_S3_SERVER_HOST"), make_lw_shared<s3::endpoint_config>(std::move(cfg)), mem);
+}
+
+static shared_ptr<s3::client> make_minio_client(semaphore& mem) {
     s3::endpoint_config cfg = {
         .port = std::stoul(tests::getenv_safe("S3_SERVER_PORT_FOR_TEST")),
         .use_https = ::getenv("AWS_DEFAULT_REGION") != nullptr,
@@ -49,8 +70,10 @@ s3::endpoint_config_ptr make_minio_config() {
             .region = ::getenv("AWS_DEFAULT_REGION") ? : "local",
         }},
     };
-    return make_lw_shared<s3::endpoint_config>(std::move(cfg));
+    return s3::client::make(tests::getenv_safe("S3_SERVER_ADDRESS_FOR_TEST"), make_lw_shared<s3::endpoint_config>(std::move(cfg)), mem);
 }
+
+using client_maker_function = std::function<shared_ptr<s3::client>(semaphore&)>;
 
 /*
  * Tests below expect minio server to be running on localhost
@@ -58,12 +81,12 @@ s3::endpoint_config_ptr make_minio_config() {
  * unrestricted anonymous read-write access
  */
 
-SEASTAR_THREAD_TEST_CASE(test_client_put_get_object) {
+void client_put_get_object(const client_maker_function& client_maker) {
     const sstring name(fmt::format("/{}/testobject-{}", tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
 
     testlog.info("Make client\n");
-    semaphore mem(16<<20);
-    auto cln = s3::client::make(tests::getenv_safe("S3_SERVER_ADDRESS_FOR_TEST"), make_minio_config(), mem);
+    semaphore mem(16 << 20);
+    auto cln = client_maker(mem);
     auto close_client = deferred_close(*cln);
 
     testlog.info("Put object {}\n", name);
@@ -97,6 +120,14 @@ SEASTAR_THREAD_TEST_CASE(test_client_put_get_object) {
     });
 }
 
+SEASTAR_THREAD_TEST_CASE(test_client_put_get_object_minio) {
+    client_put_get_object(make_minio_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_put_get_object_proxy) {
+    client_put_get_object(make_proxy_client);
+}
+
 static auto deferred_delete_object(shared_ptr<s3::client> client, sstring name) {
     return seastar::defer([client, name] {
         testlog.info("Delete object: {}\n", name);
@@ -104,12 +135,12 @@ static auto deferred_delete_object(shared_ptr<s3::client> client, sstring name) 
     });
 }
 
-void do_test_client_multipart_upload(bool with_copy_upload) {
+void do_test_client_multipart_upload(const client_maker_function& client_maker, bool with_copy_upload) {
     const sstring name(fmt::format("/{}/test{}object-{}", tests::getenv_safe("S3_BUCKET_FOR_TEST"), with_copy_upload ? "jumbo" : "large", ::getpid()));
 
     testlog.info("Make client\n");
     semaphore mem(16<<20);
-    auto cln = s3::client::make(tests::getenv_safe("S3_SERVER_ADDRESS_FOR_TEST"), make_minio_config(), mem);
+    auto cln = client_maker(mem);
     auto close_client = deferred_close(*cln);
 
     testlog.info("Upload object (with copy = {})\n", with_copy_upload);
@@ -156,21 +187,29 @@ void do_test_client_multipart_upload(bool with_copy_upload) {
     }
 }
 
-SEASTAR_THREAD_TEST_CASE(test_client_multipart_upload) {
-    do_test_client_multipart_upload(false);
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_upload_minio) {
+    do_test_client_multipart_upload(make_minio_client, false);
 }
 
-SEASTAR_THREAD_TEST_CASE(test_client_multipart_copy_upload) {
-    do_test_client_multipart_upload(true);
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_upload_proxy) {
+    do_test_client_multipart_upload(make_proxy_client, false);
 }
 
-SEASTAR_THREAD_TEST_CASE(test_client_multipart_upload_fallback) {
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_copy_upload_minio) {
+    do_test_client_multipart_upload(make_minio_client, true);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_copy_upload_proxy) {
+    do_test_client_multipart_upload(make_proxy_client, true);
+}
+
+void client_multipart_upload_fallback(const client_maker_function& client_maker) {
     const sstring name(fmt::format("/{}/testfbobject-{}", tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
 
     testlog.info("Make client");
     semaphore mem(0);
     mem.broken(); // so that any attempt to use it throws
-    auto cln = s3::client::make(tests::getenv_safe("S3_SERVER_ADDRESS_FOR_TEST"), make_minio_config(), mem);
+    auto cln = client_maker(mem);
     auto close_client = deferred_close(*cln);
 
     testlog.info("Upload object");
@@ -192,12 +231,127 @@ SEASTAR_THREAD_TEST_CASE(test_client_multipart_upload_fallback) {
     BOOST_REQUIRE_EQUAL(to_sstring(std::move(res)), to_sstring(std::move(data)));
 }
 
-SEASTAR_THREAD_TEST_CASE(test_client_readable_file) {
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_upload_fallback_minio) {
+    client_multipart_upload_fallback(make_minio_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_upload_fallback_proxy) {
+    client_multipart_upload_fallback(make_proxy_client);
+}
+
+using with_remainder_t = bool_class<class with_remainder_tag>;
+
+future<> test_client_upload_file(const client_maker_function& client_maker, std::string_view test_name, size_t total_size, size_t memory_size) {
+    tmpdir tmp;
+    const auto file_path = tmp.path() / "test";
+
+    uint32_t expected_checksum = crc32_utils::init_checksum();
+
+    // 1. prefill the data file to be uploaded
+    {
+        file f = co_await open_file_dma(file_path.native(), open_flags::create | open_flags::wo);
+        auto output = co_await make_file_output_stream(std::move(f));
+        std::string_view data = "1234567890ABCDEF";
+        // so we can test !with_remainder case properly with multiple writes
+        SCYLLA_ASSERT(total_size % data.size() == 0);
+
+        for (size_t bytes_written = 0;
+             bytes_written < total_size;
+             bytes_written += data.size()) {
+            co_await output.write(data.data(), data.size());
+            uint32_t chunk_checksum = crc32_utils::checksum(data.data(), data.size());
+            expected_checksum = checksum_combine_or_feed<crc32_utils>(
+                expected_checksum, chunk_checksum, data.data(), data.size());
+        }
+        co_await output.close();
+    }
+
+    const auto object_name = fmt::format("/{}/{}-{}",
+                                         tests::getenv_safe("S3_BUCKET_FOR_TEST"),
+                                         test_name,
+                                         ::getpid());
+
+    // 2. upload the file to s3
+    semaphore mem{memory_size};
+    auto client = client_maker(mem);
+    co_await client->upload_file(file_path, object_name);
+    // 3. retrieve the object from s3 and retrieve the object from S3 and
+    //    compare it with the pattern
+    uint32_t actual_checksum = crc32_utils::init_checksum();
+    auto readable_file = client->make_readable_file(object_name);
+    auto input = make_file_input_stream(readable_file);
+    size_t actual_size = 0;
+    for (;;) {
+        auto buf = co_await input.read();
+        if (buf.empty()) {
+            // empty() signifies the end of stream
+            break;
+        }
+        actual_size += buf.size();
+        bytes_view bv{reinterpret_cast<const int8_t*>(buf.get()), buf.size()};
+        //fmt::print("{}", fmt_hex(bv));
+        uint32_t chunk_checksum = crc32_utils::checksum(buf.get(), buf.size());
+        actual_checksum = checksum_combine_or_feed<crc32_utils>(
+            actual_checksum, chunk_checksum, buf.get(), buf.size());
+    }
+    BOOST_CHECK_EQUAL(total_size, actual_size);
+    BOOST_CHECK_EQUAL(expected_checksum, actual_checksum);
+
+    co_await readable_file.close();
+    co_await input.close();
+    co_await client->close();
+}
+
+SEASTAR_TEST_CASE(test_client_upload_file_multi_part_without_remainder_minio) {
+    const size_t part_size = 5_MiB;
+    const size_t total_size = 4 * part_size;
+    const size_t memory_size = part_size;
+    co_await test_client_upload_file(make_minio_client, seastar_test::get_name(), total_size, memory_size);
+}
+
+SEASTAR_TEST_CASE(test_client_upload_file_multi_part_without_remainder_proxy) {
+    const size_t part_size = 5_MiB;
+    const size_t total_size = 4 * part_size;
+    const size_t memory_size = part_size;
+    co_await test_client_upload_file(make_proxy_client, seastar_test::get_name(), total_size, memory_size);
+}
+
+SEASTAR_TEST_CASE(test_client_upload_file_multi_part_with_remainder_minio) {
+    const size_t part_size = 5_MiB;
+    const size_t remainder_size = part_size / 2;
+    const size_t total_size = 4 * part_size + remainder_size;
+    const size_t memory_size = part_size;
+    co_await test_client_upload_file(make_minio_client, seastar_test::get_name(), total_size, memory_size);
+}
+
+SEASTAR_TEST_CASE(test_client_upload_file_multi_part_with_remainder_proxy) {
+    const size_t part_size = 5_MiB;
+    const size_t remainder_size = part_size / 2;
+    const size_t total_size = 4 * part_size + remainder_size;
+    const size_t memory_size = part_size;
+    co_await test_client_upload_file(make_proxy_client, seastar_test::get_name(), total_size, memory_size);
+}
+
+SEASTAR_TEST_CASE(test_client_upload_file_single_part_minio) {
+    const size_t part_size = 5_MiB;
+    const size_t total_size = part_size / 2;
+    const size_t memory_size = part_size;
+    co_await test_client_upload_file(make_minio_client, seastar_test::get_name(), total_size, memory_size);
+}
+
+SEASTAR_TEST_CASE(test_client_upload_file_single_part_proxy) {
+    const size_t part_size = 5_MiB;
+    const size_t total_size = part_size / 2;
+    const size_t memory_size = part_size;
+    co_await test_client_upload_file(make_proxy_client, seastar_test::get_name(), total_size, memory_size);
+}
+
+void client_readable_file(const client_maker_function& client_maker) {
     const sstring name(fmt::format("/{}/testroobject-{}", tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
 
     testlog.info("Make client\n");
     semaphore mem(16<<20);
-    auto cln = s3::client::make(tests::getenv_safe("S3_SERVER_ADDRESS_FOR_TEST"), make_minio_config(), mem);
+    auto cln = client_maker(mem);
     auto close_client = deferred_close(*cln);
 
     testlog.info("Put object {}\n", name);
@@ -234,12 +388,20 @@ SEASTAR_THREAD_TEST_CASE(test_client_readable_file) {
     BOOST_REQUIRE_EQUAL(to_sstring(std::move(buf)), sstring("67890ABC"));
 }
 
-SEASTAR_THREAD_TEST_CASE(test_client_readable_file_stream) {
+SEASTAR_THREAD_TEST_CASE(test_client_readable_file_minio) {
+    client_readable_file(make_minio_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_readable_file_proxy) {
+    client_readable_file(make_proxy_client);
+}
+
+void client_readable_file_stream(const client_maker_function& client_maker) {
     const sstring name(fmt::format("/{}/teststreamobject-{}", tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
 
     testlog.info("Make client\n");
     semaphore mem(16<<20);
-    auto cln = s3::client::make(tests::getenv_safe("S3_SERVER_ADDRESS_FOR_TEST"), make_minio_config(), mem);
+    auto cln = client_maker(mem);
     auto close_client = deferred_close(*cln);
 
     testlog.info("Put object {}\n", name);
@@ -258,11 +420,20 @@ SEASTAR_THREAD_TEST_CASE(test_client_readable_file_stream) {
     BOOST_REQUIRE_EQUAL(res, sample);
 }
 
-SEASTAR_THREAD_TEST_CASE(test_client_put_get_tagging) {
+SEASTAR_THREAD_TEST_CASE(test_client_readable_file_stream_minio) {
+    client_readable_file_stream(make_minio_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_readable_file_stream_proxy) {
+    client_readable_file_stream(make_proxy_client);
+}
+
+void client_put_get_tagging(const client_maker_function& client_maker) {
     const sstring name(fmt::format("/{}/testobject-{}",
                                    tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
     semaphore mem(16<<20);
-    auto client = s3::client::make(tests::getenv_safe("S3_SERVER_ADDRESS_FOR_TEST"), make_minio_config(), mem);
+    auto client = client_maker(mem);
+
     auto close_client = deferred_close(*client);
     auto data = sstring("1234567890ABCDEF").release();
     client->put_object(name, std::move(data)).get();
@@ -284,5 +455,178 @@ SEASTAR_THREAD_TEST_CASE(test_client_put_get_tagging) {
         client->delete_object_tagging(name).get();
         auto tagset = client->get_object_tagging(name).get();
         BOOST_CHECK(tagset.empty());
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_put_get_tagging_minio) {
+    client_put_get_tagging(make_minio_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_put_get_tagging_proxy) {
+    client_put_get_tagging(make_proxy_client);
+}
+
+static std::unordered_set<sstring> populate_bucket(shared_ptr<s3::client> client, sstring bucket, sstring prefix, int nr_objects) {
+    std::unordered_set<sstring> names;
+
+    for (int i = 0; i < nr_objects; i++) {
+        temporary_buffer<char> data = sstring("1234567890").release();
+        auto name = format("obj.{}", i);
+        client->put_object(format("/{}/{}{}", bucket, prefix, name), std::move(data)).get();
+        names.insert(name);
+    }
+
+    return names;
+}
+
+void client_list_objects(const client_maker_function& client_maker) {
+    const sstring bucket = tests::getenv_safe("S3_BUCKET_FOR_TEST");
+    const sstring prefix(fmt::format("testprefix-{}/", ::getpid()));
+    semaphore mem(16<<20);
+    auto client = client_maker(mem);
+    auto close_client = deferred_close(*client);
+
+    // Put extra object to check list-by-prefix filters it out
+    temporary_buffer<char> data = sstring("1234567890").release();
+    client->put_object(format("/{}/extra-{}", bucket, ::getpid()), std::move(data)).get();
+    auto names = populate_bucket(client, bucket, prefix, 12);
+
+    s3::client::bucket_lister lister(client, bucket, prefix, 5);
+    auto close_lister = deferred_close(lister);
+
+    while (auto de = lister.get().get()) {
+        testlog.info("-> [{}]", de->name);
+        auto it = names.find(de->name);
+        BOOST_REQUIRE(it != names.end());
+        names.erase(it);
+    }
+    BOOST_REQUIRE(names.empty());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_list_objects_minio) {
+    client_list_objects(make_minio_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_list_objects_proxy) {
+    client_list_objects(make_proxy_client);
+}
+
+void client_list_objects_incomplete(const client_maker_function& client_maker) {
+    const sstring bucket = tests::getenv_safe("S3_BUCKET_FOR_TEST");
+    const sstring prefix(fmt::format("testprefix-{}/", ::getpid()));
+    semaphore mem(16<<20);
+    auto client = client_maker(mem);
+    auto close_client = deferred_close(*client);
+
+    populate_bucket(client, bucket, prefix, 8);
+
+    s3::client::bucket_lister lister(client, bucket, prefix, 9, 2);
+    auto close_lister = deferred_close(lister);
+
+    // Peek one entry to start lister work
+    auto de = lister.get().get();
+    close_lister.close_now();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_list_objects_incomplete_minio) {
+    client_list_objects_incomplete(make_minio_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_list_objects_incomplete_proxy) {
+    client_list_objects_incomplete(make_proxy_client);
+}
+
+void client_broken_bucket(const client_maker_function& client_maker) {
+    const sstring name(fmt::format("/{}/testobject-{}", "NO_BUCKET", ::getpid()));
+    semaphore mem(16 << 20);
+    auto client = client_maker(mem);
+
+    auto close_client = deferred_close(*client);
+    auto data = sstring("1234567890ABCDEF").release();
+    BOOST_REQUIRE_EXCEPTION(client->put_object(name, std::move(data)).get(), storage_io_error, [](const storage_io_error& e) {
+        return e.code().value() == EIO && e.what() == "S3 request failed. Code: 100. Reason: The specified bucket is not valid."sv;
+    });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_broken_bucket_minio) {
+    client_broken_bucket(make_minio_client);
+}
+
+void client_missing_prefix(const client_maker_function& client_maker) {
+    const sstring name(fmt::format("/{}/testobject-{}", tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
+    semaphore mem(16 << 20);
+    auto client = client_maker(mem);
+
+    auto close_client = deferred_close(*client);
+    BOOST_REQUIRE_EXCEPTION(client->get_object_size(name).get(), storage_io_error, [](const storage_io_error& e) {
+        return e.code().value() == ENOENT && e.what() == "S3 request failed. Code: 117. Reason:  HTTP code: 404 Not Found"sv;
+    });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_missing_prefix_minio) {
+    client_missing_prefix(make_minio_client);
+}
+
+void client_access_missing_object(const client_maker_function& client_maker) {
+    const sstring name(fmt::format("/{}/testobject-{}", tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
+    semaphore mem(16 << 20);
+    auto client = client_maker(mem);
+
+    auto close_client = deferred_close(*client);
+    BOOST_REQUIRE_EXCEPTION(client->get_object_tagging(name).get(), storage_io_error, [](const storage_io_error& e) {
+        return e.code().value() == ENOENT && e.what() == "S3 request failed. Code: 133. Reason: The specified key does not exist."sv;
+    });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_access_missing_object_minio) {
+    client_access_missing_object(make_minio_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_object_reupload) {
+    // Pay attention, we are reuploading the same file during the test
+    const sstring name(fmt::format("/{}/testobject-{}", tests::getenv_safe("S3_BUCKET_FOR_TEST"), ::getpid()));
+
+    semaphore mem(16 << 20);
+    auto cln = make_minio_client(mem);
+    auto close_client = deferred_close(*cln);
+    constexpr std::string_view content{"1234567890"};
+    for (auto i : {1, 2}) {
+        testlog.info("Put object {}, iteration {}", name, i);
+        temporary_buffer<char> data = sstring(content).release();
+        cln->put_object(name, std::move(data)).get();
+
+        size_t sz = cln->get_object_size(name).get();
+        BOOST_REQUIRE_EQUAL(sz, content.length());
+
+        s3::stats st = cln->get_object_stats(name).get();
+        BOOST_REQUIRE_EQUAL(st.size, content.length());
+    }
+
+    for (auto jumbo : {true, false}) {
+        for (auto i : {1, 2}) {
+            testlog.info("Upload object {}, iteration {} (with copy = {})", name, i, jumbo);
+            auto out = output_stream<char>(
+                // Make it 3 parts per piece, so that 128Mb buffer below
+                // would be split into several 15Mb pieces
+                jumbo ? cln->make_upload_jumbo_sink(name, 3) : cln->make_upload_sink(name));
+
+            constexpr unsigned chunk_size = 1000;
+            constexpr unsigned writes = 128 * 1024;
+            auto rnd = tests::random::get_bytes(chunk_size);
+            uint64_t object_size = 0;
+            for (unsigned ch = 0; ch < writes; ch++) {
+                out.write(reinterpret_cast<char*>(rnd.begin()), rnd.size()).get();
+                object_size += rnd.size();
+            }
+
+            out.flush().get();
+            out.close().get();
+
+            size_t sz = cln->get_object_size(name).get();
+            BOOST_REQUIRE_EQUAL(sz, object_size);
+
+            s3::stats st = cln->get_object_stats(name).get();
+            BOOST_REQUIRE_EQUAL(st.size, object_size);
+        }
     }
 }

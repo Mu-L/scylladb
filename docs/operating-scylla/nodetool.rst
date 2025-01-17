@@ -7,6 +7,7 @@ Nodetool
    :maxdepth: 1
    :hidden:
 
+   nodetool-commands/backup
    nodetool-commands/cfhistograms
    nodetool-commands/cfstats
    nodetool-commands/checkandrepaircdcstreams
@@ -41,6 +42,7 @@ Nodetool
    nodetool-commands/removenode
    nodetool-commands/repair
    nodetool-commands/resetlocalschema
+   nodetool-commands/restore
    nodetool-commands/ring
    nodetool-commands/scrub
    nodetool-commands/settraceprobability
@@ -53,37 +55,31 @@ Nodetool
    nodetool-commands/status
    Nodetool stop compaction <nodetool-commands/stop>
    nodetool-commands/tablestats
+   nodetool-commands/tasks/index
    nodetool-commands/toppartitions
    nodetool-commands/upgradesstables
    nodetool-commands/viewbuildstatus
    nodetool-commands/version
+   nodetool-commands/getcompactionthroughput
+   nodetool-commands/setcompactionthroughput
+   nodetool-commands/getstreamthroughput
+   nodetool-commands/setstreamthroughput
 
-The ``nodetool`` utility provides a simple command-line interface to the following exposed operations and attributes. ScyllaDB’s nodetool is a fork of `the Apache Cassandra nodetool <https://cassandra.apache.org/doc/latest/tools/nodetool/nodetool.html>`_ with the same syntax and a subset of the operations.
+The ``nodetool`` utility provides a simple command-line interface to the following exposed operations and attributes.
 
 .. _nodetool-generic-options:
 
 Nodetool generic options
 ========================
-All options are supported:
 
-
-
-* ``-p <port>`` or ``--port <port>`` - Remote JMX agent port number.
-
-* ``-pp`` or ``--print-port`` - Operate in 4.0 mode with hosts disambiguated by port number.
-
-* ``-pw <password>`` or ``--password <password>`` - Remote JMX agent password.
-
-* ``-pwf <passwordFilePath>`` or ``--password-file <passwordFilePath>`` - Path to the JMX password file.
-
-* ``-u <username>`` or ``--username <username>`` - Remote JMX agent username.
-
+* ``-p <port>`` or ``--port <port>`` - The port of the REST API of the ScyllaDB node.
 * ``--`` - Separates command-line options from the list of argument(useful when an argument might be mistaken for a command-line option).
 
 Supported Nodetool operations
 =============================
 Operations that are not listed below are currently not available.
 
+* :doc:`backup <nodetool-commands/backup/>` - Copy SSTables from a specified keyspace's snapshot to a designated bucket in object storage.
 * :doc:`cfhistograms <nodetool-commands/cfhistograms/>` - Provides statistics about a table, including number of SSTables, read/write latency, partition size and column count.
 * :doc:`cfstats </operating-scylla/nodetool-commands/cfstats/>` - Provides in-depth diagnostics regard table.
 * :doc:`checkandrepaircdcstreams </operating-scylla/nodetool-commands/checkandrepaircdcstreams/>` - Checks and fixes CDC streams.
@@ -120,6 +116,7 @@ Operations that are not listed below are currently not available.
 * :doc:`refresh </operating-scylla/nodetool-commands/refresh/>`- Load newly placed SSTables to the system without restart
 * :doc:`removenode </operating-scylla/nodetool-commands/removenode/>`- Remove node with the provided ID
 * :doc:`repair <nodetool-commands/repair/>`  :code:`<keyspace>` :code:`<table>` - Repair one or more tables
+* :doc:`restore </operating-scylla/nodetool-commands/restore/>` - Load SSTables from a designated bucket in object store into a specified keyspace or table
 * :doc:`resetlocalschema </operating-scylla/nodetool-commands/resetlocalschema/>` - Reset the node's local schema.
 * :doc:`ring <nodetool-commands/ring/>` - The nodetool ring command display the token ring information.
 * :doc:`scrub </operating-scylla/nodetool-commands/scrub>` :code:`[-m mode] [--no-snapshot] <keyspace> [<table>...]` - Scrub the SSTable files in the specified keyspace or table(s)
@@ -134,9 +131,13 @@ Operations that are not listed below are currently not available.
 * :doc:`stop </operating-scylla/nodetool-commands/stop/>` - Stop compaction operation.
 * **tablehistograms** see :doc:`cfhistograms <nodetool-commands/cfhistograms/>`
 * :doc:`tablestats </operating-scylla/nodetool-commands/tablestats/>` - Provides in-depth diagnostics regard table. 
+* :doc:`tasks </operating-scylla/nodetool-commands/tasks/index>` - Manage tasks manager tasks.
 * :doc:`toppartitions </operating-scylla/nodetool-commands/toppartitions/>` - Samples cluster writes and reads and reports the most active partitions in a specified table and time frame.
 * :doc:`upgradesstables </operating-scylla/nodetool-commands/upgradesstables>` - Upgrades each table that is not running the latest ScyllaDB version, by rewriting SSTables.
 * :doc:`viewbuildstatus </operating-scylla/nodetool-commands/viewbuildstatus/>` - Shows the progress of a materialized view build.
 * :doc:`version </operating-scylla/nodetool-commands/version>` - Print the DB version.
+* :doc:`getcompactionthroughput </operating-scylla/nodetool-commands/getcompactionthroughput>` - Print the throughput cap for compaction in the system
+* :doc:`setcompactionthroughput </operating-scylla/nodetool-commands/setcompactionthroughput>` - Set the throughput cap for compaction in the system
+* :doc:`getstreamthroughput </operating-scylla/nodetool-commands/getstreamthroughput>` - Print the throughput cap for SSTables streaming in the system
+* :doc:`setstreamthroughput </operating-scylla/nodetool-commands/setstreamthroughput>` - Set the throughput cap for SSTables streaming in the system
 
-.. include:: /rst_include/apache-copyrights.rst

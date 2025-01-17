@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
@@ -13,7 +13,8 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/util/file.hh>
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <utility>
 #include <fmt/ranges.h>
@@ -23,14 +24,17 @@
 #include "test/lib/result_set_assertions.hh"
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
+#include "test/lib/simple_schema.hh"
 #include "test/lib/test_utils.hh"
 #include "test/lib/key_utils.hh"
 
 #include "replica/database.hh"
+#include "utils/assert.hh"
 #include "utils/lister.hh"
 #include "partition_slice_builder.hh"
 #include "mutation/frozen_mutation.hh"
 #include "test/lib/mutation_source_test.hh"
+#include "schema/schema_builder.hh"
 #include "service/migration_manager.hh"
 #include "sstables/sstables.hh"
 #include "sstables/generation_type.hh"
@@ -40,27 +44,38 @@
 #include "test/lib/tmpdir.hh"
 #include "db/data_listeners.hh"
 #include "multishard_mutation_query.hh"
+#include "mutation_query.hh"
 #include "transport/messages/result_message.hh"
 #include "compaction/compaction_manager.hh"
 #include "db/snapshot-ctl.hh"
+#include "db/system_keyspace.hh"
+#include "db/view/view_builder.hh"
 #include "replica/mutation_dump.hh"
 
 using namespace std::chrono_literals;
 using namespace sstables;
 
-class database_test {
+class database_test_wrapper {
     replica::database& _db;
 public:
-    explicit database_test(replica::database& db) : _db(db) { }
+    explicit database_test_wrapper(replica::database& db) : _db(db) { }
 
     reader_concurrency_semaphore& get_user_read_concurrency_semaphore() {
-        return _db._read_concurrency_sem;
+        return _db.read_concurrency_sem();
     }
     reader_concurrency_semaphore& get_streaming_read_concurrency_semaphore() {
         return _db._streaming_concurrency_sem;
     }
     reader_concurrency_semaphore& get_system_read_concurrency_semaphore() {
         return _db._system_read_concurrency_sem;
+    }
+
+    size_t get_total_user_reader_concurrency_semaphore_memory() {
+        return _db._reader_concurrency_semaphores_group._total_memory;
+    }
+
+    size_t get_total_user_reader_concurrency_semaphore_weight() {
+        return _db._reader_concurrency_semaphores_group._total_weight;
     }
 };
 
@@ -92,6 +107,8 @@ future<> do_with_cql_env_and_compaction_groups(std::function<void(cql_test_env&)
         co_await do_with_cql_env_and_compaction_groups_cgs(x_log2_compaction_groups, func, cfg, thread_attr);
     }
 }
+
+BOOST_AUTO_TEST_SUITE(database_test)
 
 SEASTAR_TEST_CASE(test_safety_after_truncate) {
     auto cfg = make_shared<db::config>();
@@ -167,7 +184,7 @@ SEASTAR_TEST_CASE(test_truncate_without_snapshot_during_writes) {
         int count = 0;
 
         auto insert_data = [&] (uint32_t begin, uint32_t end) {
-            return parallel_for_each(boost::irange(begin, end), [&] (auto i) {
+            return parallel_for_each(std::views::iota(begin, end), [&] (auto i) {
                 auto pkey = partition_key::from_single_value(*s, to_bytes(fmt::format("key-{}", tests::random::get_int<uint64_t>())));
                 mutation m(s, pkey);
                 m.set_clustered_cell(clustering_key_prefix::make_empty(), "v", int32_t(42), {});
@@ -187,6 +204,28 @@ SEASTAR_TEST_CASE(test_truncate_without_snapshot_during_writes) {
         });
         f0.get();
         f1.get();
+    }, cfg);
+}
+
+// Reproducer for:
+//   https://github.com/scylladb/scylla/issues/21719
+SEASTAR_TEST_CASE(test_truncate_saves_replay_position) {
+    auto cfg = make_shared<db::config>();
+    cfg->auto_snapshot.set(false);
+    return do_with_cql_env_and_compaction_groups([] (cql_test_env& e) {
+        BOOST_REQUIRE_GT(smp::count, 1);
+        const sstring ks_name = "ks";
+        const sstring cf_name = "cf";
+        e.execute_cql(fmt::format("CREATE TABLE {}.{} (k TEXT PRIMARY KEY, v INT);", ks_name, cf_name)).get();
+        const table_id uuid = e.local_db().find_uuid(ks_name, cf_name);
+
+        replica::database::truncate_table_on_all_shards(e.db(), e.get_system_keyspace(), ks_name, cf_name, db_clock::now(), false /* with_snapshot */).get();
+
+        auto res = e.execute_cql(fmt::format("SELECT * FROM system.truncated WHERE table_uuid = {}", uuid)).get();
+        auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(res);
+        BOOST_REQUIRE(rows);
+        auto row_count = rows->rs().result_set().size();
+        BOOST_REQUIRE_EQUAL(row_count, smp::count);
     }, cfg);
 }
 
@@ -524,15 +563,15 @@ SEASTAR_THREAD_TEST_CASE(test_distributed_loader_with_pending_delete) {
 }
 
 // Snapshot tests and their helpers
-future<> do_with_some_data(std::vector<sstring> cf_names, std::function<future<> (cql_test_env& env)> func, shared_ptr<db::config> db_cfg_ptr = {}) {
-    return seastar::async([cf_names = std::move(cf_names), func = std::move(func), db_cfg_ptr = std::move(db_cfg_ptr)] () mutable {
+future<> do_with_some_data(std::vector<sstring> cf_names, std::function<future<> (cql_test_env& env)> func, bool create_mvs = false, shared_ptr<db::config> db_cfg_ptr = {}) {
+    return seastar::async([cf_names = std::move(cf_names), func = std::move(func), create_mvs,  db_cfg_ptr = std::move(db_cfg_ptr)] () mutable {
         lw_shared_ptr<tmpdir> tmpdir_for_data;
         if (!db_cfg_ptr) {
             tmpdir_for_data = make_lw_shared<tmpdir>();
             db_cfg_ptr = make_shared<db::config>();
             db_cfg_ptr->data_file_directories(std::vector<sstring>({ tmpdir_for_data->path().string() }));
         }
-        do_with_cql_env_and_compaction_groups([cf_names = std::move(cf_names), func = std::move(func)] (cql_test_env& e) {
+        do_with_cql_env_and_compaction_groups([cf_names = std::move(cf_names), func = std::move(func), create_mvs] (cql_test_env& e) {
             for (const auto& cf_name : cf_names) {
                 e.create_table([&cf_name] (std::string_view ks_name) {
                     return *schema_builder(ks_name, cf_name)
@@ -548,6 +587,18 @@ future<> do_with_some_data(std::vector<sstring> cf_names, std::function<future<>
                 e.execute_cql(fmt::format("insert into {} (p1, c1, c2, r1) values ('key2', 4, 5, 6);", cf_name)).get();
                 e.execute_cql(fmt::format("insert into {} (p1, c1, c2, r1) values ('key2', 5, 5, 6);", cf_name)).get();
                 e.execute_cql(fmt::format("insert into {} (p1, c1, c2, r1) values ('key2', 6, 5, 6);", cf_name)).get();
+
+                if (create_mvs) {
+                    auto f1 = e.local_view_builder().wait_until_built("ks", seastar::format("view_{}", cf_name));
+                    e.execute_cql(seastar::format("create materialized view view_{0} as select * from {0} where p1 is not null and c1 is not null and c2 is "
+                                                  "not null primary key (p1, c1, c2)",
+                                                  cf_name))
+                        .get();
+                    f1.get();
+                    e.get_system_keyspace().local().load_built_views().get();
+
+                    e.execute_cql(seastar::format("CREATE INDEX index_{0} ON {0} (r1);", cf_name)).get();
+                }
             }
 
             func(e).get();
@@ -557,7 +608,7 @@ future<> do_with_some_data(std::vector<sstring> cf_names, std::function<future<>
 
 future<> take_snapshot(sharded<replica::database>& db, bool skip_flush = false, sstring ks_name = "ks", sstring cf_name = "cf", sstring snapshot_name = "test") {
     try {
-        co_await replica::database::snapshot_table_on_all_shards(db, ks_name, cf_name, snapshot_name, db::snapshot_ctl::snap_views::no, skip_flush);
+        co_await replica::database::snapshot_table_on_all_shards(db, ks_name, cf_name, snapshot_name, skip_flush);
     } catch (...) {
         testlog.error("Could not take snapshot for {}.{} snapshot_name={} skip_flush={}: {}",
                 ks_name, cf_name, snapshot_name, skip_flush, std::current_exception());
@@ -573,31 +624,53 @@ future<> take_snapshot(cql_test_env& e, sstring ks_name, sstring cf_name, sstrin
     return take_snapshot(e.db(), false /* skip_flush */, std::move(ks_name), std::move(cf_name), std::move(snapshot_name));
 }
 
-SEASTAR_TEST_CASE(snapshot_works) {
-    return do_with_some_data({"cf"}, [] (cql_test_env& e) {
-        take_snapshot(e).get();
+// Helper to get directory a table keeps its data in.
+// Only suitable for tests, that work with local storage type.
+fs::path table_dir(const replica::column_family& cf) {
+    return std::get<data_dictionary::storage_options::local>(cf.get_storage_options().value).dir;
+}
+
+static future<> snapshot_works(const std::string& table_name) {
+    return do_with_some_data({"cf"}, [table_name] (cql_test_env& e) {
+        take_snapshot(e, "ks", table_name).get();
 
         std::set<sstring> expected = {
             "manifest.json",
+            "schema.cql"
         };
 
-        auto& cf = e.local_db().find_column_family("ks", "cf");
-        lister::scan_dir(fs::path(cf.dir()), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
+        auto& cf = e.local_db().find_column_family("ks", table_name);
+        auto table_directory = table_dir(cf);
+        auto snapshot_dir = table_directory / sstables::snapshots_dir / "test";
+
+        lister::scan_dir(table_directory, lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected](fs::path, directory_entry de) {
             expected.insert(de.name);
             return make_ready_future<>();
         }).get();
         // snapshot triggered a flush and wrote the data down.
-        BOOST_REQUIRE_GT(expected.size(), 1);
+        BOOST_REQUIRE_GE(expected.size(), 11);
 
         // all files were copied and manifest was generated
-        lister::scan_dir((fs::path(cf.dir()) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir(snapshot_dir, lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected](fs::path, directory_entry de) {
             expected.erase(de.name);
             return make_ready_future<>();
         }).get();
 
         BOOST_REQUIRE_EQUAL(expected.size(), 0);
         return make_ready_future<>();
-    });
+    }, true);
+}
+
+SEASTAR_TEST_CASE(table_snapshot_works) {
+    return snapshot_works("cf");
+}
+
+SEASTAR_TEST_CASE(view_snapshot_works) {
+    return snapshot_works("view_cf");
+}
+
+SEASTAR_TEST_CASE(index_snapshot_works) {
+    return snapshot_works(::secondary_index::index_table_name("index_cf"));
 }
 
 SEASTAR_TEST_CASE(snapshot_skip_flush_works) {
@@ -609,7 +682,7 @@ SEASTAR_TEST_CASE(snapshot_skip_flush_works) {
         };
 
         auto& cf = e.local_db().find_column_family("ks", "cf");
-        lister::scan_dir(fs::path(cf.dir()), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir(table_dir(cf), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
             expected.insert(de.name);
             return make_ready_future<>();
         }).get();
@@ -618,7 +691,7 @@ SEASTAR_TEST_CASE(snapshot_skip_flush_works) {
         BOOST_REQUIRE_EQUAL(expected.size(), 1);
 
         // all files were copied and manifest was generated
-        lister::scan_dir((fs::path(cf.dir()) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir((table_dir(cf) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
             expected.erase(de.name);
             return make_ready_future<>();
         }).get();
@@ -640,7 +713,7 @@ SEASTAR_TEST_CASE(snapshot_list_okay) {
         BOOST_REQUIRE_EQUAL(sd.live, 0);
         BOOST_REQUIRE_GT(sd.total, 0);
 
-        lister::scan_dir(fs::path(cf.dir()), lister::dir_entry_types::of<directory_entry_type::regular>(), [] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir(table_dir(cf), lister::dir_entry_types::of<directory_entry_type::regular>(), [] (fs::path parent_dir, directory_entry de) {
             fs::remove(parent_dir / de.name);
             return make_ready_future<>();
         }).get();
@@ -711,7 +784,7 @@ SEASTAR_TEST_CASE(clear_snapshot) {
         auto& cf = e.local_db().find_column_family("ks", "cf");
 
         unsigned count = 0;
-        lister::scan_dir((fs::path(cf.dir()) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&count] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir((table_dir(cf) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&count] (fs::path parent_dir, directory_entry de) {
             count++;
             return make_ready_future<>();
         }).get();
@@ -720,7 +793,7 @@ SEASTAR_TEST_CASE(clear_snapshot) {
         e.local_db().clear_snapshot("test", {"ks"}, "").get();
         count = 0;
 
-        BOOST_REQUIRE_EQUAL(fs::exists(fs::path(cf.dir()) / sstables::snapshots_dir / "test"), false);
+        BOOST_REQUIRE_EQUAL(fs::exists(table_dir(cf) / sstables::snapshots_dir / "test"), false);
         return make_ready_future<>();
     });
 }
@@ -736,8 +809,8 @@ SEASTAR_TEST_CASE(clear_multiple_snapshots) {
 
     co_await do_with_some_data({table_name}, [&] (cql_test_env& e) {
         auto& t = e.local_db().find_column_family(ks_name, table_name);
-        auto table_dir = fs::path(t.dir());
-        auto snapshots_dir = table_dir / sstables::snapshots_dir;
+        auto tdir = table_dir(t);
+        auto snapshots_dir = tdir / sstables::snapshots_dir;
 
         for (auto i = 0; i < num_snapshots; i++) {
             testlog.debug("Taking snapshot {} on {}.{}", snapshot_name(i), ks_name, table_name);
@@ -788,11 +861,11 @@ SEASTAR_TEST_CASE(clear_multiple_snapshots) {
         testlog.debug("Clearing all snapshots in {}.{} after it had been dropped", ks_name, table_name);
         e.local_db().clear_snapshot("", {ks_name}, table_name).get();
 
-        assert(!fs::exists(table_dir));
+        SCYLLA_ASSERT(!fs::exists(tdir));
 
         // after all snapshots had been cleared,
         // the dropped table directory is expected to be removed.
-        BOOST_REQUIRE_EQUAL(fs::exists(table_dir), false);
+        BOOST_REQUIRE_EQUAL(fs::exists(tdir), false);
 
         return make_ready_future<>();
     });
@@ -809,7 +882,7 @@ SEASTAR_TEST_CASE(clear_nonexistent_snapshot) {
 SEASTAR_TEST_CASE(test_snapshot_ctl_details) {
     return do_with_some_data({"cf"}, [] (cql_test_env& e) {
         sharded<db::snapshot_ctl> sc;
-        sc.start(std::ref(e.db())).get();
+        sc.start(std::ref(e.db()), std::ref(e.get_task_manager()), std::ref(e.get_sstorage_manager()), db::snapshot_ctl::config{}).get();
         auto stop_sc = deferred_stop(sc);
 
         auto& cf = e.local_db().find_column_family("ks", "cf");
@@ -833,7 +906,7 @@ SEASTAR_TEST_CASE(test_snapshot_ctl_details) {
         BOOST_REQUIRE_EQUAL(sc_sd.details.live, sd.live);
         BOOST_REQUIRE_EQUAL(sc_sd.details.total, sd.total);
 
-        lister::scan_dir(fs::path(cf.dir()), lister::dir_entry_types::of<directory_entry_type::regular>(), [] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir(table_dir(cf), lister::dir_entry_types::of<directory_entry_type::regular>(), [] (fs::path parent_dir, directory_entry de) {
             fs::remove(parent_dir / de.name);
             return make_ready_future<>();
         }).get();
@@ -859,7 +932,7 @@ SEASTAR_TEST_CASE(test_snapshot_ctl_details) {
 SEASTAR_TEST_CASE(test_snapshot_ctl_true_snapshots_size) {
     return do_with_some_data({"cf"}, [] (cql_test_env& e) {
         sharded<db::snapshot_ctl> sc;
-        sc.start(std::ref(e.db())).get();
+        sc.start(std::ref(e.db()), std::ref(e.get_task_manager()), std::ref(e.get_sstorage_manager()), db::snapshot_ctl::config{}).get();
         auto stop_sc = deferred_stop(sc);
 
         auto& cf = e.local_db().find_column_family("ks", "cf");
@@ -875,7 +948,7 @@ SEASTAR_TEST_CASE(test_snapshot_ctl_true_snapshots_size) {
         auto sc_live_size = sc.local().true_snapshots_size().get();
         BOOST_REQUIRE_EQUAL(sc_live_size, sd.live);
 
-        lister::scan_dir(fs::path(cf.dir()), lister::dir_entry_types::of<directory_entry_type::regular>(), [] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir(table_dir(cf), lister::dir_entry_types::of<directory_entry_type::regular>(), [] (fs::path parent_dir, directory_entry de) {
             fs::remove(parent_dir / de.name);
             return make_ready_future<>();
         }).get();
@@ -1063,11 +1136,11 @@ SEASTAR_THREAD_TEST_CASE(reader_concurrency_semaphore_selection_test) {
         destroy_scheduling_group(unknown_scheduling_group).get();
     });
 
-    const auto user_semaphore = std::mem_fn(&database_test::get_user_read_concurrency_semaphore);
-    const auto system_semaphore = std::mem_fn(&database_test::get_system_read_concurrency_semaphore);
-    const auto streaming_semaphore = std::mem_fn(&database_test::get_streaming_read_concurrency_semaphore);
+    const auto user_semaphore = std::mem_fn(&database_test_wrapper::get_user_read_concurrency_semaphore);
+    const auto system_semaphore = std::mem_fn(&database_test_wrapper::get_system_read_concurrency_semaphore);
+    const auto streaming_semaphore = std::mem_fn(&database_test_wrapper::get_streaming_read_concurrency_semaphore);
 
-    std::vector<std::pair<scheduling_group, std::function<reader_concurrency_semaphore&(database_test&)>>> scheduling_group_and_expected_semaphore{
+    std::vector<std::pair<scheduling_group, std::function<reader_concurrency_semaphore&(database_test_wrapper&)>>> scheduling_group_and_expected_semaphore{
         {default_scheduling_group(), system_semaphore}
     };
 
@@ -1084,9 +1157,10 @@ SEASTAR_THREAD_TEST_CASE(reader_concurrency_semaphore_selection_test) {
 
     do_with_cql_env_and_compaction_groups([&scheduling_group_and_expected_semaphore] (cql_test_env& e) {
         auto& db = e.local_db();
-        database_test tdb(db);
+        database_test_wrapper tdb(db);
         for (const auto& [sched_group, expected_sem_getter] : scheduling_group_and_expected_semaphore) {
-            with_scheduling_group(sched_group, [&db, sched_group = sched_group, expected_sem_ptr = &expected_sem_getter(tdb)] {
+            with_scheduling_group(sched_group, [&db, sched_group = sched_group, &tdb, &expected_sem_getter = expected_sem_getter] {
+                auto expected_sem_ptr = &expected_sem_getter(tdb);
                 auto& sem = db.get_reader_concurrency_semaphore();
                 if (&sem != expected_sem_ptr) {
                     BOOST_FAIL(fmt::format("Unexpected semaphore for scheduling group {}, expected {}, got {}", sched_group.name(), expected_sem_ptr->name(), sem.name()));
@@ -1134,7 +1208,7 @@ SEASTAR_THREAD_TEST_CASE(max_result_size_for_query_selection_test) {
 
     do_with_cql_env_and_compaction_groups([&scheduling_group_and_expected_max_result_size] (cql_test_env& e) {
         auto& db = e.local_db();
-        database_test tdb(db);
+        database_test_wrapper tdb(db);
         for (const auto& [sched_group, expected_max_size] : scheduling_group_and_expected_max_result_size) {
             with_scheduling_group(sched_group, [&db, sched_group = sched_group, expected_max_size = expected_max_size] {
                 const auto max_size = db.get_query_max_result_size();
@@ -1217,17 +1291,104 @@ SEASTAR_TEST_CASE(upgrade_sstables) {
         e.db().invoke_on_all([] (replica::database& db) -> future<> {
             auto& cm = db.get_compaction_manager();
             for (auto& [ks_name, ks] : db.get_keyspaces()) {
-                auto owned_ranges_ptr = compaction::make_owned_ranges_ptr(db.get_keyspace_local_ranges(ks_name));
+                const auto& erm = ks.get_vnode_effective_replication_map();
+                auto owned_ranges_ptr = compaction::make_owned_ranges_ptr(co_await db.get_keyspace_local_ranges(erm));
                 for (auto& [cf_name, schema] : ks.metadata()->cf_meta_data()) {
                     auto& t = db.find_column_family(schema->id());
                     constexpr bool exclude_current_version = false;
                     co_await t.parallel_foreach_table_state([&] (compaction::table_state& ts) {
-                        return cm.perform_sstable_upgrade(owned_ranges_ptr, ts, exclude_current_version);
+                        return cm.perform_sstable_upgrade(owned_ranges_ptr, ts, exclude_current_version, tasks::task_info{});
                     });
                 }
             }
         }).get();
     });
+}
+
+SEASTAR_THREAD_TEST_CASE(per_service_level_reader_concurrency_semaphore_test) {
+    cql_test_config cfg;
+    do_with_cql_env_thread([] (cql_test_env& e) {
+        const size_t num_service_levels = 3;
+        const size_t num_keys_to_insert = 10;
+        const size_t num_individual_reads_to_test = 50;
+        auto& db = e.local_db();
+        database_test_wrapper dbt(db);
+        size_t total_memory = dbt.get_total_user_reader_concurrency_semaphore_memory();
+        sharded<qos::service_level_controller>& sl_controller = e.service_level_controller_service();
+        std::array<sstring, num_service_levels> sl_names;
+        qos::service_level_options slo;
+        size_t expected_total_weight = 0;
+        auto index_to_weight = [] (size_t i) -> size_t {
+            return (i + 1)*100;
+        };
+
+        // make the default service level take as little memory as possible
+        slo.shares.emplace<int32_t>(1);
+        expected_total_weight += 1;
+        sl_controller.local().add_service_level(qos::service_level_controller::default_service_level_name, slo).get();
+
+        // Just to make the code more readable.
+        auto get_reader_concurrency_semaphore_for_sl = [&] (sstring sl_name) -> reader_concurrency_semaphore& {
+            return *sl_controller.local().with_service_level(sl_name, noncopyable_function<reader_concurrency_semaphore*()>([&] {
+                return &db.get_reader_concurrency_semaphore();
+            })).get();
+        };
+
+        for (unsigned i = 0; i < num_service_levels; i++) {
+            sstring sl_name = format("sl{}", i);
+            slo.shares.emplace<int32_t>(index_to_weight(i));
+            sl_controller.local().add_service_level(sl_name, slo).get();
+            expected_total_weight += index_to_weight(i);
+            // Make sure that the total weight is tracked correctly in the semaphore group
+            BOOST_REQUIRE_EQUAL(expected_total_weight, dbt.get_total_user_reader_concurrency_semaphore_weight());
+            sl_names[i] = sl_name;
+            size_t total_distributed_memory = 0;
+            for (unsigned j = 0 ; j <= i ; j++) {
+                reader_concurrency_semaphore& sem = get_reader_concurrency_semaphore_for_sl(sl_names[j]);
+                // Make sure that all semaphores that has been created until now - have the right amount of available memory
+                // after the operation has ended.
+                // We allow for a small delta of up to num_service_levels. This allows an off-by-one for each semaphore,
+                // the remainder being added to one of the semaphores.
+                // We make sure this didn't leak/create memory by checking the total below.
+                const auto delta = std::abs(ssize_t((index_to_weight(j) * total_memory) / expected_total_weight) - sem.available_resources().memory);
+                BOOST_REQUIRE_LE(delta, num_service_levels);
+                total_distributed_memory += sem.available_resources().memory;
+            }
+            total_distributed_memory += get_reader_concurrency_semaphore_for_sl(qos::service_level_controller::default_service_level_name).available_resources().memory;
+            BOOST_REQUIRE_EQUAL(total_distributed_memory, total_memory);
+        }
+
+        auto get_semaphores_stats_snapshot = [&] () {
+            std::unordered_map<sstring, reader_concurrency_semaphore::stats> snapshot;
+            for (auto&& sl_name : sl_names) {
+                snapshot[sl_name] = get_reader_concurrency_semaphore_for_sl(sl_name).get_stats();
+            }
+            return snapshot;
+        };
+        e.execute_cql("CREATE TABLE tbl (a int, b int, PRIMARY KEY (a));").get();
+
+        for (unsigned i = 0; i < num_keys_to_insert; i++) {
+            for (unsigned j = 0; j < num_keys_to_insert; j++) {
+                e.execute_cql(format("INSERT INTO tbl(a, b) VALUES ({}, {});", i, j)).get();
+            }
+        }
+
+        for (unsigned i = 0; i < num_individual_reads_to_test; i++) {
+            int random_service_level = tests::random::get_int(num_service_levels - 1);
+            auto snapshot_before = get_semaphores_stats_snapshot();
+
+            sl_controller.local().with_service_level(sl_names[random_service_level], noncopyable_function<future<>()> ([&] {
+                return e.execute_cql("SELECT * FROM tbl;").discard_result();
+            })).get();
+            auto snapshot_after = get_semaphores_stats_snapshot();
+            for (auto& [sl_name, stats] : snapshot_before) {
+                // Make sure that the only semaphore that experienced any activity (at least measured activity) is
+                // the semaphore that belongs to the current service level.
+                BOOST_REQUIRE((stats == snapshot_after[sl_name] && sl_name != sl_names[random_service_level]) ||
+                        (stats != snapshot_after[sl_name] && sl_name == sl_names[random_service_level]));
+            }
+        }
+    }, std::move(cfg)).get();
 }
 
 SEASTAR_TEST_CASE(populate_from_quarantine_works) {
@@ -1266,7 +1427,7 @@ SEASTAR_TEST_CASE(populate_from_quarantine_works) {
             });
         }
         BOOST_REQUIRE(found);
-    }, db_cfg_ptr);
+    }, false, db_cfg_ptr);
 
     // reload the table from tmpdir_for_data and
     // verify that all rows are still there
@@ -1330,7 +1491,7 @@ SEASTAR_TEST_CASE(snapshot_with_quarantine_works) {
         auto& cf = db.local().find_column_family("ks", "cf");
 
         // all files were copied and manifest was generated
-        co_await lister::scan_dir((fs::path(cf.dir()) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
+        co_await lister::scan_dir((table_dir(cf) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
             testlog.debug("Found in snapshots: {}", de.name);
             expected.erase(de.name);
             return make_ready_future<>();
@@ -1355,7 +1516,7 @@ SEASTAR_TEST_CASE(database_drop_column_family_clears_querier_cache) {
         auto q = query::querier(
                 tbl.as_mutation_source(),
                 tbl.schema(),
-                database_test(db).get_user_read_concurrency_semaphore().make_tracking_only_permit(s, "test", db::no_timeout, {}),
+                database_test_wrapper(db).get_user_read_concurrency_semaphore().make_tracking_only_permit(s, "test", db::no_timeout, {}),
                 query::full_partition_range,
                 s->full_slice(),
                 nullptr);
@@ -1384,7 +1545,7 @@ static future<> test_drop_table_with_auto_snapshot(bool auto_snapshot) {
     db_cfg_ptr->auto_snapshot(auto_snapshot);
 
     co_await do_with_some_data({table_name}, [&] (cql_test_env& e) -> future<> {
-        auto cf_dir = e.local_db().find_column_family(ks_name, table_name).dir();
+        auto cf_dir = table_dir(e.local_db().find_column_family(ks_name, table_name)).native();
 
         // Pass `with_snapshot=true` to drop_table_on_all
         // to allow auto_snapshot (based on the configuration above).
@@ -1393,7 +1554,7 @@ static future<> test_drop_table_with_auto_snapshot(bool auto_snapshot) {
         auto cf_dir_exists = co_await file_exists(cf_dir);
         BOOST_REQUIRE_EQUAL(cf_dir_exists, auto_snapshot);
         co_return;
-    }, db_cfg_ptr);
+    }, false, db_cfg_ptr);
 }
 
 SEASTAR_TEST_CASE(drop_table_with_auto_snapshot_enabled) {
@@ -1409,7 +1570,7 @@ SEASTAR_TEST_CASE(drop_table_with_no_snapshot) {
     sstring table_name = "table_with_no_snapshot";
 
     co_await do_with_some_data({table_name}, [&] (cql_test_env& e) -> future<> {
-        auto cf_dir = e.local_db().find_column_family(ks_name, table_name).dir();
+        auto cf_dir = table_dir(e.local_db().find_column_family(ks_name, table_name)).native();
 
         // Pass `with_snapshot=false` to drop_table_on_all
         // to disallow auto_snapshot.
@@ -1427,8 +1588,8 @@ SEASTAR_TEST_CASE(drop_table_with_explicit_snapshot) {
 
     co_await do_with_some_data({table_name}, [&] (cql_test_env& e) -> future<> {
         auto snapshot_tag = format("test-{}", db_clock::now().time_since_epoch().count());
-        co_await replica::database::snapshot_table_on_all_shards(e.db(), ks_name, table_name, snapshot_tag, db::snapshot_ctl::snap_views::no, false);
-        auto cf_dir = e.local_db().find_column_family(ks_name, table_name).dir();
+        co_await replica::database::snapshot_table_on_all_shards(e.db(), ks_name, table_name, snapshot_tag, false);
+        auto cf_dir = table_dir(e.local_db().find_column_family(ks_name, table_name)).native();
 
         // With explicit snapshot and with_snapshot=false
         // dir should still be kept, regardless of the
@@ -1450,3 +1611,5 @@ SEASTAR_TEST_CASE(mutation_dump_generated_schema_deterministic_id_version) {
 
     return make_ready_future<>();
 }
+
+BOOST_AUTO_TEST_SUITE_END()

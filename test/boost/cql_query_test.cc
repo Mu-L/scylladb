@@ -3,22 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
-#include <boost/algorithm/string/join.hpp>
 #include <boost/range/irange.hpp>
-#include <boost/range/adaptors.hpp>
 #include <boost/range/algorithm.hpp>
 #include <boost/test/unit_test.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
 
 #include <fmt/ranges.h>
+#include <fmt/std.h>
 
 #include <seastar/net/inet_address.hh>
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
@@ -29,6 +29,7 @@
 #include "transport/messages/result_message.hh"
 #include "transport/messages/result_message_base.hh"
 #include "types/types.hh"
+#include "utils/assert.hh"
 #include "utils/big_decimal.hh"
 #include "types/map.hh"
 #include "types/list.hh"
@@ -37,8 +38,8 @@
 #include "db/extensions.hh"
 #include "cql3/cql_config.hh"
 #include "test/lib/exception_utils.hh"
+#include "service/qos/qos_common.hh"
 #include "utils/rjson.hh"
-#include "utils/fmt-compat.hh"
 #include "schema/schema_builder.hh"
 #include "service/migration_manager.hh"
 #include <boost/regex.hpp>
@@ -49,8 +50,10 @@
 #include "cdc/cdc_extension.hh"
 #include "db/paxos_grace_seconds_extension.hh"
 #include "db/per_partition_rate_limit_extension.hh"
+#include "replica/schema_describe_helper.hh"
 
 
+BOOST_AUTO_TEST_SUITE(cql_query_test)
 
 using namespace std::literals::chrono_literals;
 
@@ -700,7 +703,7 @@ SEASTAR_TEST_CASE(test_cassandra_stress_like_write_and_read) {
                     .build();
         }).then([execute_update_for_key, verify_row_for_key] {
             static auto make_key = [](int suffix) { return format("0xdeadbeefcafebabe{:02d}", suffix); };
-            auto suffixes = boost::irange(0, 10);
+            auto suffixes = std::views::iota(0, 10);
             return parallel_for_each(suffixes.begin(), suffixes.end(), [execute_update_for_key](int suffix) {
                 return execute_update_for_key(make_key(suffix));
             }).then([suffixes, verify_row_for_key] {
@@ -2962,16 +2965,16 @@ SEASTAR_TEST_CASE(test_reversed_slice_with_many_clustering_ranges) {
         // Many singular ranges - to check that the right range is used for
         // determining the disk read-range upper bound.
         {
-            const auto select_query = format(
+            const auto select_query = fmt::format(
                     "SELECT * FROM test WHERE pk = {} and ck IN ({}) ORDER BY ck DESC BYPASS CACHE;",
                     pk,
-                    boost::algorithm::join(selected_cks | boost::adaptors::transformed([] (int ck) { return format("{}", ck); }), ", "));
+                    fmt::join(selected_cks | std::views::transform([] (int ck) { return format("{}", ck); }), ", "));
             assert_that(e.execute_cql(select_query).get())
                     .is_rows()
-                    .with_rows(boost::copy_range<std::vector<std::vector<bytes_opt>>>(
-                                selected_cks
-                                | boost::adaptors::reversed
-                                | boost::adaptors::transformed(make_expected_row)));
+                    .with_rows(selected_cks
+                                | std::views::reverse
+                                | std::views::transform(make_expected_row)
+                                | std::ranges::to<std::vector<std::vector<bytes_opt>>>());
         }
 
         // A single wide range - to check that the right range bound is used for
@@ -2985,10 +2988,10 @@ SEASTAR_TEST_CASE(test_reversed_slice_with_many_clustering_ranges) {
 
             assert_that(e.execute_cql(select_query).get())
                     .is_rows()
-                    .with_rows(boost::copy_range<std::vector<std::vector<bytes_opt>>>(
-                                boost::irange(selected_cks[0], selected_cks[1] + 1)
-                                | boost::adaptors::reversed
-                                | boost::adaptors::transformed(make_expected_row)));
+                    .with_rows(std::views::iota(selected_cks[0], selected_cks[1] + 1)
+                                | std::views::reverse
+                                | std::views::transform(make_expected_row)
+                                | std::ranges::to<std::vector<std::vector<bytes_opt>>>());
         }
     }, std::move(cfg));
 }
@@ -3026,10 +3029,10 @@ SEASTAR_TEST_CASE(test_query_with_range_tombstones) {
 SEASTAR_TEST_CASE(test_alter_table_validation) {
     return do_with_cql_env([] (cql_test_env& e) {
         return e.execute_cql("create table tatv (p1 int, c1 int, c2 int, r1 int, r2 set<int>, PRIMARY KEY (p1, c1, c2));").discard_result().then_wrapped([&e] (future<> f) {
-            assert(!f.failed());
+            SCYLLA_ASSERT(!f.failed());
             return e.execute_cql("alter table tatv drop r2;").discard_result();
         }).then_wrapped([&e] (future<> f) {
-            assert(!f.failed());
+            SCYLLA_ASSERT(!f.failed());
             return e.execute_cql("alter table tatv add r2 list<int>;").discard_result();
         }).then_wrapped([&e] (future<> f) {
             assert_that_failed(f);
@@ -3038,7 +3041,7 @@ SEASTAR_TEST_CASE(test_alter_table_validation) {
             assert_that_failed(f);
             return e.execute_cql("alter table tatv add r2 set<int>;").discard_result();
         }).then_wrapped([&e] (future<> f) {
-            assert(!f.failed());
+            SCYLLA_ASSERT(!f.failed());
             return e.execute_cql("alter table tatv rename r2 to r3;").discard_result();
         }).then_wrapped([&e] (future<> f) {
             assert_that_failed(f);
@@ -3050,16 +3053,16 @@ SEASTAR_TEST_CASE(test_alter_table_validation) {
             assert_that_failed(f);
             return e.execute_cql("alter table tatv add r3 map<int, int>;").discard_result();
         }).then_wrapped([&e] (future<> f) {
-            assert(!f.failed());
+            SCYLLA_ASSERT(!f.failed());
             return e.execute_cql("alter table tatv add r4 set<text>;").discard_result();
         }).then_wrapped([&e] (future<> f) {
-            assert(!f.failed());
+            SCYLLA_ASSERT(!f.failed());
             return e.execute_cql("alter table tatv drop r3;").discard_result();
         }).then_wrapped([&e] (future<> f) {
-            assert(!f.failed());
+            SCYLLA_ASSERT(!f.failed());
             return e.execute_cql("alter table tatv drop r4;").discard_result();
         }).then_wrapped([&e] (future<> f) {
-            assert(!f.failed());
+            SCYLLA_ASSERT(!f.failed());
             return e.execute_cql("alter table tatv add r3 map<int, text>;").discard_result();
         }).then_wrapped([&e] (future<> f) {
             assert_that_failed(f);
@@ -3068,10 +3071,10 @@ SEASTAR_TEST_CASE(test_alter_table_validation) {
             assert_that_failed(f);
             return e.execute_cql("alter table tatv add r3 map<int, blob>;").discard_result();
         }).then_wrapped([&e] (future<> f) {
-            assert(!f.failed());
+            SCYLLA_ASSERT(!f.failed());
             return e.execute_cql("alter table tatv add r4 set<blob>;").discard_result();
         }).then_wrapped([] (future<> f) {
-            assert(!f.failed());
+            SCYLLA_ASSERT(!f.failed());
         });
     });
 }
@@ -3747,7 +3750,7 @@ SEASTAR_TEST_CASE(test_rf_expand) {
             auto row0 = rows[0];
             BOOST_REQUIRE_EQUAL(row0.size(), 1);
 
-            auto parsed = rjson::parse(to_sstring_view(to_bytes(*row0[0])));
+            auto parsed = rjson::parse(to_string_view(to_bytes(*row0[0])));
             return std::move(rjson::get(parsed, "replication"));
         };
 
@@ -4164,7 +4167,7 @@ SEASTAR_TEST_CASE(test_describe_simple_schema) {
                 "    AND default_time_to_live = 0\n"
                 "    AND gc_grace_seconds = 954000\n"
                 "    AND max_index_interval = 3048\n"
-                "    AND memtable_flush_period_in_ms = 10\n"
+                "    AND memtable_flush_period_in_ms = 60000\n"
                 "    AND min_index_interval = 128\n"
                 "    AND speculative_retry = '99.0PERCENTILE'\n"
                 "    AND paxos_grace_seconds = 43200\n"
@@ -4187,7 +4190,7 @@ SEASTAR_TEST_CASE(test_describe_simple_schema) {
                 "    AND default_time_to_live = 0\n"
                 "    AND gc_grace_seconds = 954000\n"
                 "    AND max_index_interval = 3048\n"
-                "    AND memtable_flush_period_in_ms = 10\n"
+                "    AND memtable_flush_period_in_ms = 60000\n"
                 "    AND min_index_interval = 128\n"
                 "    AND speculative_retry = '99.0PERCENTILE'\n"
                 "    AND paxos_grace_seconds = 43200\n"
@@ -4209,7 +4212,7 @@ SEASTAR_TEST_CASE(test_describe_simple_schema) {
                 "    AND default_time_to_live = 0\n"
                 "    AND gc_grace_seconds = 954000\n"
                 "    AND max_index_interval = 3048\n"
-                "    AND memtable_flush_period_in_ms = 10\n"
+                "    AND memtable_flush_period_in_ms = 60000\n"
                 "    AND min_index_interval = 128\n"
                 "    AND speculative_retry = '99.0PERCENTILE'\n"
                 "    AND paxos_grace_seconds = 43200\n"
@@ -4221,13 +4224,13 @@ SEASTAR_TEST_CASE(test_describe_simple_schema) {
             "country_code int,"
             "number text)"
         ).get();
+        replica::schema_describe_helper describe_helper{e.data_dictionary()};
         for (auto &&ct : cql_create_tables) {
             e.execute_cql(ct.second).get();
             auto schema = e.local_db().find_schema("ks", ct.first);
-            std::ostringstream ss;
+            auto schema_desc = schema->describe(describe_helper, cql3::describe_option::STMTS);
 
-            schema->describe(e.local_db(), ss, false);
-            BOOST_CHECK_EQUAL(normalize_white_space(ss.str()), normalize_white_space(ct.second));
+            BOOST_CHECK_EQUAL(normalize_white_space(*schema_desc.create_statement), normalize_white_space(ct.second));
         }
     }, describe_test_config());
 }
@@ -4289,18 +4292,19 @@ SEASTAR_TEST_CASE(test_describe_view_schema) {
         e.execute_cql("CREATE KEYSPACE \"KS\" WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}").get();
         e.execute_cql(base_table).get();
 
+        replica::schema_describe_helper describe_helper{e.data_dictionary()};
+
         for (auto &&ct : cql_create_tables) {
             e.execute_cql(ct.second).get();
             auto schema = e.local_db().find_schema("KS", ct.first);
-            std::ostringstream ss;
+            auto schema_desc = schema->describe(describe_helper, cql3::describe_option::STMTS);
 
-            schema->describe(e.local_db(), ss, false);
-            BOOST_CHECK_EQUAL(normalize_white_space(ss.str()), normalize_white_space(ct.second));
+            BOOST_CHECK_EQUAL(normalize_white_space(*schema_desc.create_statement), normalize_white_space(ct.second));
 
             auto base_schema = e.local_db().find_schema("KS", "cF");
-            std::ostringstream base_ss;
-            base_schema->describe(e.local_db(), base_ss, false);
-            BOOST_CHECK_EQUAL(normalize_white_space(base_ss.str()), normalize_white_space(base_table));
+            auto base_schema_desc = base_schema->describe(describe_helper, cql3::describe_option::STMTS);
+
+            BOOST_CHECK_EQUAL(normalize_white_space(*base_schema_desc.create_statement), normalize_white_space(base_table));
         }
     }, describe_test_config());
 }
@@ -4532,48 +4536,6 @@ SEASTAR_TEST_CASE(test_time_uuid_fcts_result) {
     });
 }
 
-// Test that tombstones with future timestamps work correctly
-// when a write with lower timestamp arrives - in such case,
-// if the base row is covered by such a tombstone, a view update
-// needs to take it into account. Refs #5793
-SEASTAR_TEST_CASE(test_views_with_future_tombstones) {
-    return do_with_cql_env_thread([] (auto& e) {
-        cquery_nofail(e, "CREATE TABLE t (a int, b int, c int, d int, e int, PRIMARY KEY (a,b,c));");
-        cquery_nofail(e, "CREATE MATERIALIZED VIEW tv AS SELECT * FROM t"
-                " WHERE a IS NOT NULL AND b IS NOT NULL AND c IS NOT NULL PRIMARY KEY (b,a,c);");
-
-        // Partition tombstone
-        cquery_nofail(e, "delete from t using timestamp 10 where a=1;");
-        auto msg = cquery_nofail(e, "select * from t;");
-        assert_that(msg).is_rows().with_size(0);
-        cquery_nofail(e, "insert into t (a,b,c,d,e) values (1,2,3,4,5) using timestamp 8;");
-        msg = cquery_nofail(e, "select * from t;");
-        assert_that(msg).is_rows().with_size(0);
-        msg = cquery_nofail(e, "select * from tv;");
-        assert_that(msg).is_rows().with_size(0);
-
-        // Range tombstone
-        cquery_nofail(e, "delete from t using timestamp 16 where a=2 and b > 1 and b < 4;");
-        msg = cquery_nofail(e, "select * from t;");
-        assert_that(msg).is_rows().with_size(0);
-        cquery_nofail(e, "insert into t (a,b,c,d,e) values (2,3,4,5,6) using timestamp 12;");
-        msg = cquery_nofail(e, "select * from t;");
-        assert_that(msg).is_rows().with_size(0);
-        msg = cquery_nofail(e, "select * from tv;");
-        assert_that(msg).is_rows().with_size(0);
-
-        // Row tombstone
-        cquery_nofail(e, "delete from t using timestamp 24 where a=3 and b=4 and c=5;");
-        msg = cquery_nofail(e, "select * from t;");
-        assert_that(msg).is_rows().with_size(0);
-        cquery_nofail(e, "insert into t (a,b,c,d,e) values (3,4,5,6,7) using timestamp 18;");
-        msg = cquery_nofail(e, "select * from t;");
-        assert_that(msg).is_rows().with_size(0);
-        msg = cquery_nofail(e, "select * from tv;");
-        assert_that(msg).is_rows().with_size(0);
-    });
-}
-
 static std::unique_ptr<cql3::query_options> q_serial_opts(
         std::vector<cql3::raw_value> values,
         db::consistency_level cl) {
@@ -4706,7 +4668,7 @@ SEASTAR_TEST_CASE(test_select_serial_consistency) {
         auto check_fails = [&e] (const sstring& query, const source_location& loc = source_location::current()) {
             try {
                 prepared_on_shard(e, query, {}, {}, db::consistency_level::SERIAL);
-                assert(false);
+                SCYLLA_ASSERT(false);
             } catch (const exceptions::invalid_request_exception& e) {
                 testlog.info("Query '{}' failed as expected with error: {}", query, e);
             } catch (...) {
@@ -4774,6 +4736,8 @@ SEASTAR_TEST_CASE(test_impossible_where) {
     });
 }
 
+} // cql_query_test namespace
+
 // FIXME: copy-pasta
 static bool has_more_pages(::shared_ptr<cql_transport::messages::result_message> res) {
     auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(res);
@@ -4796,6 +4760,8 @@ static lw_shared_ptr<service::pager::paging_state> extract_paging_state(::shared
     }
     return make_lw_shared<service::pager::paging_state>(*paging_state);
 };
+
+namespace cql_query_test {
 
 SEASTAR_THREAD_TEST_CASE(test_query_limit) {
     cql_test_config cfg;
@@ -4825,8 +4791,8 @@ SEASTAR_THREAD_TEST_CASE(test_query_limit) {
             return {raw_pk, int32_type->decompose(ck), raw_value};
         };
 
-        const auto normal_rows = boost::copy_range<std::vector<std::vector<bytes_opt>>>(boost::irange(0, num_rows) | boost::adaptors::transformed(make_expected_row));
-        const auto reversed_rows = boost::copy_range<std::vector<std::vector<bytes_opt>>>(boost::irange(0, num_rows) | boost::adaptors::reversed | boost::adaptors::transformed(make_expected_row));
+        const auto normal_rows = std::views::iota(0, num_rows) | std::views::transform(make_expected_row) | std::ranges::to<std::vector<std::vector<bytes_opt>>>();
+        const auto reversed_rows = std::views::iota(0, num_rows) | std::views::reverse | std::views::transform(make_expected_row) | std::ranges::to<std::vector<std::vector<bytes_opt>>>();
 
         db_config->max_memory_for_unlimited_query_soft_limit.set(256, utils::config_file::config_source::CommandLine);
         db_config->max_memory_for_unlimited_query_hard_limit.set(1024, utils::config_file::config_source::CommandLine);
@@ -4899,7 +4865,7 @@ static future<> test_clustering_filtering_with_compaction_strategy(std::string_v
     db_config->sstable_format("me");
 
     return do_with_cql_env_thread([cs] (cql_test_env& e) {
-        cquery_nofail(e, format("CREATE TABLE cf(pk text, ck int, v text, PRIMARY KEY(pk, ck)) WITH COMPACTION = {{'class': '{}'}}", cs));
+        cquery_nofail(e, seastar::format("CREATE TABLE cf(pk text, ck int, v text, PRIMARY KEY(pk, ck)) WITH COMPACTION = {{'class': '{}'}}", cs));
         cquery_nofail(e, "INSERT INTO  cf(pk, ck, v) VALUES ('a', 1, 'a1')");
         e.db().invoke_on_all([] (replica::database& db) { return db.flush_all_memtables(); }).get();
         e.db().invoke_on_all([] (replica::database& db) { db.row_cache_tracker().clear(); }).get();
@@ -4923,7 +4889,7 @@ static future<> test_clustering_filtering_2_with_compaction_strategy(std::string
     db_config->sstable_format("me");
 
     return do_with_cql_env_thread([cs] (cql_test_env& e) {
-        cquery_nofail(e, format("CREATE TABLE cf(pk text, ck int, v text, PRIMARY KEY(pk, ck)) WITH COMPACTION = {{'class': '{}'}}", cs));
+        cquery_nofail(e, seastar::format("CREATE TABLE cf(pk text, ck int, v text, PRIMARY KEY(pk, ck)) WITH COMPACTION = {{'class': '{}'}}", cs));
         cquery_nofail(e, "INSERT INTO  cf(pk, ck, v) VALUES ('a', 1, 'a1')");
         cquery_nofail(e, "INSERT INTO  cf(pk, ck, v) VALUES ('b', 2, 'b2')");
         e.db().invoke_on_all([] (replica::database& db) { return db.flush_all_memtables(); }).get();
@@ -4948,7 +4914,7 @@ static future<> test_clustering_filtering_3_with_compaction_strategy(std::string
     db_config->sstable_format("me");
 
     return do_with_cql_env_thread([cs] (cql_test_env& e) {
-        cquery_nofail(e, format("CREATE TABLE cf(pk text, ck int, v text, PRIMARY KEY(pk, ck)) WITH COMPACTION = {{'class': '{}'}}", cs));
+        cquery_nofail(e, seastar::format("CREATE TABLE cf(pk text, ck int, v text, PRIMARY KEY(pk, ck)) WITH COMPACTION = {{'class': '{}'}}", cs));
         e.db().invoke_on_all([] (replica::database& db) {
             auto& table = db.find_column_family("ks", "cf");
             return table.disable_auto_compaction();
@@ -5094,14 +5060,21 @@ SEASTAR_TEST_CASE(test_user_based_sla_queries) {
         e.execute_cql("CREATE SERVICE_LEVEL sl_1;").get();
         auto msg = e.execute_cql("LIST SERVICE_LEVEL sl_1;").get();
         assert_that(msg).is_rows().with_rows({
-            {utf8_type->decompose("sl_1"), {}, {}},
+            {utf8_type->decompose("sl_1"), {}, {}, int32_type->decompose(1000)},
         });
-        e.execute_cql("CREATE SERVICE_LEVEL sl_2;").get();
+        //create and alter service levels
+        e.execute_cql("CREATE SERVICE_LEVEL sl_2 WITH SHARES = 200;").get();
+        e.execute_cql("ALTER SERVICE_LEVEL sl_1 WITH SHARES = 111;").get();
+        msg = e.execute_cql("LIST ALL SERVICE_LEVELS;").get();
+        assert_that(msg).is_rows().with_rows({
+            {utf8_type->decompose("sl_1"), {}, {}, int32_type->decompose(111), utf8_type->decompose("35.69%")},
+            {utf8_type->decompose("sl_2"), {}, {}, int32_type->decompose(200), utf8_type->decompose("64.31%")},
+        });
         //drop service levels
         e.execute_cql("DROP SERVICE_LEVEL sl_1;").get();
         msg = e.execute_cql("LIST ALL SERVICE_LEVELS;").get();
         assert_that(msg).is_rows().with_rows({
-            {utf8_type->decompose("sl_2"), {}, {}},
+            {utf8_type->decompose("sl_2"), {}, {}, int32_type->decompose(200), utf8_type->decompose("100.00%")},
         });
 
         // validate exceptions (illegal requests)
@@ -5109,8 +5082,11 @@ SEASTAR_TEST_CASE(test_user_based_sla_queries) {
         e.execute_cql("DROP SERVICE_LEVEL IF EXISTS sl_1;").get();
 
         BOOST_REQUIRE_THROW(e.execute_cql("CREATE SERVICE_LEVEL sl_2;").get(), exceptions::invalid_request_exception);
-        BOOST_REQUIRE_THROW(e.execute_cql("CREATE SERVICE_LEVEL sl_2;").get(), exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(e.execute_cql("CREATE SERVICE_LEVEL sl_2 WITH SHARES = 999;").get(), exceptions::invalid_request_exception);
         e.execute_cql("CREATE SERVICE_LEVEL IF NOT EXISTS sl_2;").get();
+
+        BOOST_REQUIRE_THROW(e.execute_cql("CREATE SERVICE_LEVEL sl_1 WITH SHARES = 0;").get(), exceptions::syntax_exception);
+        BOOST_REQUIRE_THROW(e.execute_cql("CREATE SERVICE_LEVEL sl_1 WITH SHARES = 1001;").get(), exceptions::syntax_exception);
 
         // test attach role
         e.execute_cql("ATTACH SERVICE_LEVEL sl_2 TO tester").get();
@@ -5129,7 +5105,7 @@ SEASTAR_TEST_CASE(test_user_based_sla_queries) {
         BOOST_CHECK(true);
         // tests detaching service levels
         e.execute_cql("CREATE ROLE tester2;").get();
-        e.execute_cql("CREATE SERVICE_LEVEL sl_1;").get();
+        e.execute_cql("CREATE SERVICE_LEVEL sl_1 WITH SHARES = 998;").get();
         e.execute_cql("ATTACH SERVICE_LEVEL sl_1 TO tester2;").get();
         e.execute_cql("DETACH SERVICE_LEVEL FROM tester;").get();
         msg = e.execute_cql("LIST ATTACHED SERVICE_LEVEL OF tester2;").get();
@@ -5163,6 +5139,7 @@ SEASTAR_TEST_CASE(test_user_based_sla_queries) {
         msg = e.execute_cql("LIST ALL ATTACHED SERVICE_LEVELS;").get();
         assert_that(msg).is_rows().with_rows({
         });
+        BOOST_REQUIRE_THROW(e.execute_cql("ALTER SERVICE_LEVEL i_do_not_exist WITH shares = 1;").get(), exceptions::invalid_request_exception);
     });
 }
 
@@ -5181,15 +5158,15 @@ SEASTAR_TEST_CASE(timeuuid_fcts_prepared_re_evaluation) {
         };
         for (const auto& t : sub_tests) {
             BOOST_TEST_CHECKPOINT(t.first);
-            e.execute_cql(format("CREATE TABLE test_{} (pk {} PRIMARY KEY)", t.first, t.second)).get();
-            auto drop_test_table = defer([&e, &t] { e.execute_cql(format("DROP TABLE test_{}", t.first)).get(); });
-            auto insert_stmt = e.prepare(format("INSERT INTO test_{0} (pk) VALUES ({0}())", t.first)).get();
+            e.execute_cql(seastar::format("CREATE TABLE test_{} (pk {} PRIMARY KEY)", t.first, t.second)).get();
+            auto drop_test_table = defer([&e, &t] { e.execute_cql(seastar::format("DROP TABLE test_{}", t.first)).get(); });
+            auto insert_stmt = e.prepare(seastar::format("INSERT INTO test_{0} (pk) VALUES ({0}())", t.first)).get();
             e.execute_prepared(insert_stmt, {}).get();
             sleep(1ms).get();
             // Check that the second execution is evaluated again and yields a
             // different value.
             e.execute_prepared(insert_stmt, {}).get();
-            auto msg = e.execute_cql(format("SELECT * FROM test_{}", t.first)).get();
+            auto msg = e.execute_cql(seastar::format("SELECT * FROM test_{}", t.first)).get();
             assert_that(msg).is_rows().with_size(2);
         }
     });
@@ -5731,6 +5708,26 @@ SEASTAR_TEST_CASE(test_bind_variable_type_checking) {
     });
 }
 
+SEASTAR_TEST_CASE(test_bind_variable_type_checking_disabled) {
+    auto db_config = make_shared<db::config>();
+    db_config->cql_duplicate_bind_variable_names_refer_to_same_variable(false);
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE tab1 (p int primary key, a int, b text, c int)").get();
+
+        // Test :var needing to have two conflicting types; will fail without
+        // cql_duplicate_bind_variable_names_refer_to_same_variable = false
+        auto prepared = e.prepare("INSERT INTO tab1 (p, a, b) VALUES (0, :var, :var)").get();
+
+        // Verify that the parameters passed positionally work (non-positional won't make sense)
+        auto a = int32_type->decompose(1);
+        auto b = utf8_type->decompose("abc");
+        e.execute_prepared(prepared, {cql3::raw_value::make_value(a), cql3::raw_value::make_value(b)}).get();
+
+        auto msg = e.execute_cql("SELECT a, b FROM tab1 WHERE p = 0").get();
+        assert_that(msg).is_rows().with_rows({{a, b}});
+    }, cql_test_config{db_config});
+}
+
 SEASTAR_TEST_CASE(test_setting_synchronous_updates_property) {
     return do_with_cql_env_thread([](cql_test_env& e) {
         e.execute_cql("create table base (k int, v int, primary key (k));").get();
@@ -5820,6 +5817,18 @@ SEASTAR_TEST_CASE(test_sending_tablet_info_unprepared_select) {
             });
         }).get();
     }, tablet_cql_test_config());
+}
+
+// Reproduces #20768
+SEASTAR_TEST_CASE(test_alter_keyspace_updates_in_memory_objects_with_data_from_system_schema_scylla_keyspaces) {
+        return do_with_cql_env_thread([] (cql_test_env& e) {
+            e.execute_cql("create keyspace ks_tablet with replication = { 'class': 'NetworkTopologyStrategy', "
+                          "'replication_factor': 1 } and tablets = { 'initial': 1 }").get();
+            e.execute_cql("alter keyspace ks_tablet with tablets = { 'initial': 2 }").get();
+            e.execute_cql("alter keyspace ks_tablet with tablets = { 'initial': 3 }").get();
+            auto& ks = e.local_db().find_keyspace("ks_tablet");
+            BOOST_REQUIRE(ks.metadata()->initial_tablets() == 3);
+        }, tablet_cql_test_config());
 }
 
 SEASTAR_TEST_CASE(test_sending_tablet_info_insert) {
@@ -5928,3 +5937,5 @@ SEASTAR_TEST_CASE(test_schema_change_events) {
         BOOST_REQUIRE(dynamic_pointer_cast<event_t>(res));
      });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

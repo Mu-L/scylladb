@@ -1,12 +1,12 @@
 #
 # Copyright (C) 2024-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 """
 Tests for materialized views that need a three-node cluster.
 Note that most materialized-view functional tests can make due with a single
-node, and belong cql-pytest. We also have topology_experimental_raft/
+node, and belong in cqlpy. We also have topology_experimental_raft/
 test_mv_tablets.py for tests that each needs a cluster of a different
 size, and/or special Scylla parameters.
 """
@@ -15,6 +15,8 @@ import logging
 import pytest
 
 from test.topology.util import new_test_keyspace, new_test_table, new_materialized_view
+
+ksdef = "WITH REPLICATION = { 'class': 'NetworkTopologyStrategy', 'replication_factor': 3 } AND TABLETS = {'enabled': false }"
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +31,10 @@ async def test_mv_tombstone_gc_setting(manager):
 
     tombstone_gc=repair is not supported on a table with RF=1, and RF>1
     is not supported on a single node, which is why this test needs to
-    be here and not in the single-node cql-pytest.
+    be here and not in the single-node cqlpy.
     """
     cql = manager.cql
-    async with new_test_keyspace(cql, "WITH REPLICATION = { 'class': 'NetworkTopologyStrategy', 'replication_factor': 3 }") as keyspace:
+    async with new_test_keyspace(cql, ksdef) as keyspace:
         async with new_test_table(cql, keyspace, "p int primary key, x int") as table:
             # Adding "WITH tombstone_gc = ..." In the CREATE MATERIALIZED VIEW:
             async with new_materialized_view(cql, table, "*", "p, x", "p is not null and x is not null", "WITH tombstone_gc = {'mode': 'repair'}") as mv:
@@ -55,7 +57,7 @@ async def test_mv_tombstone_gc_not_inherited(manager):
     demonstrates the existing behavior.
     """
     cql = manager.cql
-    async with new_test_keyspace(cql, "WITH REPLICATION = { 'class': 'NetworkTopologyStrategy', 'replication_factor': 3 }") as keyspace:
+    async with new_test_keyspace(cql, ksdef) as keyspace:
         async with new_test_table(cql, keyspace, "p int primary key, x int", "WITH tombstone_gc = {'mode': 'repair'}") as table:
             s = list(cql.execute(f"DESC {table}"))[0].create_statement
             assert "'mode': 'repair'" in s

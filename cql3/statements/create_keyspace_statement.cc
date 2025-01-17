@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
@@ -92,11 +92,12 @@ future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector
     using namespace cql_transport;
     const auto& tm = *qp.proxy().get_token_metadata_ptr();
     const auto& feat = qp.proxy().features();
+    const auto& cfg = qp.db().get_config();
     std::vector<mutation> m;
     std::vector<sstring> warnings;
 
     try {
-        auto ksm = _attrs->as_ks_metadata(_name, tm, feat);
+        auto ksm = _attrs->as_ks_metadata(_name, tm, feat, cfg);
         m = service::prepare_new_keyspace_announcement(qp.db().real_database(), ksm, ts);
         // If the new keyspace uses tablets, as long as there are features
         // which aren't supported by tablets we want to warn the user that
@@ -109,11 +110,10 @@ future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector
             locator::replication_strategy_params(ksm->strategy_options(), ksm->initial_tablets()));
         if (rs->uses_tablets()) {
             warnings.push_back(
-                "Tables in this keyspace will be replicated using tablets, "
-                "and will not support the CDC feature (issue #16317) and LWT "
-                "may suffer from issue #5251 more often. If you want to use "
-                "CDC or LWT, please drop this keyspace and re-create it "
-                "without tablets, by adding AND TABLETS = {'enabled': false} "
+                "Tables in this keyspace will be replicated using Tablets "
+                "and will not support CDC, LWT and counters features. "
+                "To use CDC, LWT or counters, drop this keyspace and re-create it "
+                "without tablets by adding AND TABLETS = {'enabled': false} "
                 "to the CREATE KEYSPACE statement.");
         }
     } catch (const exceptions::already_exists_exception& e) {
@@ -135,7 +135,7 @@ future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector
 
 std::unique_ptr<cql3::statements::prepared_statement>
 cql3::statements::create_keyspace_statement::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<create_keyspace_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<create_keyspace_statement>(*this));
 }
 
 future<> cql3::statements::create_keyspace_statement::grant_permissions_to_creator(const service::client_state& cs, service::group0_batch& mc) const {
@@ -279,9 +279,9 @@ create_keyspace_statement::execute(query_processor& qp, service::query_state& st
     });
 }
 
-lw_shared_ptr<data_dictionary::keyspace_metadata> create_keyspace_statement::get_keyspace_metadata(const locator::token_metadata& tm, const gms::feature_service& feat) {
+lw_shared_ptr<data_dictionary::keyspace_metadata> create_keyspace_statement::get_keyspace_metadata(const locator::token_metadata& tm, const gms::feature_service& feat, const db::config& cfg) {
     _attrs->validate();
-    return _attrs->as_ks_metadata(_name, tm, feat);
+    return _attrs->as_ks_metadata(_name, tm, feat, cfg);
 }
 
 ::shared_ptr<schema_altering_statement::event_t> create_keyspace_statement::created_event() const {

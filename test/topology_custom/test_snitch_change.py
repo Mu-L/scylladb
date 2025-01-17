@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2024-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 import pytest
@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 async def test_snitch_change(manager: ManagerClient) -> None:
     """ The test changes snitch from simple to GossipingPropertyFileSnitch one and checks
         that DC and rack names change accordingly"""
-    s1 = await manager.server_add(property_file = {'dc': 'DC1', 'rack' : 'R1'})
-    s2 = await manager.server_add(property_file = {'dc': 'DC1', 'rack' : 'R1'})
+    s1 = await manager.server_add(config = {"endpoint_snitch": "SimpleSnitch"}, property_file = {'dc': 'DC1', 'rack' : 'R1'})
+    s2 = await manager.server_add(config = {"endpoint_snitch": "SimpleSnitch"}, property_file = {'dc': 'DC1', 'rack' : 'R1'})
     cql = manager.get_cql()
     res = await cql.run_async(f"SELECT data_center,rack From system.peers")
     assert res[0].data_center == "datacenter1" and res[0].rack == "rack1"

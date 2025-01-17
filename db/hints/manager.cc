@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "db/hints/manager.hh"
@@ -28,7 +28,6 @@
 #include <seastar/coroutine/parallel_for_each.hh>
 
 // Boost features.
-#include <boost/range/adaptors.hpp>
 
 // Scylla includes.
 #include "db/hints/internal/hint_logger.hh"
@@ -171,8 +170,11 @@ void manager::register_metrics(const sstring& group_name) {
         sm::make_counter("dropped", _stats.dropped,
                         sm::description("Number of dropped hints.")),
 
-        sm::make_counter("sent", _stats.sent,
+        sm::make_counter("sent_total", _stats.sent_total,
                         sm::description("Number of sent hints.")),
+
+        sm::make_counter("sent_bytes_total", _stats.sent_hints_bytes_total,
+                        sm::description("The total size of the sent hints (in bytes)")),
 
         sm::make_counter("discarded", _stats.discarded,
                         sm::description("Number of hints that were discarded during sending (too old, schema changed, etc.).")),
@@ -193,7 +195,7 @@ void manager::register_metrics(const sstring& group_name) {
     });
 }
 
-future<> manager::start(shared_ptr<gms::gossiper> gossiper_ptr) {
+future<> manager::start(shared_ptr<const gms::gossiper> gossiper_ptr) {
     _gossiper_anchor = std::move(gossiper_ptr);
 
     if (_proxy.features().host_id_based_hinted_handoff) {
@@ -221,7 +223,7 @@ future<> manager::stop() {
     return _migrating_done.finally([this] {
         return _draining_eps_gate.close();
     }).finally([this] {
-        return parallel_for_each(_ep_managers | boost::adaptors::map_values, [] (hint_endpoint_manager& ep_man) {
+        return parallel_for_each(_ep_managers | std::views::values, [] (hint_endpoint_manager& ep_man) {
             return ep_man.stop();
         }).finally([this] {
             _ep_managers.clear();
@@ -264,21 +266,47 @@ void manager::forbid_hints_for_eps_with_pending_hints() {
     }
 }
 
-sync_point::shard_rps manager::calculate_current_sync_point(std::span<const gms::inet_address> target_eps) const {
+sync_point::shard_rps manager::calculate_current_sync_point(std::span<const locator::host_id> target_eps) const {
     sync_point::shard_rps rps;
-    const auto tmptr = _proxy.get_token_metadata_ptr();
 
     for (auto addr : target_eps) {
-        const auto hid = tmptr->get_host_id_if_known(addr);
-        // Ignore the IPs that we cannot map.
-        if (!hid) {
-            continue;
-        }
-
-        auto it = _ep_managers.find(*hid);
+        auto it = _ep_managers.find(addr);
         if (it != _ep_managers.end()) {
             const hint_endpoint_manager& ep_man = it->second;
-            rps[*hid] = ep_man.last_written_replay_position();
+            rps[addr] = ep_man.last_written_replay_position();
+        }
+    }
+
+    // When `target_eps` is empty, it means the sync point should correspond to ALL hosts.
+    //
+    // It's worth noting here why this algorithm works. We don't have a guarantee that there's
+    // an endpoint manager for each hint directory stored by this node. However, if a hint
+    // directory doesn't have a corresponding endpoint manager, there is one of the two reasons
+    // for that:
+    //
+    // Reason 1. The hint directory is rejected by the host filter, i.e. this node is forbidden
+    //           to send hints to the node corresponding to the directory. In that case, the user
+    //           must've specified that they don't want hints to be sent there on their own
+    //           and it makes no sense to wait for those hints to be sent.
+    //
+    // Reason 2. When upgrading Scylla from a version with IP-based hinted handoff to a version
+    //           with support for host-ID hinted handoff, there's a transition period when
+    //           endpoint managers are identified by host IDs, while the names of hint directories
+    //           stored on disk still represent IP addresses; we keep mappings between those two
+    //           entities. It may happen that multiple IPs correspond to the same hint directory
+    //           and so -- even if a hint directory is accepted by the host filter, there might not
+    //           be an endpoint manager managing it. This reason is ONLY possible during the transition
+    //           period. Once the transition is done, only reason 1 can apply.
+    //           For more details on the mappings and related things, see:
+    //              scylladb/scylladb#12278 and scylladb/scylladb#15567.
+    //
+    // Because of that, it suffices to browse the existing endpoint managers and gather their
+    // last replay positions to abide by the design and guarantees of the sync point API, i.e.
+    // if the parameter `target_hosts` of a request to create a sync point is empty, we should
+    // create a sync point for ALL other nodes.
+    if (target_eps.empty()) {
+        for (const auto& [host_id, ep_man] : _ep_managers) {
+            rps[host_id] = ep_man.last_written_replay_position();
         }
     }
 
@@ -307,10 +335,11 @@ future<> manager::wait_for_sync_point(abort_source& as, const sync_point::shard_
 
     for (const auto& [addr, rp] : rps) {
         if (std::holds_alternative<gms::inet_address>(addr)) {
-            const auto maybe_hid = tmptr->get_host_id_if_known(std::get<gms::inet_address>(addr));
-            // Ignore the IPs we cannot map.
-            if (maybe_hid) [[likely]] {
-                hid_rps.emplace(*maybe_hid, rp);
+            try {
+                const auto hid = _gossiper_anchor->get_host_id(std::get<gms::inet_address>(addr));
+                hid_rps.emplace(hid, rp);
+            } catch (...) {
+                // Ignore the IPs we cannot map.
             }
         } else {
             hid_rps.emplace(std::get<locator::host_id>(addr), rp);
@@ -386,6 +415,14 @@ hint_endpoint_manager& manager::get_ep_manager(const endpoint_id& host_id, const
     }
 }
 
+uint64_t manager::max_size_of_hints_in_progress() const noexcept {
+    if (utils::get_local_injector().enter("decrease_max_size_of_hints_in_progress")) [[unlikely]] {
+        return 1'000;
+    } else {
+        return MAX_SIZE_OF_HINTS_IN_PROGRESS;
+    }
+}
+
 bool manager::have_ep_manager(const std::variant<locator::host_id, gms::inet_address>& ep) const noexcept {
     if (std::holds_alternative<locator::host_id>(ep)) {
         return _ep_managers.contains(std::get<locator::host_id>(ep));
@@ -393,11 +430,11 @@ bool manager::have_ep_manager(const std::variant<locator::host_id, gms::inet_add
     return _hint_directory_manager.has_mapping(std::get<gms::inet_address>(ep));
 }
 
-bool manager::store_hint(endpoint_id host_id, gms::inet_address ip, schema_ptr s, lw_shared_ptr<const frozen_mutation> fm,
+bool manager::store_hint(endpoint_id host_id, schema_ptr s, lw_shared_ptr<const frozen_mutation> fm,
         tracing::trace_state_ptr tr_state) noexcept
 {
     if (utils::get_local_injector().enter("reject_incoming_hints")) {
-        manager_logger.debug("Rejecting a hint to {} / {} due to an error injection", host_id, ip);
+        manager_logger.debug("Rejecting a hint to {} due to an error injection", host_id);
         ++_stats.dropped;
         return false;
     }
@@ -407,6 +444,8 @@ bool manager::store_hint(endpoint_id host_id, gms::inet_address ip, schema_ptr s
         ++_stats.dropped;
         return false;
     }
+
+    auto ip = _gossiper_anchor->get_address_map().get(host_id);
 
     try {
         manager_logger.trace("Going to store a hint to {}", host_id);
@@ -449,9 +488,13 @@ static bool endpoint_downtime_not_bigger_than(const gms::gossiper& gossiper, con
 
     gossiper.for_each_endpoint_state_until(
             [&info] (const gms::inet_address& ip, const gms::endpoint_state& state) {
-        const auto app_state = state.get_application_state_ptr(gms::application_state::HOST_ID);
+        const auto* app_state = state.get_application_state_ptr(gms::application_state::HOST_ID);
+        if (!app_state) {
+            manager_logger.error("Host ID application state for {} has not been found. Endpoint state: {}", ip, state);
+            return stop_iteration::no;
+        }
         const auto host_id = locator::host_id{utils::UUID{app_state->value()}};
-        if (!app_state || host_id != info.host_id) {
+        if (host_id != info.host_id) {
             return stop_iteration::no;
         }
         if (info.gossiper.get_endpoint_downtime(ip) <= info.max_hint_window_us) {
@@ -467,7 +510,7 @@ static bool endpoint_downtime_not_bigger_than(const gms::gossiper& gossiper, con
 bool manager::too_many_in_flight_hints_for(endpoint_id ep) const noexcept {
     // There is no need to check the DC here because if there is an in-flight hint for this
     // endpoint, then this means that its DC has already been checked and found to be ok.
-    return _stats.size_of_hints_in_progress > MAX_SIZE_OF_HINTS_IN_PROGRESS
+    return _stats.size_of_hints_in_progress > max_size_of_hints_in_progress()
             && !_proxy.local_db().get_token_metadata().get_topology().is_me(ep)
             && hints_in_progress_for(ep) > 0
             && endpoint_downtime_not_bigger_than(local_gossiper(), ep, _max_hint_window_us);
@@ -493,7 +536,7 @@ bool manager::can_hint_for(endpoint_id ep) const noexcept {
     // In the worst case there's going to be (_max_size_of_hints_in_progress + N - 1) in-flight
     // hints where N is the total number nodes in the cluster.
     const auto hipf = hints_in_progress_for(ep);
-    if (_stats.size_of_hints_in_progress > MAX_SIZE_OF_HINTS_IN_PROGRESS && hipf > 0) {
+    if (_stats.size_of_hints_in_progress > max_size_of_hints_in_progress() && hipf > 0) {
         manager_logger.trace("size_of_hints_in_progress {} hints_in_progress_for({}) {}",
                 _stats.size_of_hints_in_progress, ep, hipf);
         return false;
@@ -552,9 +595,9 @@ future<> manager::change_host_filter(host_filter filter) {
                     // been created by mistake and they're invalid. The same for pre-host-ID hinted handoff
                     // -- hint directories representing host IDs are NOT valid.
                     if (hid_or_ep.has_host_id() && _uses_host_id) {
-                        return std::make_optional(pair_type{hid_or_ep.id(), hid_or_ep.resolve_endpoint(*tmptr)});
+                        return std::make_optional(pair_type{hid_or_ep.id(), hid_or_ep.resolve_endpoint(*_gossiper_anchor)});
                     } else if (hid_or_ep.has_endpoint() && !_uses_host_id) {
-                        return std::make_optional(pair_type{hid_or_ep.resolve_id(*tmptr), hid_or_ep.endpoint()});
+                        return std::make_optional(pair_type{hid_or_ep.resolve_id(*_gossiper_anchor), hid_or_ep.endpoint()});
                     } else {
                         return std::nullopt;
                     }
@@ -647,7 +690,7 @@ future<> manager::drain_for(endpoint_id host_id, gms::inet_address ip) noexcept 
         set_draining_all();
 
         try {
-            co_await coroutine::parallel_for_each(_ep_managers | boost::adaptors::map_values,
+            co_await coroutine::parallel_for_each(_ep_managers | std::views::values,
                     [&drain_ep_manager] (hint_endpoint_manager& ep_man) {
                 return drain_ep_manager(ep_man);
             });
@@ -754,6 +797,8 @@ future<> manager::initialize_endpoint_managers() {
             // If hinted handoff is host-ID-based but the directory doesn't represent a host ID,
             // it's invalid. Ignore it.
             if (!maybe_host_id_or_ep->has_host_id()) {
+                manager_logger.warn("Encountered a hint directory of invalid name while initializing endpoint managers: {}. "
+                        "Hints stored in it won't be replayed", de.name);
                 co_return;
             }
 
@@ -763,14 +808,17 @@ future<> manager::initialize_endpoint_managers() {
         }
 
         // If we have got to this line, hinted handoff is still IP-based and we need to map the IP.
+
         if (!maybe_host_id_or_ep->has_endpoint()) {
             // If the directory name doesn't represent an IP, it's invalid. We ignore it.
+            manager_logger.warn("Encountered a hint directory of invalid name while initializing endpoint managers: {}. "
+                    "Hints stored in it won't be replayed", de.name);
             co_return;
         }
 
         const auto maybe_host_id = std::invoke([&] () -> std::optional<locator::host_id> {
             try {
-                return maybe_host_id_or_ep->resolve_id(*tmptr);
+                return maybe_host_id_or_ep->resolve_id(*_gossiper_anchor);
             } catch (...) {
                 return std::nullopt;
             }
@@ -822,7 +870,7 @@ future<> manager::migrate_ip_directories() {
                     continue;
                 }
 
-                const locator::host_id host_id = hid_or_ep.resolve_id(*tmptr);
+                const locator::host_id host_id = hid_or_ep.resolve_id(*_gossiper_anchor);
                 dirs_to_rename.push_back({.current_name = std::move(directory), .new_name = host_id.to_sstring()});
             } catch (...) {
                 // We cannot map the IP to the corresponding host ID either because

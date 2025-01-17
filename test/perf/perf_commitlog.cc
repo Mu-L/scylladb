@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <fstream>
 
 #include <fmt/ranges.h>
-#include <boost/range/irange.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <json/json.h>
@@ -30,6 +29,7 @@
 #include "db/config.hh"
 #include "db/extensions.hh"
 #include "db/commitlog/commitlog.hh"
+#include "utils/assert.hh"
 #include "utils/UUID_gen.hh"
 
 struct test_config {
@@ -120,7 +120,7 @@ struct commitlog_service {
     {}
 
     future<> init(const db::commitlog::config& cfg) {
-        assert(!log);
+        SCYLLA_ASSERT(!log);
         log.emplace(co_await db::commitlog::create_commitlog(cfg));
         fa.emplace(log->add_flush_handler(std::bind(&commitlog_service::flush_handler, this, std::placeholders::_1, std::placeholders::_2)));
     }
@@ -256,10 +256,10 @@ int main(int argc, char** argv) {
             auto median = median_result.throughput;
             auto min = results[0].throughput;
             auto max = results[results.size() - 1].throughput;
-            auto absolute_deviations = boost::copy_range<std::vector<double>>(
-                    results
-                    | boost::adaptors::transformed(std::mem_fn(&perf_result::throughput))
-                    | boost::adaptors::transformed([&] (double r) { return abs(r - median); }));
+            auto absolute_deviations = results
+                    | std::views::transform(std::mem_fn(&perf_result::throughput))
+                    | std::views::transform([&] (double r) { return abs(r - median); })
+                    | std::ranges::to<std::vector<double>>();
             std::sort(absolute_deviations.begin(), absolute_deviations.end());
             auto mad = absolute_deviations[results.size() / 2];
             std::cout << format("\nmedian {}\nmedian absolute deviation: {:.2f}\nmaximum: {:.2f}\nminimum: {:.2f}\n", median_result, mad, max, min);

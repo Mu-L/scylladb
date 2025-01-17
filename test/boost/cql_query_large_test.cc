@@ -3,19 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
 #include <boost/range/irange.hpp>
-#include <boost/range/adaptors.hpp>
 #include <boost/range/algorithm.hpp>
 #include <boost/test/unit_test.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
 
 #include <fmt/ranges.h>
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
@@ -29,6 +29,8 @@
 #include "db/config.hh"
 #include "compaction/compaction_manager.hh"
 #include "schema/schema_builder.hh"
+
+BOOST_AUTO_TEST_SUITE(cql_query_large_test)
 
 using namespace std::literals::chrono_literals;
 
@@ -125,7 +127,7 @@ SEASTAR_THREAD_TEST_CASE(test_large_data) {
         flush(e);
         e.db().invoke_on_all([] (replica::database& dbi) {
             return dbi.get_tables_metadata().parallel_for_each_table([&dbi] (table_id, lw_shared_ptr<replica::table> t) {
-                return dbi.get_compaction_manager().perform_major_compaction(t->try_get_table_state_with_static_sharding());
+                return dbi.get_compaction_manager().perform_major_compaction(t->try_get_table_state_with_static_sharding(), tasks::task_info{});
             });
         }).get();
 
@@ -196,3 +198,5 @@ SEASTAR_TEST_CASE(test_insert_large_collection_values) {
         });
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

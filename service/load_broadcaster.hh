@@ -4,11 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
+#include <seastar/core/distributed.hh>
+#include "utils/assert.hh"
 #include "replica/database_fwd.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
 #include "gms/gossiper.hh"
@@ -32,7 +34,7 @@ public:
         _gossiper.register_(shared_from_this());
     }
     ~load_broadcaster() {
-        assert(_stopped);
+        SCYLLA_ASSERT(_stopped);
     }
 
     virtual future<> on_change(gms::inet_address endpoint, const gms::application_state_map& states, gms::permit_id pid) override {

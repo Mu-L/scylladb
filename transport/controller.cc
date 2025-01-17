@@ -3,20 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include <grp.h>
 #include "transport/controller.hh"
 #include <seastar/core/sharded.hh>
 #include <seastar/net/socket_defs.hh>
 #include <seastar/net/unix_address.hh>
 #include <seastar/core/file-types.hh>
+#include <seastar/core/with_scheduling_group.hh>
 #include "transport/server.hh"
 #include "service/memory_limiter.hh"
 #include "db/config.hh"
 #include "gms/gossiper.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "cql3/query_processor.hh"
 
 using namespace seastar;
@@ -155,24 +157,16 @@ future<> controller::start_listening_on_maintenance_socket(sharded<cql_server>& 
         throw std::runtime_error(format("Maintenance socket path is too long: {}. Change it to string shorter than {} chars.", socket, max_socket_length));
     }
 
-    struct stat statbuf;
-    auto stat_result = ::stat(socket.c_str(), &statbuf);
-    if (stat_result == 0) {
-        // Check if it is a unix domain socket, not a regular file or directory
-        if (!S_ISSOCK(statbuf.st_mode)) {
+    auto file_exists = co_await seastar::file_exists(socket.c_str());
+    if (file_exists) {
+        auto f_stat = co_await seastar::file_stat(socket.c_str());
+        if (!S_ISSOCK(f_stat.mode)) {
             throw std::runtime_error(format("Under maintenance socket path ({}) there is something else.", socket));
         }
-    } else if (errno != ENOENT) {
-        // Other error than "file does not exist"
-        throw std::runtime_error(format("Failed to stat {}: {}", socket, strerror(errno)));
-    }
 
-    // Remove the socket if it already exists, otherwise when the server
-    // tries to listen on it, it will hang on bind().
-    auto unlink_result = ::unlink(socket.c_str());
-    if (unlink_result < 0 && errno != ENOENT) {
-        // Other error than "file does not exist"
-        throw std::runtime_error(format("Failed to unlink {}: {}", socket, strerror(errno)));
+        // Remove the socket if it already exists, otherwise when the server
+        // tries to listen on it, it will hang on bind().
+        co_await seastar::remove_file(socket.c_str());
     }
 
     auto addr = socket_address { unix_domain_addr { socket } };
@@ -188,18 +182,19 @@ future<> controller::start_listening_on_maintenance_socket(sharded<cql_server>& 
 
     if (_config.maintenance_socket_group.is_set()) {
         auto group_name = _config.maintenance_socket_group();
-        struct group *grp;
-        grp = ::getgrnam(group_name.c_str());
-        if (!grp) {
+        std::optional<struct group_details> grp = co_await seastar::getgrnam(group_name.c_str());
+
+        if (!grp.has_value()) {
             throw std::runtime_error(format("Group id of {} not found. Make sure the group exists.", group_name));
         }
 
-        auto chown_result = ::chown(socket.c_str(), ::geteuid(), grp->gr_gid);
-        if (chown_result < 0) {
-            if (errno == EPERM) {
+        try {
+            co_await seastar::chown(socket.c_str(), ::geteuid(), grp.value().group_id);
+        } catch(std::system_error& e) {
+            if (e.code().value() == EPERM) {
                 throw std::runtime_error(format("Failed to change group of {}: Permission denied. Make sure the user has the root privilege or is a member of the group {}.", socket, group_name));
             } else {
-                throw std::runtime_error(format("Failed to chown {}: {} ()", socket, strerror(errno)));
+                throw std::runtime_error(format("Failed to chown {}: {} ()", socket, strerror(e.code().value())));
             }
         }
     }
@@ -272,7 +267,7 @@ future<> controller::do_start_server() {
 }
 
 future<> controller::stop_server() {
-    assert(this_shard_id() == 0);
+    SCYLLA_ASSERT(this_shard_id() == 0);
 
     if (!_stopped) {
         co_await _ops_sem.wait();
@@ -329,18 +324,23 @@ future<> controller::do_stop_server() {
 }
 
 future<> controller::subscribe_server(sharded<cql_server>& server) {
-    return server.invoke_on_all([this] (cql_server& server) {
+    return server.invoke_on_all([this] (cql_server& server) -> future<> {
         _mnotifier.local().register_listener(server.get_migration_listener());
         _lifecycle_notifier.local().register_subscriber(server.get_lifecycle_listener());
-        return make_ready_future<>();
+        if (!_used_by_maintenance_socket) {
+            _sl_controller.local().register_subscriber(server.get_qos_configuration_listener());
+        }
+        co_return;
     });
 }
 
 future<> controller::unsubscribe_server(sharded<cql_server>& server) {
-    return server.invoke_on_all([this] (cql_server& server) {
-        return _mnotifier.local().unregister_listener(server.get_migration_listener()).then([this, &server]{
-            return _lifecycle_notifier.local().unregister_subscriber(server.get_lifecycle_listener());
-        });
+    return server.invoke_on_all([this] (cql_server& server) -> future<> {
+        co_await _mnotifier.local().unregister_listener(server.get_migration_listener());
+        co_await _lifecycle_notifier.local().unregister_subscriber(server.get_lifecycle_listener());
+        if (!_used_by_maintenance_socket) {
+            co_await _sl_controller.local().unregister_subscriber(server.get_qos_configuration_listener());
+        }
     });
 }
 
@@ -350,6 +350,31 @@ future<> controller::set_cql_ready(bool ready) {
 
 future<utils::chunked_vector<client_data>> controller::get_client_data() {
     return _server ? _server->local().get_client_data() : protocol_server::get_client_data();
+}
+
+future<> controller::update_connections_scheduling_group() {
+    if (!_server) {
+        co_return;
+    }
+
+    co_await _server->invoke_on_all([] (auto& server) {
+        return server.update_connections_scheduling_group();
+    });
+}
+
+future<std::vector<connection_service_level_params>> controller::get_connections_service_level_params() {
+    if (!_server) {
+        co_return std::vector<connection_service_level_params>();
+    }
+
+    auto sl_params_vectors = co_await _server->map([] (cql_server& server) {
+        return server.get_connections_service_level_params();
+    });    
+    std::vector<connection_service_level_params> sl_params;
+    for (auto& vec: sl_params_vectors) {
+        sl_params.insert(sl_params.end(), std::make_move_iterator(vec.begin()), std::make_move_iterator(vec.end()));
+    }
+    co_return sl_params;
 }
 
 } // namespace cql_transport

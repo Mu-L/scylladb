@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -113,10 +113,20 @@ extern std::mutex boost_logger_mutex;
 
 }
 
+namespace internal {
+
+template<typename Lhs, typename Rhs>
+concept has_left_shift = requires(Lhs& lhs, const Rhs& rhs) {
+    { lhs << rhs } -> std::same_as<Lhs&>;
+};
+
+}
+
 namespace std {
 
 template <typename T>
-requires fmt::is_formattable<T>::value
+requires (fmt::is_formattable<T>::value &&
+          !::internal::has_left_shift<std::ostream, T>)
 std::ostream& boost_test_print_type(std::ostream& os, const T& p) {
     fmt::print(os, "{}", p);
     return os;

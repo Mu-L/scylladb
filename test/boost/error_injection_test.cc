@@ -3,21 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/testing/on_internal_error.hh>
 #include "test/lib/cql_test_env.hh"
 #include <seastar/core/manual_clock.hh>
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/rpc/rpc_types.hh>
 #include "utils/error_injection.hh"
 #include "db/timeout_clock.hh"
 #include "test/lib/cql_assertions.hh"
 #include "test/lib/test_utils.hh"
 #include "types/list.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include <chrono>
+
+BOOST_AUTO_TEST_SUITE(error_injection_test)
 
 using namespace std::literals::chrono_literals;
 
@@ -121,23 +124,6 @@ SEASTAR_TEST_CASE(test_inject_sleep_deadline_manual_clock) {
         auto deadline = seastar::manual_clock::now() + sleep_msec;
         errinj.enable("future_deadline");
         auto f = errinj.inject("future_deadline", deadline).then([deadline] {
-            BOOST_REQUIRE_GE(seastar::manual_clock::now() - deadline,
-                             seastar::manual_clock::duration::zero());
-            return make_ready_future<>();
-        });
-        manual_clock::advance(sleep_msec);
-        f.get();
-    });
-}
-
-SEASTAR_TEST_CASE(test_inject_sleep_deadline_manual_clock_lambda) {
-    return do_with_cql_env_thread([] (cql_test_env& e) {
-        utils::error_injection<true> errinj;
-
-        // Inject sleep, deadline short-circuit
-        auto deadline = seastar::manual_clock::now() + sleep_msec;
-        errinj.enable("future_deadline");
-        auto f = errinj.inject("future_deadline", deadline, [deadline] {
             BOOST_REQUIRE_GE(seastar::manual_clock::now() - deadline,
                              seastar::manual_clock::duration::zero());
             return make_ready_future<>();
@@ -517,3 +503,5 @@ SEASTAR_TEST_CASE(test_inject_cql) {
         });
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

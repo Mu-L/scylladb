@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -16,8 +16,6 @@
 #include "utils/logalloc.hh"
 #include "utils/managed_vector.hh"
 
-#include <boost/range/algorithm/equal.hpp>
-#include <boost/version.hpp>
 #include <type_traits>
 #include <iterator>
 #include <utility>
@@ -263,7 +261,7 @@ public:
     std::reverse_iterator<const_iterator> crend() const { return std::reverse_iterator(cbegin()); }
 public:
     bool operator==(const chunked_managed_vector& x) const {
-        return boost::equal(*this, x);
+        return std::ranges::equal(*this, x);
     }
 
     // Returns the amount of external memory used to hold inserted items.

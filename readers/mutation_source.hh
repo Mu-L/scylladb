@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include "query-request.hh"
 #include "tracing/trace_state.hh"
 #include "readers/mutation_reader_fwd.hh"
@@ -35,7 +36,7 @@ partition_presence_checker make_default_partition_presence_checker() {
 // when invoking the source.
 //
 // When reading in reverse, a reverse schema has to be passed (compared to the
-// table's schema), and a half-reverse (legacy) slice.
+// table's schema), and a reverse (native) slice.
 // See docs/dev/reverse-reads.md for more details.
 // Partition-range forwarding is not yet supported in reverse mode.
 class mutation_source {
@@ -81,7 +82,7 @@ public:
                     tracing::trace_state_ptr,
                     streamed_mutation::forwarding fwd,
                     mutation_reader::forwarding) {
-        assert(!fwd);
+        SCYLLA_ASSERT(!fwd);
         return fn(std::move(s), std::move(permit), range, slice);
     }) {}
     mutation_source(std::function<mutation_reader(schema_ptr, reader_permit, partition_range range)> fn)
@@ -92,7 +93,7 @@ public:
                     tracing::trace_state_ptr,
                     streamed_mutation::forwarding fwd,
                     mutation_reader::forwarding) {
-        assert(!fwd);
+        SCYLLA_ASSERT(!fwd);
         return fn(std::move(s), std::move(permit), range);
     }) {}
 

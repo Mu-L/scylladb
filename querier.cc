@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/coroutine.hh>
@@ -12,7 +12,7 @@
 #include "dht/i_partitioner.hh"
 #include "reader_concurrency_semaphore.hh"
 #include "schema/schema.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "utils/error_injection.hh"
 
 #include <boost/range/adaptor/map.hpp>
@@ -386,7 +386,7 @@ std::optional<Querier> querier_cache::lookup_querier(
                     reinterpret_cast<uintptr_t>(&current_sem));
     }
     else if (can_be_used == can_use::no_fatal_semaphore_mismatch) {
-        on_internal_error(qlogger, format("semaphore mismatch detected, dropping reader {}: "
+        on_internal_error(qlogger, seastar::format("semaphore mismatch detected, dropping reader {}: "
                 "reader belongs to {} (0x{:x}) but the query class appropriate is {} (0x{:x})",
                 permit.description(),
                 q_semaphore_name,
@@ -441,6 +441,22 @@ future<> querier_base::close() noexcept {
         }
     };
     return std::visit(variant_closer{*this}, _reader);
+}
+
+thread_local logger::rate_limit querier::row_tombstone_warn_rate_limit{std::chrono::seconds(10)};
+thread_local logger::rate_limit querier::cell_tombstone_warn_rate_limit{std::chrono::seconds(10)};
+
+void querier::maybe_log_tombstone_warning(std::string_view what, uint64_t live, uint64_t dead, logger::rate_limit& rl) {
+    if (!_qr_config.tombstone_warn_threshold || dead < _qr_config.tombstone_warn_threshold) {
+        return;
+    }
+    if (_range->is_singular()) {
+        qrlogger.log(log_level::warn, rl, "Read {} live {} and {} dead {}/tombstones for {}.{} partition key \"{}\" {} (see tombstone_warn_threshold)",
+                      live, what, dead, what, _schema->ks_name(), _schema->cf_name(), _range->start()->value().key()->with_schema(*_schema), (*_range));
+    } else {
+        qrlogger.log(log_level::warn, rl, "Read {} live {} and {} dead {}/tombstones for {}.{} <partition-range-scan> {} (see tombstone_warn_threshold)",
+                      live, what, dead, what, _schema->ks_name(), _schema->cf_name(), (*_range));
+    }
 }
 
 void querier_cache::set_entry_ttl(std::chrono::seconds entry_ttl) {

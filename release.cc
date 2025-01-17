@@ -3,16 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include "version.hh"
 #include "build_mode.hh"
 
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
 
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 
 static const char scylla_product_str[] = SCYLLA_PRODUCT;
 static const char scylla_version_str[] = SCYLLA_VERSION;
@@ -40,7 +41,7 @@ std::string doc_link(std::string_view url_tail) {
         std::vector<std::string> components;
         boost::split(components, version, boost::algorithm::is_any_of("."));
         // Version is compiled into the binary, testing will step on this immediately.
-        assert(components.size() >= 2);
+        SCYLLA_ASSERT(components.size() >= 2);
         branch = fmt::format("branch-{}.{}", components[0], components[1]);
     }
 

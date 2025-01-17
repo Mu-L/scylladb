@@ -5,9 +5,10 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
+#include "utils/assert.hh"
 #include <seastar/core/coroutine.hh>
 #include "cql3/query_options.hh"
 #include "cql3/statements/alter_table_statement.hh"
@@ -20,8 +21,6 @@
 #include "timestamp.hh"
 #include "validation.hh"
 #include "db/extensions.hh"
-#include <boost/range/adaptor/filtered.hpp>
-#include <boost/range/adaptor/transformed.hpp>
 #include "cql3/util.hh"
 #include "view_info.hh"
 #include "data_dictionary/data_dictionary.hh"
@@ -138,11 +137,12 @@ static void validate_column_rename(data_dictionary::database db, const schema& s
     if (!schema.indices().empty()) {
         auto dependent_indices = db.find_column_family(schema.id()).get_index_manager().get_dependent_indices(*def);
         if (!dependent_indices.empty()) {
-            auto index_names = fmt::join(dependent_indices | boost::adaptors::transformed([](const index_metadata& im) {
-                return im.name();
-            }), ", ");
             throw exceptions::invalid_request_exception(
-                    format("Cannot rename column {} because it has dependent secondary indexes ({})", from, index_names));
+                    seastar::format("Cannot rename column {} because it has dependent secondary indexes ({})",
+                                    from,
+                                    fmt::join(dependent_indices | std::views::transform([](const index_metadata& im) {
+                                        return im.name();
+                                    }), ", ")));
         }
     }
 }
@@ -267,7 +267,7 @@ void alter_table_statement::drop_column(const query_options& options, const sche
             drop_timestamp = _attrs->get_timestamp(now, options);
         }
 
-        for (auto&& column_def : boost::range::join(schema.static_columns(), schema.regular_columns())) { // find
+        for (auto&& column_def : schema.static_and_regular_columns()) { // find
             if (column_def.name() == column_name.name()) {
                 cfm.remove_column(column_name.name(), drop_timestamp);
                 break;
@@ -304,7 +304,7 @@ std::pair<schema_builder, std::vector<view_ptr>> alter_table_statement::prepare_
 
     switch (_type) {
     case alter_table_statement::type::add:
-        assert(_column_changes.size());
+        SCYLLA_ASSERT(_column_changes.size());
         if (s->is_dense()) {
             throw exceptions::invalid_request_exception("Cannot add new column to a COMPACT STORAGE table");
         }
@@ -312,12 +312,12 @@ std::pair<schema_builder, std::vector<view_ptr>> alter_table_statement::prepare_
         break;
 
     case alter_table_statement::type::alter:
-        assert(_column_changes.size() == 1);
+        SCYLLA_ASSERT(_column_changes.size() == 1);
         invoke_column_change_fn(std::mem_fn(&alter_table_statement::alter_column));
         break;
 
     case alter_table_statement::type::drop:
-        assert(_column_changes.size());
+        SCYLLA_ASSERT(_column_changes.size());
         if (!s->is_cql3_table()) {
             throw exceptions::invalid_request_exception("Cannot drop columns from a non-CQL3 table");
         }
@@ -384,7 +384,8 @@ std::pair<schema_builder, std::vector<view_ptr>> alter_table_statement::prepare_
                     auto new_where = util::rename_column_in_where_clause(
                             view->view_info()->where_clause(),
                             column_identifier::raw(view_from->text(), true),
-                            column_identifier::raw(view_to->text(), true));
+                            column_identifier::raw(view_to->text(), true),
+                            cql3::dialect{});
                     builder.with_view_info(view->view_info()->base_id(), view->view_info()->base_name(),
                             view->view_info()->include_all_columns(), std::move(new_where));
 
@@ -454,7 +455,7 @@ alter_table_statement::raw_statement::prepare(data_dictionary::database db, cql_
     auto prepared_attrs = _attrs->prepare(db, keyspace(), column_family());
     prepared_attrs->fill_prepare_context(ctx);
 
-    return std::make_unique<prepared_statement>(::make_shared<alter_table_statement>(
+    return std::make_unique<prepared_statement>(audit_info(), ::make_shared<alter_table_statement>(
                 ctx.bound_variables_size(),
                 *_cf_name,
                 _type,

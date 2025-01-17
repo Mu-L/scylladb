@@ -3,16 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <iosfwd>
-
 #include "mutation_partition.hh"
 #include "keys.hh"
 #include "schema/schema_fwd.hh"
+#include "utils/assert.hh"
 #include "utils/hashing.hh"
 #include "mutation_fragment_v2.hh"
 #include "mutation_consumer.hh"
@@ -20,9 +19,8 @@
 #include "mutation/mutation_consumer_concepts.hh"
 #include "utils/preempt.hh"
 
+#include <seastar/util/later.hh>
 #include <seastar/util/optimized_optional.hh>
-#include <seastar/core/coroutine.hh>
-#include <seastar/coroutine/maybe_yield.hh>
 
 struct mutation_consume_cookie {
     using crs_iterator_type = mutation_partition::rows_type::iterator;
@@ -302,7 +300,7 @@ std::optional<stop_iteration> consume_clustering_fragments(schema_ptr s, mutatio
       if (crs_it == crs_end && rts_it == rts_end) {
         flush_tombstones(position_in_partition::after_all_clustered_rows());
       } else {
-        assert(preempt && need_preempt());
+        SCYLLA_ASSERT(preempt && need_preempt());
         return std::nullopt;
       }
     }
@@ -454,7 +452,7 @@ void apply(mutation& dst, const mutation_opt& src) {
 // Returns a range into partitions containing mutations covered by the range.
 // partitions must be sorted according to decorated key.
 // range must not wrap around.
-boost::iterator_range<std::vector<mutation>::const_iterator> slice(
+std::ranges::subrange<std::vector<mutation>::const_iterator> slice(
     const std::vector<mutation>& partitions,
     const dht::partition_range&);
 

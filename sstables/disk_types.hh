@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -87,7 +87,8 @@ struct disk_array_ref {
 
 template <typename Size, typename Key, typename Value>
 struct disk_hash {
-    std::unordered_map<Key, Value, std::hash<Key>> map;
+    using map_type = std::unordered_map<Key, Value, std::hash<Key>>;
+    map_type map;
 };
 
 template <typename TagType, TagType Tag, typename T>

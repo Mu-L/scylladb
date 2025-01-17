@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -366,12 +366,3 @@ struct fmt::formatter<cql3::cql3_type>: fmt::formatter<string_view> {
         return formatter<string_view>::format(format_as(t), ctx);
     }
 };
-
-#if FMT_VERSION < 100000
-template <std::derived_from<cql3::cql3_type::raw> T>
-struct fmt::formatter<T>: fmt::formatter<std::string_view> {
-    auto format(const T& t, fmt::format_context& ctx) const {
-        return formatter<std::string_view>::format(format_as(t), ctx);
-    }
-};
-#endif

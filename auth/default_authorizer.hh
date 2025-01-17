@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -26,7 +26,6 @@ namespace auth {
 
 class default_authorizer : public authorizer {
     cql3::query_processor& _qp;
-    ::service::raft_group0_client& _group0_client;
 
     ::service::migration_manager& _migration_manager;
 

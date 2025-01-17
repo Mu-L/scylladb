@@ -3,10 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
+#include "utils/assert.hh"
 #include "raft.hh"
 
 namespace raft {
@@ -78,12 +79,12 @@ public:
             // All log entries following the snapshot must
             // be present, otherwise we will not be able to
             // perform an initial state transfer.
-            assert(_first_idx <= _snapshot.idx + 1);
+            SCYLLA_ASSERT(_first_idx <= _snapshot.idx + index_t{1});
         }
         _memory_usage = range_memory_usage(_log.begin(), _log.end());
         // The snapshot index is at least 0, so _first_idx
         // is at least 1
-        assert(_first_idx > 0);
+        SCYLLA_ASSERT(_first_idx > index_t{0});
         stable_to(last_idx());
         init_last_conf_idx();
     }
@@ -130,11 +131,17 @@ public:
         return _snapshot;
     }
 
-    // This call will update the log to point to the new snapshot
-    // and will truncate the log prefix so that the number of
-    // remaining applied entries is <= max_trailing_entries and their total size is <= max_trailing_bytes.
-    // Return value specifies the size in bytes of the dropped log entries.
-    size_t apply_snapshot(snapshot_descriptor&& snp, size_t max_trailing_entries, size_t max_trailing_bytes);
+    // This call will update the log to point to the new snapshot and will truncate the log prefix so that
+    // the number of remaining applied entries is <= max_trailing_entries and their total
+    // size is <= max_trailing_bytes.
+    // Please note: the number of remaining items includes the snapshot index item, so a trailing entry
+    // index is smaller or equal to the snapshot index. In case there are no trailing entries, the
+    // first index in the log will be the snapshot index + 1, even if the log contains no entries, only
+    // the snapshot.
+    // Return: the value that specifies the size in bytes of the dropped log entries and the first index
+    //         in the log after truncation
+    std::tuple<size_t, index_t> apply_snapshot(snapshot_descriptor&& snp, size_t max_trailing_entries,
+        size_t max_trailing_bytes);
 
     // 3.5
     // Raft maintains the following properties, which

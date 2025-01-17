@@ -3,18 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <seastar/core/sstring.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/shared_future.hh>
 #include <seastar/core/sharded.hh>
 #include <unordered_map>
 #include <functional>
 #include <set>
+#include <unordered_set>
 #include "seastarx.hh"
 #include "db/schema_features.hh"
 #include "gms/feature.hh"
@@ -63,10 +63,14 @@ class feature_service final : public peering_sharded_service<feature_service> {
     void unregister_feature(feature& f);
     friend class feature;
     std::unordered_map<sstring, std::reference_wrapper<feature>> _registered_features;
+    std::unordered_set<sstring> _suppressed_features;
 
     feature_config _config;
 
     future<> enable_features_on_startup(db::system_keyspace&);
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+    void initialize_suppressed_features_set();
+#endif
 public:
     explicit feature_service(feature_config cfg);
     ~feature_service() = default;
@@ -112,6 +116,7 @@ public:
     gms::feature collection_indexing { *this, "COLLECTION_INDEXING"sv };
     gms::feature large_collection_detection { *this, "LARGE_COLLECTION_DETECTION"sv };
     gms::feature range_tombstone_and_dead_rows_detection { *this, "RANGE_TOMBSTONE_AND_DEAD_ROWS_DETECTION"sv };
+    gms::feature truncate_as_topology_operation { *this, "TRUNCATE_AS_TOPOLOGY_OPERATION"sv };
     gms::feature secondary_indexes_on_static_columns { *this, "SECONDARY_INDEXES_ON_STATIC_COLUMNS"sv };
     gms::feature tablets { *this, "TABLETS"sv };
     gms::feature uuid_sstable_identifiers { *this, "UUID_SSTABLE_IDENTIFIERS"sv };
@@ -126,12 +131,35 @@ public:
     gms::feature group0_schema_versioning { *this, "GROUP0_SCHEMA_VERSIONING"sv };
     gms::feature supports_consistent_topology_changes { *this, "SUPPORTS_CONSISTENT_TOPOLOGY_CHANGES"sv };
     gms::feature host_id_based_hinted_handoff { *this, "HOST_ID_BASED_HINTED_HANDOFF"sv };
+    gms::feature topology_requests_type_column { *this, "TOPOLOGY_REQUESTS_TYPE_COLUMN"sv };
+    gms::feature native_reverse_queries { *this, "NATIVE_REVERSE_QUERIES"sv };
+    gms::feature zero_token_nodes { *this, "ZERO_TOKEN_NODES"sv };
+    gms::feature view_build_status_on_group0 { *this, "VIEW_BUILD_STATUS_ON_GROUP0"sv };
+    gms::feature views_with_tablets { *this, "VIEWS_WITH_TABLETS"sv };
+
+    // Whether to allow fragmented commitlog entries. While this is a node-local feature as such, hide
+    // behind a feature to ensure an upgrading cluster appears to be at least functional before using,
+    // to avoid data loss if rolling back in a dirty state, but also because it changes which/how mutations
+    // can be applied to a given node - i.e. with it on, a node can accept larger, say, schema mutations,
+    // whereas without it, it will fail the insert - i.e. for things like raft etc _all_ nodes should
+    // have it or none, otherwise we can get partial failures on writes.
+    gms::feature fragmented_commitlog_entries { *this, "FRAGMENTED_COMMITLOG_ENTRIES"sv };
+    gms::feature maintenance_tenant { *this, "MAINTENANCE_TENANT"sv };
+
+    gms::feature tablet_repair_scheduler { *this, "TABLET_REPAIR_SCHEDULER"sv };
+    gms::feature tablet_merge { *this, "TABLET_MERGE"sv };
+
+    gms::feature tablet_migration_virtual_task { *this, "TABLET_MIGRATION_VIRTUAL_TASK"sv };
+    gms::feature tablet_resize_virtual_task { *this, "TABLET_RESIZE_VIRTUAL_TASK"sv };
 
     // A feature just for use in tests. It must not be advertised unless
     // the "features_enable_test_feature" injection is enabled.
     // This feature MUST NOT be advertised in release mode!
     gms::feature test_only_feature { *this, "TEST_ONLY_FEATURE"sv };
+    gms::feature address_nodes_by_host_ids { *this, "ADDRESS_NODES_BY_HOST_IDS"sv };
 
+    gms::feature workload_prioritization { *this, "WORKLOAD_PRIORITIZATION"sv };
+    gms::feature compression_dicts { *this, "COMPRESSION_DICTS"sv };
 public:
 
     const std::unordered_map<sstring, std::reference_wrapper<feature>>& registered_features() const;

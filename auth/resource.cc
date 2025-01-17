@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "auth/resource.hh"
@@ -15,7 +15,6 @@
 #include <iterator>
 #include <unordered_map>
 
-#include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
 
@@ -23,7 +22,7 @@
 #include "cql3/functions/user_function.hh"
 #include "cql3/util.hh"
 #include "db/marshal/type_parser.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace auth {
 
@@ -148,7 +147,7 @@ resource::resource(functions_resource_t, std::string_view keyspace, std::string_
 }
 
 sstring resource::name() const {
-    return boost::algorithm::join(_parts, "/");
+    return fmt::to_string(fmt::join(_parts, "/"));
 }
 
 std::optional<resource> resource::parent() const {
@@ -193,8 +192,8 @@ service_level_resource_view::service_level_resource_view(const resource &r) {
 }
 
 sstring encode_signature(std::string_view name, std::vector<data_type> args) {
-    return format("{}[{}]", name,
-            fmt::join(args | boost::adaptors::transformed([] (const data_type t) {
+    return seastar::format("{}[{}]", name,
+            fmt::join(args | std::views::transform([] (const data_type t) {
                 return t->name();
             }), "^"));
 }
@@ -209,11 +208,10 @@ std::pair<sstring, std::vector<data_type>> decode_signature(std::string_view enc
     }
     std::vector<std::string_view> raw_types;
     boost::split(raw_types, encoded_signature, boost::is_any_of("^"));
-    std::vector<data_type> decoded_types = boost::copy_range<std::vector<data_type>>(
-        raw_types | boost::adaptors::transformed([] (std::string_view raw_type) {
+    std::vector<data_type> decoded_types =
+        raw_types | std::views::transform([] (std::string_view raw_type) {
             return db::marshal::type_parser::parse(raw_type);
-        })
-    );
+        }) | std::ranges::to<std::vector>();
     return {sstring(function_name), decoded_types};
 }
 
@@ -222,8 +220,8 @@ std::pair<sstring, std::vector<data_type>> decode_signature(std::string_view enc
 // to the short form (int)
 static sstring decoded_signature_string(std::string_view encoded_signature) {
     auto [function_name, arg_types] = decode_signature(encoded_signature);
-    return format("{}({})", cql3::util::maybe_quote(sstring(function_name)),
-            boost::algorithm::join(arg_types | boost::adaptors::transformed([] (data_type t) {
+    return seastar::format("{}({})", cql3::util::maybe_quote(sstring(function_name)),
+            fmt::join(arg_types | std::views::transform([] (data_type t) {
                 return t->cql3_type_name();
             }), ", "));
 }

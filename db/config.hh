@@ -4,16 +4,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <boost/program_options.hpp>
+#include <boost/program_options/options_description.hpp>
 #include <unordered_map>
 
 #include <seastar/core/sstring.hh>
-#include <seastar/core/shared_ptr.hh>
 #include <seastar/util/program-options.hh>
 #include <seastar/util/log.hh>
 
@@ -21,12 +20,13 @@
 #include "seastarx.hh"
 #include "utils/config_file.hh"
 #include "utils/enum_option.hh"
-#include "locator/host_id.hh"
 #include "gms/inet_address.hh"
 #include "db/hints/host_filter.hh"
 #include "utils/updateable_value.hh"
 #include "utils/s3/creds.hh"
 #include "utils/error_injection.hh"
+#include "utils/dict_trainer.hh"
+#include "utils/advanced_rpc_compressor.hh"
 
 namespace seastar {
 class file;
@@ -109,6 +109,7 @@ struct experimental_features_t {
         ALTERNATOR_STREAMS,
         BROADCAST_TABLES,
         KEYSPACE_STORAGE_OPTIONS,
+        VIEWS_WITH_TABLETS
     };
     static std::map<sstring, feature> map(); // See enum_option.
     static std::vector<enum_option<experimental_features_t>> all();
@@ -212,11 +213,13 @@ public:
     named_value<uint32_t> schema_commitlog_segment_size_in_mb;
     named_value<uint32_t> commitlog_sync_period_in_ms;
     named_value<uint32_t> commitlog_sync_batch_window_in_ms;
+    named_value<uint32_t> commitlog_max_data_lifetime_in_seconds;
     named_value<int64_t> commitlog_total_space_in_mb;
     named_value<bool> commitlog_reuse_segments; // unused. retained for upgrade compat
     named_value<int64_t> commitlog_flush_threshold_in_mb;
     named_value<bool> commitlog_use_o_dsync;
     named_value<bool> commitlog_use_hard_size_limit;
+    named_value<bool> commitlog_use_fragmented_entries;
     named_value<bool> compaction_preheat_key_cache;
     named_value<uint32_t> concurrent_compactors;
     named_value<uint32_t> in_memory_compaction_limit_in_mb;
@@ -266,6 +269,7 @@ public:
     named_value<uint32_t> tombstone_failure_threshold;
     named_value<uint64_t> query_tombstone_page_limit;
     named_value<uint64_t> query_page_size_in_bytes;
+    named_value<uint32_t> group0_tombstone_gc_refresh_interval_in_ms;
     named_value<uint32_t> range_request_timeout_in_ms;
     named_value<uint32_t> read_request_timeout_in_ms;
     named_value<uint32_t> counter_write_request_timeout_in_ms;
@@ -277,6 +281,18 @@ public:
     named_value<uint32_t> internode_send_buff_size_in_bytes;
     named_value<uint32_t> internode_recv_buff_size_in_bytes;
     named_value<sstring> internode_compression;
+    named_value<float> internode_compression_zstd_max_cpu_fraction;
+    named_value<uint32_t> internode_compression_zstd_cpu_quota_refresh_period_ms;
+    named_value<float> internode_compression_zstd_max_longterm_cpu_fraction;
+    named_value<uint32_t> internode_compression_zstd_longterm_cpu_quota_refresh_period_ms;
+    named_value<uint32_t> internode_compression_zstd_min_message_size;
+    named_value<uint32_t> internode_compression_zstd_max_message_size;
+    named_value<bool> internode_compression_checksumming;
+    named_value<utils::advanced_rpc_compressor::tracker::algo_config> internode_compression_algorithms;
+    named_value<bool> internode_compression_enable_advanced;
+    named_value<enum_option<utils::dict_training_loop::when>> rpc_dict_training_when;
+    named_value<uint32_t> rpc_dict_training_min_time_seconds;
+    named_value<uint64_t> rpc_dict_training_min_bytes;
     named_value<bool> inter_dc_tcp_nodelay;
     named_value<uint32_t> streaming_socket_timeout_in_ms;
     named_value<bool> start_native_transport;
@@ -303,6 +319,7 @@ public:
     named_value<uint32_t> max_hint_window_in_ms;
     named_value<uint32_t> max_hints_delivery_threads;
     named_value<uint32_t> batchlog_replay_throttle_in_kb;
+    named_value<uint32_t> batchlog_replay_cleanup_after_replays;
     named_value<sstring> request_scheduler;
     named_value<sstring> request_scheduler_id;
     named_value<string_map> request_scheduler_options;
@@ -337,7 +354,12 @@ public:
     named_value<bool> enable_repair_based_node_ops;
     named_value<sstring> allowed_repair_based_node_ops;
     named_value<bool> enable_compacting_data_for_streaming_and_repair;
+    named_value<bool> enable_tombstone_gc_for_streaming_and_repair;
     named_value<double> repair_partition_count_estimation_ratio;
+    named_value<uint32_t> repair_hints_batchlog_flush_cache_time_in_ms;
+    named_value<uint64_t> repair_multishard_reader_buffer_hint_size;
+    named_value<uint64_t> repair_multishard_reader_enable_read_ahead;
+    named_value<bool> enable_small_table_optimization_for_rbno;
     named_value<uint32_t> ring_delay_ms;
     named_value<uint32_t> shadow_round_ms;
     named_value<uint32_t> fd_max_interval_ms;
@@ -381,6 +403,9 @@ public:
     named_value<uint32_t> reader_concurrency_semaphore_serialize_limit_multiplier;
     named_value<uint32_t> reader_concurrency_semaphore_kill_limit_multiplier;
     named_value<uint32_t> reader_concurrency_semaphore_cpu_concurrency;
+    named_value<uint32_t> view_update_reader_concurrency_semaphore_serialize_limit_multiplier;
+    named_value<uint32_t> view_update_reader_concurrency_semaphore_kill_limit_multiplier;
+    named_value<uint32_t> view_update_reader_concurrency_semaphore_cpu_concurrency;
     named_value<int> maintenance_reader_concurrency_semaphore_count_limit;
     named_value<uint32_t> twcs_max_window_count;
     named_value<unsigned> initial_sstable_loading_concurrency;
@@ -394,10 +419,9 @@ public:
     named_value<bool> cdc_dont_rewrite_streams;
     named_value<tri_mode_restriction> strict_allow_filtering;
     named_value<tri_mode_restriction> strict_is_not_null_in_views;
-    named_value<bool> reversed_reads_auto_bypass_cache;
-    named_value<bool> enable_optimized_reversed_reads;
     named_value<bool> enable_cql_config_updates;
     named_value<bool> enable_parallelized_aggregation;
+    named_value<bool> cql_duplicate_bind_variable_names_refer_to_same_variable;
 
     named_value<uint16_t> alternator_port;
     named_value<uint16_t> alternator_https_port;
@@ -433,6 +457,7 @@ public:
     named_value<bool> force_schema_commit_log;
 
     named_value<uint32_t> task_ttl_seconds;
+    named_value<uint32_t> user_task_ttl_seconds;
     named_value<uint32_t> nodeops_watchdog_timeout_seconds;
     named_value<uint32_t> nodeops_heartbeat_interval_seconds;
 
@@ -479,6 +504,19 @@ public:
 
     named_value<uint32_t> service_levels_interval;
 
+    named_value<sstring> audit;
+    named_value<sstring> audit_categories;
+    named_value<sstring> audit_tables;
+    named_value<sstring> audit_keyspaces;
+    named_value<sstring> audit_unix_socket_path;
+    named_value<size_t> audit_syslog_write_buffer_size;
+
+    named_value<sstring> ldap_url_template;
+    named_value<sstring> ldap_attr_role;
+    named_value<sstring> ldap_bind_dn;
+    named_value<sstring> ldap_bind_passwd;
+    named_value<sstring> saslauthd_socket_path;
+
     seastar::logging_settings logging_settings(const log_cli::options&) const;
 
     const db::extensions& extensions() const;
@@ -488,6 +526,11 @@ public:
     named_value<std::vector<error_injection_at_startup>> error_injections_at_startup;
     named_value<double> topology_barrier_stall_detector_threshold_seconds;
     named_value<bool> enable_tablets;
+    named_value<uint32_t> view_flow_control_delay_limit_in_ms;
+
+    named_value<int> disk_space_monitor_normal_polling_interval_in_seconds;
+    named_value<int> disk_space_monitor_high_polling_interval_in_seconds;
+    named_value<float> disk_space_monitor_polling_interval_threshold;
 
     static const sstring default_tls_priority;
 private:
@@ -543,6 +586,6 @@ future<gms::inet_address> resolve(const config_file::named_value<sstring>&, gms:
  */
 future<> update_relabel_config_from_file(const std::string& name);
 
-std::vector<sstring> split_comma_separated_list(sstring comma_separated_list);
+std::vector<sstring> split_comma_separated_list(std::string_view comma_separated_list);
 
-}
+} // namespace utils

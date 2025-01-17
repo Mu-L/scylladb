@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,6 +12,8 @@
 #include <seastar/json/json_elements.hh>
 #include "api/api_init.hh"
 #include "db/data_listeners.hh"
+#include "compaction/compaction_descriptor.hh"
+#include "gms/gossip_address_map.hh"
 
 namespace cql_transport { class controller; }
 namespace db {
@@ -73,9 +75,9 @@ void set_storage_service(http_context& ctx, httpd::routes& r, sharded<service::s
 void unset_storage_service(http_context& ctx, httpd::routes& r);
 void set_sstables_loader(http_context& ctx, httpd::routes& r, sharded<sstables_loader>& sst_loader);
 void unset_sstables_loader(http_context& ctx, httpd::routes& r);
-void set_view_builder(http_context& ctx, httpd::routes& r, sharded<db::view::view_builder>& vb);
+void set_view_builder(http_context& ctx, httpd::routes& r, sharded<db::view::view_builder>& vb, sharded<gms::gossiper>& g);
 void unset_view_builder(http_context& ctx, httpd::routes& r);
-void set_repair(http_context& ctx, httpd::routes& r, sharded<repair_service>& repair);
+void set_repair(http_context& ctx, httpd::routes& r, sharded<repair_service>& repair, sharded<gms::gossip_address_map>& am);
 void unset_repair(http_context& ctx, httpd::routes& r);
 void set_transport_controller(http_context& ctx, httpd::routes& r, cql_transport::controller& ctl);
 void unset_transport_controller(http_context& ctx, httpd::routes& r);

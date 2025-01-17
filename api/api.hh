@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -219,11 +219,10 @@ template <class T, class Base = T>
 class req_param {
 public:
     sstring name;
-    sstring param;
     T value;
 
     req_param(const request& req, sstring name, T default_val) : name(name) {
-        param = req.get_query_param(name);
+        sstring param = req.get_query_param(name);
         if (param.empty()) {
             value = default_val;
             return;
@@ -246,7 +245,7 @@ public:
                 value = T{boost::lexical_cast<Base>(param)};
             }
         } catch (boost::bad_lexical_cast&) {
-            throw httpd::bad_param_exception(format("{} ({}): type error - should be {}", name, param, boost::units::detail::demangle(typeid(Base).name())));
+            throw httpd::bad_param_exception(fmt::format("{} ({}): type error - should be {}", name, param, boost::units::detail::demangle(typeid(Base).name())));
         }
     }
 

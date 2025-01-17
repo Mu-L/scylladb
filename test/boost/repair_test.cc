@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "replica/memtable.hh"
@@ -18,9 +18,13 @@
 #include "test/lib/cql_test_env.hh"
 #include "service/storage_proxy.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include "test/lib/sstable_utils.hh"
 #include "readers/mutation_fragment_v1_stream.hh"
+#include "schema/schema_registry.hh"
+
+BOOST_AUTO_TEST_SUITE(repair_test)
 
 // Helper mutation_fragment_queue that stores the received stream of
 // mutation_fragments in a passed in deque of mutation_fragment_v2.
@@ -88,6 +92,7 @@ repair_rows_on_wire make_random_repair_rows_on_wire(random_mutation_generator& g
         auto m2 = make_memtable(s, {mut});
         m->apply(mut);
         auto reader = mutation_fragment_v1_stream(m2->make_flat_reader(s, permit));
+        auto close_reader = deferred_close(reader);
         std::list<frozen_mutation_fragment> mfs;
         reader.consume_pausable([s, &mfs](mutation_fragment mf) {
             if ((mf.is_partition_start() && !mf.as_partition_start().partition_tombstone()) || mf.is_end_of_partition()) {
@@ -267,3 +272,5 @@ SEASTAR_TEST_CASE(repair_rows_size_considers_external_memory) {
         BOOST_REQUIRE_EQUAL(row_with_boundary.size(), fmf_size + boundary.pk.external_memory_usage() + boundary.position.external_memory_usage() + sizeof(repair_row));
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

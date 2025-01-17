@@ -116,7 +116,7 @@ name                 kind       mandatory   default   description
                                                       details below).
 ``durable_writes``   *simple*   no          true      Whether to use the commit log for updates on this keyspace
                                                       (disable this option at your own risk!).
-``tablets``          *map*      no                    Enables or disables tablets for the keyspace (see :ref:`tablets<tablets>`)
+``tablets``          *map*      no                    Enables or disables tablets for the keyspace (see :ref:`tablets <tablets>`)
 =================== ========== =========== ========= ===================================================================
 
 The ``replication`` property is mandatory and must at least contains the ``'class'`` sub-option, which defines the
@@ -213,7 +213,7 @@ An example that excludes a datacenter while using ``replication_factor``::
   By default, SStables of a keyspace are stored locally.
   As an alternative, you can configure your keyspace to be stored
   on Amazon S3 or another S3-compatible object store.
-  See :ref:`Keyspace storage options <keyspace-storage-options>` for details.
+  See :ref:`Keyspace storage options <admin-keyspace-storage-options>` for details.
 
 .. _tablets:
 
@@ -232,9 +232,7 @@ sub-option                             type  description
 ``'initial'``                          int   The number of tablets to start with
 ===================================== ====== =============================================
 
-By default, a keyspace is created with tablets enabled. The ``tablets`` option 
-is used to opt out a keyspace from tablets-based distribution; see :ref:`Enabling Tablets <tablets-enable-tablets>`
-for details.
+.. scylladb_include_flag:: tablets-default.rst
 
 A good rule of thumb to calculate initial tablets is to divide the expected total storage used
 by tables in this keyspace by (``replication_factor`` * 5GB). For example, if you expect a 30TB
@@ -686,6 +684,18 @@ A table supports the following options:
      - simple
      - 0
      - The default expiration time (“TTL”) in seconds for a table.
+   * - ``memtable_flush_period_in_ms``
+     - simple
+     - 0
+     - Flush the memtables associated with this table every ``memtable_flush_period_in_ms`` milliseconds. When set to ``0``, periodic flush is disabled. Cannot set to values lower than ``60000`` (1 minute). Default: ``0``.
+   * - ``min_index_interval``
+     - simple
+     - 128
+     - Minimum gap between summary entries: ScyllaDB will create summary entries with at least this amount of partitions between them. Controls the maximums density of the summary.
+   * - ``max_index_interval``
+     - simple
+     - 2048
+     - Not implemented (option value is ignored).
    * - ``compaction``
      - map
      - see below
@@ -746,7 +756,7 @@ Custom strategy can be provided by specifying the full class name as a :ref:`str
 <constants>`.
 
 All default strategies support a number of common options, as well as options specific to
-the strategy chosen (see the section corresponding to your strategy for details: :ref:`STCS <stcs-options>`, :ref:`LCS <lcs-options>`, and :ref:`TWCS <twcs-options>`).
+the strategy chosen (see the section corresponding to your strategy for details: :ref:`STCS <stcs-options>`, :ref:`LCS <lcs-options>`, :ref:`ICS <ics-options>`, and :ref:`TWCS <twcs-options>`).
 
 .. _cql-compression-options:
 
@@ -759,22 +769,16 @@ available:
 ========================= =============== =============================================================================
  Option                    Default         Description
 ========================= =============== =============================================================================
- ``sstable_compression``   LZ4Compressor   The compression algorithm to use. Default compressors are
-                                           LZ4Compressor, SnappyCompressor, and DeflateCompressor.
-                                           A custom compressor can be provided by specifying the full class
-                                           name as a “string constant”:#constants.
+ ``sstable_compression``   LZ4Compressor   The compression algorithm to use. Available compressors are
+                                           LZ4Compressor, SnappyCompressor, DeflateCompressor, and ZstdCompressor.
  ``chunk_length_in_kb``    4               On disk SSTables are compressed by block (to allow random reads). This
                                            defines the size (in KB) of the block. Bigger values may improve the
                                            compression rate, but increases the minimum size of data to be read from disk
                                            for a read. Allowed values are powers of two between 1 and 128.
+ ``crc_check_chance``      1.0             Not implemented (option value is ignored).
 ========================= =============== =============================================================================
 
-.. ``crc_check_chance``      1.0             When compression is enabled, each compressed block includes a checksum of
-..                                           that block for the purpose of detecting disk bitrot and avoiding the
-..                                           propagation of corruption to other replicas. This option defines the
-..                                           probability with which those checksums are checked during read. By default
-..                                           they are always checked. Set to 0 to disable checksum checking and to 0.5 for
-..                                           instance to check them every other read   |
+.. crc_check_chance was promoted to a top-level table option since Cassandra 3.0, but we didn't do this.
 
 For example, to enable compression:
 

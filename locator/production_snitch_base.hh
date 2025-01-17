@@ -5,11 +5,12 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <unordered_map>
 #include <unordered_set>
 
@@ -73,17 +74,17 @@ protected:
     std::unordered_map<sstring, sstring> _prop_values;
 
     sharded<snitch_ptr>& container() noexcept {
-        assert(_backreference != nullptr);
+        SCYLLA_ASSERT(_backreference != nullptr);
         return _backreference->container();
     }
 
     snitch_ptr& local() noexcept {
-        assert(_backreference != nullptr);
+        SCYLLA_ASSERT(_backreference != nullptr);
         return *_backreference;
     }
 
     const snitch_ptr& local() const noexcept {
-        assert(_backreference != nullptr);
+        SCYLLA_ASSERT(_backreference != nullptr);
         return *_backreference;
     }
 

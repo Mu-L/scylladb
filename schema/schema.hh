@@ -3,17 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "cql3/description.hh"
+#include "utils/assert.hh"
 #include <functional>
 #include <optional>
 #include <unordered_map>
-#include <boost/range/iterator_range.hpp>
-#include <boost/range/join.hpp>
-#include <boost/lexical_cast.hpp>
+#include <ranges>
 #include <boost/dynamic_bitset.hpp>
 
 #include "cql3/column_specification.hh"
@@ -31,7 +31,6 @@
 #include "tombstone_gc_options.hh"
 #include "db/per_partition_rate_limit_options.hh"
 #include "schema_fwd.hh"
-#include "data_dictionary/keyspace_element.hh"
 
 namespace dht {
 
@@ -46,7 +45,6 @@ class options;
 }
 
 namespace replica {
-class database;
 class table;
 }
 
@@ -164,50 +162,8 @@ private:
 public:
     speculative_retry(type t, double v) : _t(t), _v(v) {}
 
-    sstring to_sstring() const {
-        if (_t == type::NONE) {
-            return "NONE";
-        } else if (_t == type::ALWAYS) {
-            return "ALWAYS";
-        } else if (_t == type::CUSTOM) {
-            return format("{:.2f}ms", _v);
-        } else if (_t == type::PERCENTILE) {
-            return format("{:.1f}PERCENTILE", 100 * _v);
-        } else {
-            throw std::invalid_argument(format("unknown type: {:d}\n", uint8_t(_t)));
-        }
-    }
-    static speculative_retry from_sstring(sstring str) {
-        std::transform(str.begin(), str.end(), str.begin(), ::toupper);
-
-        sstring ms("MS");
-        sstring percentile("PERCENTILE");
-
-        auto convert = [&str] (sstring& t) {
-            try {
-                return boost::lexical_cast<double>(str.substr(0, str.size() - t.size()));
-            } catch (boost::bad_lexical_cast& e) {
-                throw std::invalid_argument(format("cannot convert {} to speculative_retry\n", str));
-            }
-        };
-
-        type t;
-        double v = 0;
-        if (str == "NONE") {
-            t = type::NONE;
-        } else if (str == "ALWAYS") {
-            t = type::ALWAYS;
-        } else if (str.compare(str.size() - ms.size(), ms.size(), ms) == 0) {
-            t = type::CUSTOM;
-            v = convert(ms);
-        } else if (str.compare(str.size() - percentile.size(), percentile.size(), percentile) == 0) {
-            t = type::PERCENTILE;
-            v = convert(percentile) / 100;
-        } else {
-            throw std::invalid_argument(format("cannot convert {} to speculative_retry\n", str));
-        }
-        return speculative_retry(t, v);
-    }
+    sstring to_sstring() const;
+    static speculative_retry from_sstring(sstring str);
     type get_type() const {
         return _t;
     }
@@ -356,7 +312,7 @@ public:
         return is_primary_key();
     }
     uint32_t component_index() const {
-        assert(has_component_index());
+        SCYLLA_ASSERT(has_component_index());
         return id;
     }
     uint32_t position() const {
@@ -517,6 +473,9 @@ class partition_slice;
 class schema_extension {
 public:
     virtual ~schema_extension() {};
+    virtual future<> validate(const schema&) const {
+        return make_ready_future<>();
+    }
     virtual bytes serialize() const = 0;
     virtual bool is_placeholder() const {
         return false;
@@ -535,6 +494,15 @@ struct schema_static_props {
         use_schema_commitlog = true;
         use_null_sharder = true; // schema commitlog lives only on the null shard
     }
+    bool is_group0_table = false; // the table is a group 0 table
+};
+
+class schema_describe_helper {
+public:
+    virtual bool is_global_index(const table_id& base_id, const schema& view_s) const = 0;
+    virtual bool is_index(const table_id& base_id, const schema& view_s) const = 0;
+    virtual schema_ptr find_schema(const table_id& id) const = 0;
+    virtual ~schema_describe_helper() = default;
 };
 
 /*
@@ -542,7 +510,7 @@ struct schema_static_props {
  * Not safe to access across cores because of shared_ptr's.
  * Use global_schema_ptr for safe across-shard access.
  */
-class schema final : public enable_lw_shared_from_this<schema>, public data_dictionary::keyspace_element {
+class schema final : public enable_lw_shared_from_this<schema> {
     friend class v3_columns;
 public:
     struct dropped_column {
@@ -586,7 +554,7 @@ private:
         int32_t _memtable_flush_period = 0;
         ::speculative_retry _speculative_retry = ::speculative_retry(speculative_retry::type::PERCENTILE, 0.99);
         // This is the compaction strategy that will be used by default on tables which don't have one explicitly specified.
-        sstables::compaction_strategy_type _compaction_strategy = sstables::compaction_strategy_type::size_tiered;
+        sstables::compaction_strategy_type _compaction_strategy = sstables::compaction_strategy_type::incremental;
         std::map<sstring, sstring> _compaction_strategy_options;
         bool _compaction_enabled = true;
         ::caching_options _caching_options;
@@ -598,6 +566,7 @@ private:
         // Sharding info is not stored in the schema mutation and does not affect
         // schema digest. It is also not set locally on a schema tables.
         std::reference_wrapper<const dht::static_sharder> _sharder;
+        std::optional<raw_view_info> _view_info;
     };
     raw_schema _raw;
     schema_static_props _static_props;
@@ -620,6 +589,8 @@ private:
     column_count_type _regular_column_count;
     column_count_type _static_column_count;
 
+    std::vector<const column_definition*> _all_columns_in_select_order;
+
     extensions_map& extensions() {
         return _raw._extensions;
     }
@@ -632,8 +603,8 @@ public:
     typedef std::vector<column_definition> columns_type;
     typedef typename columns_type::iterator iterator;
     typedef typename columns_type::const_iterator const_iterator;
-    typedef boost::iterator_range<iterator> iterator_range_type;
-    typedef boost::iterator_range<const_iterator> const_iterator_range_type;
+    typedef std::ranges::subrange<iterator> iterator_range_type;
+    typedef std::ranges::subrange<const_iterator> const_iterator_range_type;
 
     static constexpr int32_t NAME_LENGTH = 48;
 
@@ -647,10 +618,11 @@ private:
 
     lw_shared_ptr<cql3::column_specification> make_column_specification(const column_definition& def) const;
     void rebuild();
+    void compute_all_columns_in_select_order();
     schema(const schema&, const std::function<void(schema&)>&);
     class private_tag{};
 public:
-    schema(private_tag, const raw_schema&, std::optional<raw_view_info>, const schema_static_props& props);
+    schema(private_tag, const raw_schema&, const schema_static_props& props);
     schema(const schema&);
     // See \ref make_reversed().
     schema(reversed_tag, const schema&);
@@ -829,10 +801,12 @@ public:
     const_iterator_range_type columns(column_kind) const;
     // Returns a range of column definitions
 
-    typedef boost::range::joined_range<const_iterator_range_type, const_iterator_range_type>
-        select_order_range;
+    const_iterator_range_type primary_key_columns() const;
+    const_iterator_range_type static_and_regular_columns() const;
 
-    select_order_range all_columns_in_select_order() const;
+    std::ranges::range auto all_columns_in_select_order() const {
+        return _all_columns_in_select_order | std::views::transform([] (const column_definition* def) -> const column_definition& { return *def; });
+    }
     uint32_t position(const column_definition& column) const;
 
     const columns_type& all_columns() const {
@@ -897,11 +871,9 @@ public:
     // Search for an existing index with same kind and options.
     std::optional<index_metadata> find_index_noname(const index_metadata& target) const;
     friend fmt::formatter<schema>;
-    virtual sstring keypace_name() const override { return ks_name(); }
-    virtual sstring element_name() const override { return cf_name(); }
-    virtual sstring element_type(replica::database& db) const override;
+
     /*!
-     * \brief stream the CQL DESCRIBE output.
+     * \brief generate the CQL DESCRIBE output.
      *
      * The output of DESCRIBE is the CQL command to create the described table with its indexes and views.
      *
@@ -913,14 +885,15 @@ public:
      * or "CREATE INDEX" depends on the type of index that schema describes (ie. Materialized View, Global
      * Index or Local Index).
      *
-     * When `with_internals` is true, the description is extended with table's id and dropped columns.
-     * The dropped columns are present in column definitions and also the `ALTER DROP` statement 
-     * (and `ALTER ADD` if the column has been re-added) to the description.
+     * When `cql3::describe_option::WITH_STMTS_AND_INTERNALS` is used, the description is extended with
+     * table's id and dropped columns. The dropped columns are present in column definitions and also the `ALTER DROP`
+     * statement (and `ALTER ADD` if the column has been re-added) to the description.
      */
-    virtual std::ostream& describe(replica::database& db, std::ostream& os, bool with_internals) const override;
+    cql3::description describe(const schema_describe_helper& helper, cql3::describe_option) const;
+
     // Generate ALTER TABLE/MATERIALIZED VIEW statement containing all properties with current values.
     // The method cannot be used on index, as indexes don't support alter statement.
-    std::ostream& describe_alter_with_properties(replica::database& db, std::ostream& os) const;
+    std::ostream& describe_alter_with_properties(const schema_describe_helper& helper, std::ostream& os) const;
     friend bool operator==(const schema&, const schema&);
     const column_mapping& get_column_mapping() const;
     friend class schema_registry_entry;
@@ -935,9 +908,15 @@ public:
     bool wait_for_sync_to_commitlog() const {
         return _static_props.wait_for_sync_to_commitlog;
     }
+
+    // The calculated version should be machine-independent, so that all nodes
+    // arrive at the same version for the same schema definition.
+    static table_schema_version calculate_digest(const raw_schema& r);
 private:
     // Print all schema properties in CQL syntax
-    std::ostream& schema_properties(replica::database& db, std::ostream& os) const;
+    std::ostream& schema_properties(const schema_describe_helper& helper, std::ostream& os) const;
+
+    sstring get_create_statement(const schema_describe_helper& helper, bool with_internals) const;
 public:
     const v3_columns& v3() const {
         return _v3_columns;
@@ -962,15 +941,11 @@ public:
     //
     //      auto schema = make_schema();
     //      auto reverse_schema = schema->get_reversed();
-    //      assert(reverse_schema->get_reversed().get() == schema.get());
-    //      assert(schema->get_reversed().get() == reverse_schema.get());
+    //      SCYLLA_ASSERT(reverse_schema->get_reversed().get() == schema.get());
+    //      SCYLLA_ASSERT(schema->get_reversed().get() == reverse_schema.get());
     //
     schema_ptr get_reversed() const;
 };
-
-lw_shared_ptr<const schema> make_shared_schema(std::optional<table_id> id, std::string_view ks_name, std::string_view cf_name,
-    std::vector<schema::column> partition_key, std::vector<schema::column> clustering_key, std::vector<schema::column> regular_columns,
-    std::vector<schema::column> static_columns, data_type regular_column_name_type, sstring comment = "");
 
 bool operator==(const schema&, const schema&);
 
@@ -982,7 +957,7 @@ class view_ptr final {
 public:
     explicit view_ptr(schema_ptr schema) noexcept : _schema(schema) {
         if (schema) {
-            assert(_schema->is_view());
+            SCYLLA_ASSERT(_schema->is_view());
         }
     }
 

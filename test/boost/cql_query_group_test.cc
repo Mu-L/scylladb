@@ -3,25 +3,27 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
 #include <boost/range/irange.hpp>
-#include <boost/range/adaptors.hpp>
 #include <boost/range/algorithm.hpp>
 #include <boost/test/unit_test.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
 
 #include <seastar/net/inet_address.hh>
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
 
 #include <seastar/core/future-util.hh>
 #include "test/lib/exception_utils.hh"
+
+BOOST_AUTO_TEST_SUITE(cql_query_group_test)
 
 using namespace std::literals::chrono_literals;
 
@@ -234,3 +236,5 @@ SEASTAR_TEST_CASE(test_group_by_null_clustering) {
         return make_ready_future<>();
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

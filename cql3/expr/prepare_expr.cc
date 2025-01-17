@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "expression.hh"
@@ -24,7 +24,7 @@
 #include "exceptions/unrecognized_entity_exception.hh"
 #include "utils/like_matcher.hh"
 
-#include <boost/range/algorithm/count.hpp>
+#include <ranges>
 
 namespace cql3::expr {
 
@@ -146,7 +146,7 @@ usertype_constructor_prepare_expression(const usertype_constructor& u, data_dict
         // We had some field that are not part of the type
         for (auto&& id_val : u.elements) {
             auto&& id = id_val.first;
-            if (!boost::range::count(ut->field_names(), id.bytes_)) {
+            if (!std::ranges::contains(ut->field_names(), id.bytes_)) {
                 throw exceptions::invalid_request_exception(format("Unknown field '{}' in value of user defined type {}", id, ut->get_name_as_string()));
             }
         }
@@ -561,9 +561,10 @@ tuple_constructor_prepare_nontuple(const tuple_constructor& tc, data_dictionary:
     if (receiver) {
         type = receiver->type;
     } else {
-        type = tuple_type_impl::get_instance(boost::copy_range<std::vector<data_type>>(
+        type = tuple_type_impl::get_instance(
                 values
-                | boost::adaptors::transformed(type_of)));
+                | std::views::transform(type_of)
+                | std::ranges::to<std::vector>());
     }
     tuple_constructor value {
         .elements  = std::move(values),
@@ -604,7 +605,7 @@ untyped_constant_parsed_value(const untyped_constant uc, data_type validator)
 {
     try {
         if (uc.partial_type == untyped_constant::type_class::hex && validator == bytes_type) {
-            auto v = static_cast<sstring_view>(uc.raw_text);
+            auto v = static_cast<std::string_view>(uc.raw_text);
             v.remove_prefix(2);
             return validator->from_string(v);
         }
@@ -969,7 +970,7 @@ prepare_function_call(const expr::function_call& fc, data_dictionary::database d
             return func;
         },
         [&] (const functions::function_name& name) {
-            auto fun = functions::functions::get(db, keyspace, name, partially_prepared_args, keyspace, cf_name, receiver.get());
+            auto fun = functions::instance().get(db, keyspace, name, partially_prepared_args, keyspace, cf_name, receiver.get());
             if (!fun) {
                 throw exceptions::invalid_request_exception(format("Unknown function {} called", name));
             }
@@ -995,7 +996,7 @@ prepare_function_call(const expr::function_call& fc, data_dictionary::database d
     bool all_terminal = true;
     for (size_t i = 0; i < partially_prepared_args.size(); ++i) {
         expr::expression e = prepare_expression(fc.args[i], db, keyspace, schema_opt,
-                                                functions::functions::make_arg_spec(keyspace, cf_name, *fun, i));
+                                                functions::instance().make_arg_spec(keyspace, cf_name, *fun, i));
         if (!expr::is<expr::constant>(e)) {
             all_terminal = false;
         }
@@ -1026,7 +1027,7 @@ test_assignment_function_call(const cql3::expr::function_call& fc, data_dictiona
         auto&& fun = std::visit(overloaded_functor{
             [&] (const functions::function_name& name) {
                 auto args = prepare_function_args_for_type_inference(fc.args, db, keyspace, schema_opt);
-                return functions::functions::get(db, keyspace, name, args, receiver.ks_name, receiver.cf_name, &receiver);
+                return functions::instance().get(db, keyspace, name, args, receiver.ks_name, receiver.cf_name, &receiver);
             },
             [] (const shared_ptr<functions::function>& func) {
                 return func;
@@ -1190,18 +1191,24 @@ try_prepare_expression(const expression& expr, data_dictionary::database db, con
 
             auto col_spec = column_specification_of(sub_col);
             lw_shared_ptr<column_specification> subscript_column_spec;
+            data_type value_cmp;
             if (sub_col_type.is_map()) {
                 subscript_column_spec = map_key_spec_of(*col_spec);
+                value_cmp = static_cast<const collection_type_impl&>(sub_col_type).value_comparator();
+            } else if (sub_col_type.is_set()) {
+                subscript_column_spec = set_value_spec_of(*col_spec);
+                value_cmp = static_cast<const collection_type_impl&>(sub_col_type).name_comparator();
             } else if (sub_col_type.is_list()) {
                 subscript_column_spec = list_key_spec_of(*col_spec);
+                value_cmp = static_cast<const collection_type_impl&>(sub_col_type).value_comparator();
             } else {
-                throw exceptions::invalid_request_exception(format("Column {} is not a map/list, cannot be subscripted", col_spec->name->text()));
+                throw exceptions::invalid_request_exception(format("Column {} is not a map/set/list, cannot be subscripted", col_spec->name->text()));
             }
 
             return subscript {
                 .val = sub_col,
                 .sub = prepare_expression(sub.sub, db, schema.ks_name(), &schema, std::move(subscript_column_spec)),
-                .type = static_cast<const collection_type_impl&>(sub_col_type).value_comparator(),
+                .type = value_cmp,
             };
         },
         [&] (const unresolved_identifier& unin) -> std::optional<expression> {
@@ -1279,7 +1286,8 @@ test_assignment(const expression& expr, data_dictionary::database db, const sstr
             return expression_test_assignment(col_val.col->type, receiver);
         },
         [&] (const subscript&) -> test_result {
-            on_internal_error(expr_logger, "subscripts are not yet reachable via test_assignment()");
+            // not implemented. issue #22075
+            return assignment_testable::test_result::NOT_ASSIGNABLE;
         },
         [&] (const unresolved_identifier& ui) -> test_result {
             return unresolved_identifier_test_assignment(ui, db, keyspace, schema_opt, receiver);
@@ -1387,6 +1395,8 @@ static lw_shared_ptr<column_specification> get_lhs_receiver(const expression& pr
             const column_value& sub_col = get_subscripted_column(col_val);
             if (sub_col.col->type->is_map()) {
                 return map_value_spec_of(*sub_col.col->column_specification);
+            } else if (sub_col.col->type->is_set()) {
+                return set_value_spec_of(*sub_col.col->column_specification);
             } else {
                 return list_value_spec_of(*sub_col.col->column_specification);
             }
@@ -1449,9 +1459,9 @@ static lw_shared_ptr<column_specification> get_lhs_receiver(const expression& pr
 static lw_shared_ptr<column_specification> get_rhs_receiver(lw_shared_ptr<column_specification>& lhs_receiver, oper_t oper) {
     const data_type lhs_type = lhs_receiver->type->underlying_type();
 
-    if (oper == oper_t::IN) {
+    if (oper == oper_t::IN || oper == oper_t::NOT_IN) {
         data_type rhs_receiver_type = list_type_impl::get_instance(std::move(lhs_type), false);
-        auto in_name = ::make_shared<column_identifier>(format("in({})", lhs_receiver->name->text()), true);
+        auto in_name = ::make_shared<column_identifier>(format("{}({})", oper, lhs_receiver->name->text()), true);
         return make_lw_shared<column_specification>(lhs_receiver->ks_name,
                                                     lhs_receiver->cf_name,
                                                     in_name,

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/range/irange.hpp>
@@ -14,12 +14,14 @@
 #include "replica/memtable.hh"
 #include "row_cache.hh"
 #include "partition_slice_builder.hh"
+#include "utils/assert.hh"
 #include "utils/int_range.hh"
 #include "utils/div_ceil.hh"
 #include "utils/to_string.hh"
 #include "test/lib/memtable_snapshot_source.hh"
 #include <seastar/core/reactor.hh>
 #include <fmt/core.h>
+#include <fmt/std.h>
 
 static thread_local bool cancelled = false;
 
@@ -73,7 +75,7 @@ struct table {
     }
 
     size_t index_of_key(const dht::decorated_key& dk) {
-        for (auto i : boost::irange<size_t>(0, p_keys.size())) {
+        for (auto i : std::views::iota(0u, p_keys.size())) {
             if (p_keys[i].equal(*s.schema(), dk)) {
                 return i;
             }
@@ -110,7 +112,7 @@ struct table {
 
     void mutate_next_phase() {
         testlog.trace("mutating, phase={}", mutation_phase);
-        for (auto i : boost::irange<int>(0, p_keys.size())) {
+        for (auto i : std::views::iota(0u, p_keys.size())) {
             auto t = s.new_timestamp();
             auto tag = value_tag(i, mutation_phase);
             auto m = get_mutation(i, t, tag);
@@ -230,11 +232,11 @@ public:
         std::tie(value, t) = _t.s.get_value(*_s, row);
         testlog.trace("reader {}: {} @{}, {}", _id, value, t, clustering_row::printer(*_s, row));
         if (_value && value != _value) {
-            throw std::runtime_error(format("Saw values from two different writes in partition {:d}: {} and {}", _key, _value, value));
+            throw std::runtime_error(fmt::format("Saw values from two different writes in partition {:d}: {} and {}", _key, _value, value));
         }
         auto lowest_timestamp = _writetimes[_key];
         if (t < lowest_timestamp) {
-            throw std::runtime_error(format("Expected to see the write @{:d}, but saw @{:d} ({}), c_key={}", lowest_timestamp, t, value, row.key()));
+            throw std::runtime_error(fmt::format("Expected to see the write @{:d}, but saw @{:d} ({}), c_key={}", lowest_timestamp, t, value, row.key()));
         }
         _value = std::move(value);
         return stop_iteration::no;
@@ -365,7 +367,7 @@ int main(int argc, char** argv) {
             // populate the initial phase, readers expect constant fragment count.
             t.mutate_next_phase();
 
-            auto readers = parallel_for_each(boost::irange(0u, concurrency), [&] (auto i) {
+            auto readers = parallel_for_each(std::views::iota(0u, concurrency), [&] (auto i) {
                 reader_id id{format("single-{:d}", i)};
                 return seastar::async([&, i, id] {
                     single_partition_reader(i, id);
@@ -374,7 +376,7 @@ int main(int argc, char** argv) {
                 });
             });
 
-            auto scanning_readers = parallel_for_each(boost::irange(0u, scan_concurrency), [&] (auto i) {
+            auto scanning_readers = parallel_for_each(std::views::iota(0u, scan_concurrency), [&] (auto i) {
                 reader_id id{format("scan-{:d}", i)};
                 return seastar::async([&, id] {
                     scanning_reader(id);
@@ -411,8 +413,8 @@ int main(int argc, char** argv) {
             t.tracker.cleaner().drain().get();
             t.tracker.memtable_cleaner().drain().get();
 
-            assert(t.tracker.get_stats().partitions == 0);
-            assert(t.tracker.get_stats().rows == 0);
+            SCYLLA_ASSERT(t.tracker.get_stats().partitions == 0);
+            SCYLLA_ASSERT(t.tracker.get_stats().rows == 0);
         });
     });
 }

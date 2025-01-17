@@ -1,6 +1,6 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for basic table operations: CreateTable, DeleteTable, ListTables.
 # Also some basic tests for UpdateTable - although UpdateTable usually
@@ -485,7 +485,7 @@ def fails_without_consistent_cluster_management(request, check_pre_consistent_cl
 # InternalServerError) in the *middle* of the table creation or deletion.
 # Such a failure may even leave behind some half-created table.
 #
-# NOTE: This test, like all cql-pytest tests, runs on a single node. So it
+# NOTE: This test, like all cqlpy tests, runs on a single node. So it
 # doesn't exercise the most general possibility that two concurrent schema
 # modifications from two different coordinators collide. So multi-node
 # tests will be needed to check for that potential problem as well.
@@ -686,6 +686,17 @@ def test_delete_table_description_with_si(dynamodb):
     for i in ['KeySchema', 'AttributeDefinitions', 'GlobalSecondaryIndexes', 'LocalSecondaryIndexes']:
         assert i in got_describe
         assert not i in got_delete
+
+# Test that CreateTable rejects spurious entries in AttributeDefinitions
+# (entries which aren't used as a key of the table or any GSI or LSI).
+# Reproduces issue #19784.
+def test_create_table_spurious_attribute_definitions(dynamodb):
+    with pytest.raises(ClientError, match='ValidationException.*AttributeDefinitions'):
+        with new_test_table(dynamodb,
+            KeySchema=[{ 'AttributeName': 'p', 'KeyType': 'HASH' }],
+            AttributeDefinitions=[{ 'AttributeName': 'p', 'AttributeType': 'S' },
+                                  { 'AttributeName': 'c', 'AttributeType': 'S' }]) as table:
+                pass
 
 # Currently, because of incomplete LWT support, Alternator tables do not use
 # tablets by default - even if the tablets experimental feature is enabled.

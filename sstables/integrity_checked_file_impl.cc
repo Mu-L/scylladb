@@ -3,12 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "integrity_checked_file_impl.hh"
 #include <seastar/core/do_with.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <boost/algorithm/cxx11/all_of.hpp>
 #include "bytes.hh"
 

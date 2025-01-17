@@ -3,15 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
 #include <iostream>
 #include <fmt/ranges.h>
 #include <seastar/core/thread.hh>
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/util/defer.hh>
+
+#include <boost/range/algorithm/copy.hpp>
 
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
@@ -24,10 +27,13 @@
 #include "types/list.hh"
 #include "types/user.hh"
 #include "db/config.hh"
+#include "db/system_keyspace.hh"
 #include "test/lib/tmpdir.hh"
 #include "test/lib/exception_utils.hh"
 #include "test/lib/log.hh"
 #include "cdc/cdc_extension.hh"
+
+BOOST_AUTO_TEST_SUITE(schema_change_test)
 
 static cql_test_config run_with_raft_recovery_config() {
     cql_test_config c;
@@ -576,7 +582,7 @@ public:
     virtual void on_update_function(const sstring&, const sstring&) override { ++update_function_count; }
     virtual void on_update_aggregate(const sstring&, const sstring&) override { ++update_aggregate_count; }
     virtual void on_update_view(const sstring&, const sstring&, bool) override { ++update_view_count; }
-    virtual void on_update_tablet_metadata() override { ++update_tablets; }
+    virtual void on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) override { ++update_tablets; }
     virtual void on_drop_keyspace(const sstring&) override { ++drop_keyspace_count; }
     virtual void on_drop_column_family(const sstring&, const sstring&) override { ++drop_column_family_count; }
     virtual void on_drop_user_type(const sstring&, const sstring&) override { ++drop_user_type_count; }
@@ -1139,3 +1145,21 @@ SEASTAR_TEST_CASE(test_schema_get_reversed) {
         return make_ready_future<>();
     });
 }
+
+// The purpose of the test is to avoid unintended changes of schema version
+// of system tables due to changes in generic code in schema_builder.
+//
+// It's enough to check only one system table as all tables share the version
+// calculation code. The test chooses to check system.batchlog, whose schema
+// shouldn't change often and cause failures due to intended version changes.
+SEASTAR_TEST_CASE(test_system_schema_version_is_stable) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        auto s = db::system_keyspace::batchlog();
+
+        // If you changed the schema of system.batchlog then this is expected to fail.
+        // Just replace expected version with the new version.
+        BOOST_REQUIRE_EQUAL(s->version(), table_schema_version(utils::UUID("776f1766-8688-3d52-908b-a5228900dc00")));
+    });
+}
+
+BOOST_AUTO_TEST_SUITE_END()

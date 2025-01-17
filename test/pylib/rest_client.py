@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 """Asynchronous helper for Scylla REST API operations.
 """
@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from aiohttp import request, BaseConnector, UnixConnector, ClientTimeout
 import pytest
 from test.pylib.internal_types import IPAddress, HostID
+from cassandra.pool import Host                          # type: ignore # pylint: disable=no-name-in-module
 
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ class RESTClient(metaclass=ABCMeta):
     async def _fetch(self, method: str, resource: str, response_type: Optional[str] = None,
                      host: Optional[str] = None, port: Optional[int] = None,
                      params: Optional[Mapping[str, str]] = None,
-                     json: Optional[Mapping] = None, timeout: Optional[float] = None) -> Any:
+                     json: Optional[Mapping] = None, timeout: Optional[float] = None, allow_failed: bool = False) -> Any:
         # Can raise exception. See https://docs.aiohttp.org/en/latest/web_exceptions.html
         assert method in ["GET", "POST", "PUT", "DELETE"], f"Invalid HTTP request method {method}"
         assert response_type is None or response_type in ["text", "json"], \
@@ -64,6 +65,8 @@ class RESTClient(metaclass=ABCMeta):
         async with request(method, uri,
                            connector = self.connector if hasattr(self, "connector") else None,
                            params = params, json = json, timeout = client_timeout) as resp:
+            if allow_failed:
+                return await resp.json()
             if resp.status != 200:
                 text = await resp.text()
                 raise HTTPError(uri, resp.status, params, json, text)
@@ -73,8 +76,8 @@ class RESTClient(metaclass=ABCMeta):
         return None
 
     async def get(self, resource_uri: str, host: Optional[str] = None, port: Optional[int] = None,
-                  params: Optional[Mapping[str, str]] = None) -> Any:
-        return await self._fetch("GET", resource_uri, host = host, port = port, params = params)
+                  params: Optional[Mapping[str, str]] = None, allow_failed: bool = False) -> Any:
+        return await self._fetch("GET", resource_uri, host = host, port = port, params = params, allow_failed=allow_failed)
 
     async def get_text(self, resource_uri: str, host: Optional[str] = None,
                        port: Optional[int] = None, params: Optional[Mapping[str, str]] = None,
@@ -85,11 +88,11 @@ class RESTClient(metaclass=ABCMeta):
         return ret
 
     async def get_json(self, resource_uri: str, host: Optional[str] = None,
-                       port: Optional[int] = None, params: Optional[Mapping[str, str]] = None
-                       ) -> Any:
+                       port: Optional[int] = None, params: Optional[Mapping[str, str]] = None,
+                       allow_failed: bool = False) -> Any:
         """Fetch URL and get JSON. Caller must check JSON content types."""
         ret = await self._fetch("GET", resource_uri, response_type = "json", host = host,
-                                port = port, params = params)
+                                port = port, params = params, allow_failed = allow_failed)
         return ret
 
     async def post(self, resource_uri: str, host: Optional[str] = None,
@@ -125,7 +128,7 @@ class UnixRESTClient(RESTClient):
     def __init__(self, sock_path: str):
         # NOTE: using Python requests style URI for Unix domain sockets to avoid using "localhost"
         #       host parameter is ignored but set to socket name as convention
-        self.uri_scheme: str = "http+unix"
+        self.uri_scheme: str = "http"
         self.default_host: str = f"{os.path.basename(sock_path)}"
         self.connector = UnixConnector(path=sock_path)
 
@@ -159,7 +162,7 @@ class ScyllaRESTAPIClient():
     async def get_host_id_map(self, dst_server_ip: IPAddress) -> list[HostID]:
         """Retrieve the mapping of endpoint to host ID"""
         data = await self.client.get_json("/storage_service/host_id/", dst_server_ip)
-        assert(type(data) == list)
+        assert isinstance(data, list)
         return data
 
     async def get_ownership(self, dst_server_ip: IPAddress, keyspace: str = None, table: str = None) -> list:
@@ -176,7 +179,7 @@ class ScyllaRESTAPIClient():
     async def get_down_endpoints(self, node_ip: IPAddress) -> list[IPAddress]:
         """Retrieve down endpoints from gossiper's point of view """
         data = await self.client.get_json("/gossiper/endpoint/down/", node_ip)
-        assert(type(data) == list)
+        assert isinstance(data, list)
         return data
 
     async def remove_node(self, initiator_ip: IPAddress, host_id: HostID,
@@ -207,19 +210,19 @@ class ScyllaRESTAPIClient():
         """Get the current generation number of `target_ip` observed by `node_ip`."""
         data = await self.client.get_json(f"/gossiper/generation_number/{target_ip}",
                                           host = node_ip)
-        assert(type(data) == int)
+        assert isinstance(data, int)
         return data
 
     async def get_joining_nodes(self, node_ip: str) -> list:
         """Get the list of joining nodes according to `node_ip`."""
         data = await self.client.get_json(f"/storage_service/nodes/joining", host=node_ip)
-        assert(type(data) == list)
+        assert isinstance(data, list)
         return data
 
     async def get_alive_endpoints(self, node_ip: str) -> list:
         """Get the list of alive nodes according to `node_ip`."""
         data = await self.client.get_json(f"/gossiper/endpoint/live", host=node_ip)
-        assert(type(data) == list)
+        assert isinstance(data, list)
         return data
 
     async def enable_injection(self, node_ip: str, injection: str, one_shot: bool, parameters: dict[str, Any] = {}) -> None:
@@ -270,6 +273,13 @@ class ScyllaRESTAPIClient():
             "token": str(token)
         })
 
+    async def tablet_repair(self, node_ip: str, ks: str, table: str, token : int, timeout: Optional[float] = None) -> None:
+        await self.client.post(f"/storage_service/tablets/repair", host=node_ip, timeout=timeout, params={
+            "ks": ks,
+            "table": table,
+            "tokens": str(token)
+        })
+
     async def enable_tablet_balancing(self, node_ip: str) -> None:
         await self.client.post(f"/storage_service/tablets/balancing", host=node_ip, params={"enabled": "true"})
 
@@ -281,8 +291,8 @@ class ScyllaRESTAPIClient():
 
     async def get_enabled_injections(self, node_ip: str) -> list[str]:
         data = await self.client.get_json("/v2/error_injection/injection", host=node_ip)
-        assert(type(data) == list)
-        assert(type(e) == str for e in data)
+        assert isinstance(data, list)
+        assert all(isinstance(e, str) for e in data)
         return data
 
     async def message_injection(self, node_ip: str, injection: str) -> None:
@@ -304,6 +314,36 @@ class ScyllaRESTAPIClient():
         """Flush keyspace"""
         await self.client.post(f"/storage_service/keyspace_flush/{ks}", host=node_ip)
 
+    async def flush_all_keyspaces(self, node_ip: str) -> None:
+        """Flush all keyspaces"""
+        await self.client.post(f"/storage_service/flush", host=node_ip)
+
+    async def backup(self, node_ip: str, ks: str, table: str, tag: str, dest: str, bucket: str, prefix: str) -> str:
+        """Backup keyspace's snapshot"""
+        params = {"keyspace": ks,
+                  "table": table,
+                  "endpoint": dest,
+                  "bucket": bucket,
+                  "prefix": prefix,
+                  "snapshot": tag}
+        return await self.client.post_json(f"/storage_service/backup", host=node_ip, params=params)
+
+    async def restore(self, node_ip: str, ks: str, cf: str, dest: str, bucket: str, prefix: str, sstables: list[str], scope: str = None) -> str:
+        """Restore keyspace:table from backup"""
+        params = {"keyspace": ks,
+                  "table": cf,
+                  "endpoint": dest,
+                  "bucket": bucket,
+                  "prefix": prefix}
+        if scope is not None:
+            params['scope'] = scope
+        return await self.client.post_json(f"/storage_service/restore", host=node_ip, params=params, json=sstables)
+
+    async def take_snapshot(self, node_ip: str, ks: str, tag: str) -> None:
+        """Take keyspace snapshot"""
+        params = { 'kn': ks, 'tag': tag }
+        await self.client.post(f"/storage_service/snapshots", host=node_ip, params=params)
+
     async def cleanup_keyspace(self, node_ip: str, ks: str) -> None:
         """Cleanup keyspace"""
         await self.client.post(f"/storage_service/keyspace_cleanup/{ks}", host=node_ip)
@@ -324,11 +364,19 @@ class ScyllaRESTAPIClient():
             url += f"?cf={table}"
         await self.client.post(url, host=node_ip)
 
-    async def keyspace_compaction(self, node_ip: str, keyspace: str, table: Optional[str] = None) -> None:
+    async def keyspace_compaction(self, node_ip: str, keyspace: str, table: Optional[str] = None, consider_only_existing_data: bool = False) -> None:
         """Compact the specified or all tables in the keyspace"""
         url = f"/storage_service/keyspace_compaction/{keyspace}"
+        params = {
+            "consider_only_existing_data": str(consider_only_existing_data),
+        }
         if table is not None:
-            url += "?cf={table}"
+            params["cf"] = table
+        await self.client.post(url, host=node_ip, params=params)
+
+    async def stop_compaction(self, node_ip: str, type: str) -> None:
+        """Stop compaction of a given type"""
+        url = f"/compaction_manager/stop_compaction?type={type}"
         await self.client.post(url, host=node_ip)
 
     async def dump_llvm_profile(self, node_ip : str):
@@ -344,7 +392,7 @@ class ScyllaRESTAPIClient():
     async def raft_topology_upgrade_status(self, node_ip: str) -> str:
         """Returns the current state of upgrade to raft topology"""
         data = await self.client.get_json("/storage_service/raft_topology/upgrade", host=node_ip)
-        assert(type(data) == str)
+        assert isinstance(data, str)
         return data
 
     async def get_raft_leader(self, node_ip: str, group_id: Optional[str] = None) -> HostID:
@@ -391,8 +439,17 @@ class ScyllaRESTAPIClient():
             url += f"?{'&'.join(params)}"
 
         data = await self.client.get_json(url, host=node_ip)
-        assert(type(data) == list)
+        assert isinstance(data, list)
         return data
+
+    async def get_task_status(self, node_ip: str, task_id: str):
+        return await self.client.get_json(f'/task_manager/task_status/{task_id}', host=node_ip)
+
+    async def wait_task(self, node_ip: str, task_id: str):
+        return await self.client.get_json(f'/task_manager/wait_task/{task_id}', host=node_ip)
+
+    async def abort_task(self, node_ip: str, task_id: str):
+        await self.client.post(f'/task_manager/abort_task/{task_id}', host=node_ip)
 
 class ScyllaMetrics:
     def __init__(self, lines: list[str]):
@@ -487,3 +544,26 @@ async def inject_error_one_shot(api: ScyllaRESTAPIClient, node_ip: IPAddress, in
     if not enabled:
         pytest.skip("Error injection not enabled in Scylla - try compiling in dev/debug/sanitize mode")
     return InjectionHandler(api, injection, node_ip)
+
+
+async def read_barrier(api: ScyllaRESTAPIClient, node_ip: IPAddress, group_id: Optional[str] = None) -> None:
+    """ Issue a read barrier on the specific host for the group_id.
+
+        :param api: the REST API client
+        :param node_ip: the node IP address for which the read barrier will be posted
+        :param group_id: the optional group id (default=group0)
+    """
+    params = {}
+    if group_id:
+        params["group_id"] = group_id
+
+    await api.client.post("/raft/read_barrier", host=node_ip, params=params)
+
+
+def get_host_api_address(host: Host) -> IPAddress:
+    """ Returns the API address of the host.
+
+        The API address can be different than the RPC (node) address under certain circumstances.
+        In particular, in case the RPC address has been modified.
+    """
+    return host.listen_address if host.listen_address else host.address

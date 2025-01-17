@@ -4,7 +4,6 @@ import asyncio
 import os
 import requests
 import pytest
-import xml.etree.ElementTree as ET
 import shutil
 import logging
 
@@ -12,6 +11,8 @@ from test.pylib.minio_server import MinioServer
 from cassandra.protocol import ConfigurationException
 from test.pylib.manager_client import ManagerClient
 from test.topology.util import reconnect_driver
+from test.object_store.conftest import get_s3_resource
+from test.object_store.conftest import format_tuples
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +72,10 @@ async def test_basic(manager: ManagerClient, s3_server):
 
     # Check that the ownership table is populated properly
     res = cql.execute("SELECT * FROM system.sstables;")
+    tid = cql.execute(f"SELECT id FROM system_schema.tables WHERE keyspace_name = '{ks}' AND table_name = '{cf}'").one()
     for row in res:
-        assert row.location.startswith(workdir), \
-            f'Unexpected entry location in registry: {row.location}'
+        assert row.owner == tid.id, \
+            f'Unexpected entry owner in registry: {row.owner}'
         assert row.status == 'sealed', f'Unexpected entry status in registry: {row.status}'
 
     print('Restart scylla')
@@ -91,24 +93,13 @@ async def test_basic(manager: ManagerClient, s3_server):
     cql.execute(f"DROP TABLE {ks}.{cf};")
     # Check that the ownership table is de-populated
     res = cql.execute("SELECT * FROM system.sstables;")
-    rows = "\n".join(f"{row.location} {row.status}" for row in res)
+    rows = "\n".join(f"{row.owner} {row.status}" for row in res)
     assert not rows, 'Unexpected entries in registry'
 
 
 @pytest.mark.asyncio
 async def test_garbage_collect(manager: ManagerClient, s3_server):
     '''verify ownership table is garbage-collected on boot'''
-
-    def list_bucket(s3_server):
-        r = requests.get(f'http://{s3_server.address}:{s3_server.port}/{s3_server.bucket_name}')
-        bucket_list_res = ET.fromstring(r.content)
-        objects = []
-        for elem in bucket_list_res:
-            if elem.tag.endswith('Contents'):
-                for opt in elem:
-                    if opt.tag.endswith('Key'):
-                        objects.append(opt.text)
-        return objects
 
     sstable_entries = []
 
@@ -126,11 +117,11 @@ async def test_garbage_collect(manager: ManagerClient, s3_server):
     # Mark the sstables as "removing" to simulate the problem
     res = cql.execute("SELECT * FROM system.sstables;")
     for row in res:
-        sstable_entries.append((row.location, row.generation))
+        sstable_entries.append((row.owner, row.generation))
     print(f'Found entries: {[ str(ent[1]) for ent in sstable_entries ]}')
-    for loc, gen in sstable_entries:
+    for owner, gen in sstable_entries:
         cql.execute("UPDATE system.sstables SET status = 'removing'"
-                     f" WHERE location = '{loc}' AND generation = {gen};")
+                     f" WHERE owner = {owner} AND generation = {gen};")
 
     print('Restart scylla')
     await manager.server_restart(server.server_id)
@@ -141,11 +132,11 @@ async def test_garbage_collect(manager: ManagerClient, s3_server):
     # Must be empty as no sstables should have been picked up
     assert not have_res, f'Sstables not cleaned, got {have_res}'
     # Make sure objects also disappeared
-    objects = list_bucket(s3_server)
+    objects = get_s3_resource(s3_server).Bucket(s3_server.bucket_name).objects.all()
     print(f'Found objects: {[ objects ]}')
     for o in objects:
         for ent in sstable_entries:
-            assert not o.startswith(str(ent[1])), f'Sstable object not cleaned, found {o}'
+            assert not o.key.startswith(str(ent[1])), f'Sstable object not cleaned, found {o.key}'
 
 
 @pytest.mark.asyncio
@@ -172,7 +163,7 @@ async def test_populate_from_quarantine(manager: ManagerClient, s3_server):
     assert len(list(res)) > 0, 'No entries in registry'
     for row in res:
         cql.execute("UPDATE system.sstables SET state = 'quarantine'"
-                     f" WHERE location = '{row.location}' AND generation = {row.generation};")
+                     f" WHERE owner = {row.owner} AND generation = {row.generation};")
 
     print('Restart scylla')
     await manager.server_restart(server.server_id)
@@ -242,7 +233,7 @@ async def test_memtable_flush_retries(manager: ManagerClient, tmpdir, s3_server)
     await flush
     print(f'Check the sstables table')
     res = cql.execute("SELECT * FROM system.sstables;")
-    ssts = "\n".join(f"{row.location} {row.generation} {row.status}" for row in res)
+    ssts = "\n".join(f"{row.owner} {row.generation} {row.status}" for row in res)
     print(f'sstables:\n{ssts}')
 
     print('Restart scylla')
@@ -252,12 +243,3 @@ async def test_memtable_flush_retries(manager: ManagerClient, tmpdir, s3_server)
     res = cql.execute(f"SELECT * FROM {ks}.{cf};")
     have_res = { x.name: x.value for x in res }
     assert have_res == dict(rows), f'Unexpected table content: {have_res}'
-
-
-def format_tuples(tuples=None, **kwargs):
-    '''format a dict to structured values (tuples) in CQL'''
-    if tuples is None:
-        tuples = {}
-    tuples.update(kwargs)
-    body = ', '.join(f"'{key}': '{value}'" for key, value in tuples.items())
-    return f'{{ {body} }}'

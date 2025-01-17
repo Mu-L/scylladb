@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include "clustering_key_filter.hh"
 #include "clustering_ranges_walker.hh"
 #include "mutation/mutation.hh"
@@ -58,7 +59,7 @@ public:
         switch (mf.mutation_fragment_kind()) {
             case mutation_fragment_v2::kind::partition_start:
                 // can't happen
-                assert(false);
+                SCYLLA_ASSERT(false);
                 break;
             case mutation_fragment_v2::kind::static_row:
                 break;
@@ -909,7 +910,7 @@ make_mutation_reader_from_mutations_v2(
         streamed_mutation::forwarding fwd) {
     const auto reversed = slice.is_reversed();
     auto sliced_mutation = reversed
-        ? slice_mutation(s->make_reversed(), std::move(m), query::half_reverse_slice(*s, slice))
+        ? slice_mutation(s->make_reversed(), std::move(m), query::reverse_slice(*s, slice))
         : slice_mutation(s, std::move(m), slice);
     return make_mutation_reader_from_mutations_v2(std::move(s), std::move(permit), std::move(sliced_mutation), fwd, reversed);
 }
@@ -985,7 +986,7 @@ make_mutation_reader_from_mutations_v2(schema_ptr s, reader_permit permit, std::
     const auto reversed = query_slice.is_reversed();
     std::vector<mutation> sliced_mutations;
     if (reversed) {
-        sliced_mutations = slice_mutations(s->make_reversed(), std::move(mutations), query::half_reverse_slice(*s, query_slice));
+        sliced_mutations = slice_mutations(s->make_reversed(), std::move(mutations), query::reverse_slice(*s, query_slice));
     } else {
         sliced_mutations = slice_mutations(s, std::move(mutations), query_slice);
     }
@@ -1119,18 +1120,17 @@ std::deque<mutation_fragment_v2> reverse_fragments(const schema& schema, reader_
 
 mutation_reader
 make_mutation_reader_from_fragments(schema_ptr schema, reader_permit permit, std::deque<mutation_fragment_v2> fragments,
-        const dht::partition_range& pr, const query::partition_slice& query_slice) {
-    const auto reversed = query_slice.is_reversed();
+        const dht::partition_range& pr, const query::partition_slice& slice) {
+    const auto reversed = slice.is_reversed();
     if (reversed) {
         fragments = reverse_fragments(*schema, permit, std::move(fragments));
     }
-    auto slice = reversed ? query::legacy_reverse_slice_to_native_reverse_slice(*schema, query_slice) : query_slice;
 
     std::deque<mutation_fragment_v2> filtered;
     for (auto it = fragments.begin(); it != fragments.end(); ) {
         auto&& mf = *it++;
         auto kind = mf.mutation_fragment_kind();
-        assert(kind == mutation_fragment_v2::kind::partition_start);
+        SCYLLA_ASSERT(kind == mutation_fragment_v2::kind::partition_start);
         partition_slicer slicer(schema, permit, slice.row_ranges(*schema, mf.as_partition_start().key().key()),
                                 [&filtered] (mutation_fragment_v2 mf) {
                                     filtered.push_back(std::move(mf));
@@ -1460,7 +1460,7 @@ private:
 
 public:
     compacting_reader(mutation_reader source, gc_clock::time_point compaction_time,
-            std::function<api::timestamp_type(const dht::decorated_key&)> get_max_purgeable,
+            max_purgeable_fn get_max_purgeable,
             const tombstone_gc_state& gc_state,
             streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no)
         : impl(source.schema(), source.permit())
@@ -1547,7 +1547,7 @@ public:
 } // anonymous namespace
 
 mutation_reader make_compacting_reader(mutation_reader source, gc_clock::time_point compaction_time,
-        std::function<api::timestamp_type(const dht::decorated_key&)> get_max_purgeable,
+        max_purgeable_fn get_max_purgeable,
         const tombstone_gc_state& gc_state, streamed_mutation::forwarding fwd) {
     return make_mutation_reader<compacting_reader>(std::move(source), compaction_time, get_max_purgeable, gc_state, fwd);
 }

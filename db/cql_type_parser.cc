@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #include <unordered_map>
 #include <boost/range/adaptor/map.hpp>
@@ -20,7 +20,9 @@
 #include "utils/sorting.hh"
 
 static ::shared_ptr<cql3::cql3_type::raw> parse_raw(const sstring& str) {
-    return cql3::util::do_with_parser(str,
+    // In general it's a bad idea to use the default dialect, but type parsing
+    // should be dialect-agnostic.
+    return cql3::util::do_with_parser(str, cql3::dialect{},
         [] (cql3_parser::CqlParser& parser) {
             return parser.comparator_type(true);
         });

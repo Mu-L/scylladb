@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 """
 Test consistency of schema changes with topology changes.
@@ -13,14 +13,16 @@ import functools
 import operator
 import time
 import re
+from contextlib import asynccontextmanager, contextmanager, suppress
 
 from cassandra.cluster import ConnectionException, ConsistencyLevel, NoHostAvailable, Session, SimpleStatement  # type: ignore # pylint: disable=no-name-in-module
 from cassandra.pool import Host                          # type: ignore # pylint: disable=no-name-in-module
 from cassandra.util import datetime_from_uuid1           # type: ignore # pylint: disable=no-name-in-module
 from test.pylib.internal_types import ServerInfo, HostID
 from test.pylib.manager_client import ManagerClient
-from test.pylib.util import wait_for, wait_for_cql_and_get_hosts, read_barrier, get_available_host, unique_name
-from contextlib import asynccontextmanager
+from test.pylib.rest_client import get_host_api_address, read_barrier
+from test.pylib.util import wait_for, wait_for_cql_and_get_hosts, get_available_host, unique_name
+from typing import Optional, List
 
 
 logger = logging.getLogger(__name__)
@@ -71,7 +73,7 @@ async def get_current_group0_config(manager: ManagerClient, srv: ServerInfo) -> 
      """
     assert manager.cql
     host = (await wait_for_cql_and_get_hosts(manager.cql, [srv], time.time() + 60))[0]
-    await read_barrier(manager.cql, host)
+    await read_barrier(manager.api, srv.ip_addr)
     group0_id = (await manager.cql.run_async(
         "select value from system.scylla_local where key = 'raft_group0_id'",
         host=host))[0].value
@@ -86,13 +88,24 @@ async def get_current_group0_config(manager: ManagerClient, srv: ServerInfo) -> 
 async def get_topology_coordinator(manager: ManagerClient) -> HostID:
     """Get the host ID of the topology coordinator."""
     host = await get_available_host(manager.cql, time.time() + 60)
-    await read_barrier(manager.cql, host)
-    return await manager.api.get_raft_leader(host.address)
+    host_address = get_host_api_address(host)
+    await read_barrier(manager.api, host_address)
+    return await manager.api.get_raft_leader(host_address)
+
+
+async def find_server_by_host_id(manager: ManagerClient, servers: List[ServerInfo], host_id: HostID) -> ServerInfo:
+    for s in servers:
+        if await manager.get_host_id(s.server_id) == host_id:
+            return s
+    raise Exception(f"Host ID {host_id} not found in {servers}")
 
 
 async def check_token_ring_and_group0_consistency(manager: ManagerClient) -> None:
     """Ensure that the normal token owners and group 0 members match
        according to each currently running server.
+
+       Note that the normal token owners and group 0 members never match
+       in the presence of zero-token nodes.
     """
     servers = await manager.running_servers()
     for srv in servers:
@@ -205,17 +218,23 @@ async def wait_until_last_generation_is_in_use(cql: Session):
     else:
         logger.info(f"The last generation is already in use.")
 
-async def check_system_topology_and_cdc_generations_v3_consistency(manager: ManagerClient, hosts: list[Host]):
+async def check_system_topology_and_cdc_generations_v3_consistency(manager: ManagerClient, hosts: list[Host], cqls: Optional[list[Session]] = None):
+    # The cqls parameter is a temporary workaround for testing the recovery mode in the presence of live zero-token
+    # nodes. A zero-token node requires a different cql session not to be ignored by the driver because of empty tokens
+    # in the system.peers table.
     assert len(hosts) != 0
 
-    topo_results = await asyncio.gather(*(manager.cql.run_async("SELECT * FROM system.topology", host=host) for host in hosts))
+    if cqls is None:
+        cqls = [manager.cql] * len(hosts)
+
+    topo_results = await asyncio.gather(*(cql.run_async("SELECT * FROM system.topology", host=host) for cql, host in zip(cqls, hosts)))
 
     for host, topo_res in zip(hosts, topo_results):
         logging.info(f"Dumping the state of system.topology as seen by {host}:")
         for row in topo_res:
             logging.info(f"  {row}")
 
-    for host, topo_res in zip(hosts, topo_results):
+    for cql, host, topo_res in zip(cqls, hosts, topo_results):
         assert len(topo_res) != 0
 
         for row in topo_res:
@@ -228,9 +247,8 @@ async def check_system_topology_and_cdc_generations_v3_consistency(manager: Mana
             assert row.release_version is not None
             assert row.supported_features is not None
             assert row.shard_count is not None
-            assert row.tokens is not None
 
-            assert len(row.tokens) == row.num_tokens
+            assert (0 if row.tokens is None else len(row.tokens)) == row.num_tokens
 
         assert topo_res[0].committed_cdc_generations is not None
         committed_generations = frozenset(gen[1] for gen in topo_res[0].committed_cdc_generations)
@@ -246,7 +264,7 @@ async def check_system_topology_and_cdc_generations_v3_consistency(manager: Mana
         assert enabled_features == computed_enabled_features
         assert "SUPPORTS_CONSISTENT_TOPOLOGY_CHANGES" in enabled_features
 
-        cdc_res = await manager.cql.run_async("SELECT * FROM system.cdc_generations_v3", host=host)
+        cdc_res = await cql.run_async("SELECT * FROM system.cdc_generations_v3", host=host)
         assert len(cdc_res) != 0
 
         all_generations = frozenset(row.id for row in cdc_res)
@@ -254,6 +272,49 @@ async def check_system_topology_and_cdc_generations_v3_consistency(manager: Mana
 
         # Check that the contents fetched from the current host are the same as for other nodes
         assert topo_results[0] == topo_res
+
+async def check_node_log_for_failed_mutations(manager: ManagerClient, server: ServerInfo):
+    logging.info(f"Checking that node {server} had no failed mutations")
+    log = await manager.server_open_log(server.server_id)
+    occurrences = await log.grep(expr="Failed to apply mutation from")
+    assert len(occurrences) == 0
+
+
+async def start_writes(cql: Session, rf: int, cl: ConsistencyLevel, concurrency: int = 3):
+    logging.info(f"Starting to asynchronously write, concurrency = {concurrency}")
+
+    stop_event = asyncio.Event()
+
+    ks_name = unique_name()
+    await cql.run_async(f"CREATE KEYSPACE {ks_name} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {rf}}}")
+    await cql.run_async(f"USE {ks_name}")
+    await cql.run_async(f"CREATE TABLE tbl (pk int PRIMARY KEY, v int)")
+
+    # In the test we only care about whether operations report success or not
+    # and whether they trigger errors in the nodes' logs. Inserting the same
+    # value repeatedly is enough for our purposes.
+    stmt = SimpleStatement("INSERT INTO tbl (pk, v) VALUES (0, 0)", consistency_level=cl)
+
+    async def do_writes(worker_id: int):
+        write_count = 0
+        while not stop_event.is_set():
+            start_time = time.time()
+            try:
+                await cql.run_async(stmt)
+                write_count += 1
+            except Exception as e:
+                logging.error(f"Write started {time.time() - start_time}s ago failed: {e}")
+                raise
+        logging.info(f"Worker #{worker_id} did {write_count} successful writes")
+
+    tasks = [asyncio.create_task(do_writes(worker_id)) for worker_id in range(concurrency)]
+
+    async def finish():
+        logging.info("Stopping write workers")
+        stop_event.set()
+        await asyncio.gather(*tasks)
+
+    return finish
 
 async def start_writes_to_cdc_table(cql: Session, concurrency: int = 3):
     logger.info(f"Starting to asynchronously write, concurrency = {concurrency}")
@@ -304,8 +365,7 @@ async def start_writes_to_cdc_table(cql: Session, concurrency: int = 3):
 
         stream_to_timestamp = { stream: gen.time for gen in generations for stream in gen.streams}
 
-        # FIXME: Doesn't work with all_pages=True (https://github.com/scylladb/scylladb/issues/19101)
-        cdc_log = await cql.run_async(f"SELECT * FROM {ks_name}.tbl_scylla_cdc_log", all_pages=False)
+        cdc_log = await cql.run_async(f"SELECT * FROM {ks_name}.tbl_scylla_cdc_log", all_pages=True)
         for log_entry in cdc_log:
             assert log_entry.cdc_stream_id in stream_to_timestamp
             timestamp = stream_to_timestamp[log_entry.cdc_stream_id]
@@ -336,6 +396,11 @@ async def trigger_snapshot(manager, server: ServerInfo) -> None:
     host = cql.cluster.metadata.get_host(server.ip_addr)
     await manager.api.client.post(f"/raft/trigger_snapshot/{group0_id}", host=server.ip_addr)
 
+async def trigger_stepdown(manager, server: ServerInfo) -> None:
+    cql = manager.get_cql()
+    host = cql.cluster.metadata.get_host(server.ip_addr)
+    await manager.api.client.post("/raft/trigger_stepdown", host=server.ip_addr)
+
 
 
 async def get_coordinator_host_ids(manager: ManagerClient) -> list[str]:
@@ -364,11 +429,20 @@ async def get_coordinator_host(manager: ManagerClient) -> ServerInfo:
     """Get coordinator ServerInfo"""
 
     coordinator_host_id = (await get_coordinator_host_ids(manager))[0]
-    server_id_maps = {await manager.get_host_id(srv.server_id):srv for srv in await manager.running_servers()}
-    coordinator_host = server_id_maps.get(coordinator_host_id, None)
-    assert coordinator_host, \
-        f"Node with host id {coordinator_host_id} was not found in cluster host ids {list(server_id_maps.keys())}"
-    return coordinator_host
+    host_ids = []
+    for s_info in await manager.running_servers():
+        with suppress(Exception):
+            host_ids.append(await manager.get_host_id(s_info.server_id))
+            if host_ids[-1] == coordinator_host_id:
+                return s_info
+    raise AssertionError(f"Node with host id {coordinator_host_id} was not found in cluster host ids {host_ids}")
+
+
+async def get_non_coordinator_host(manager: ManagerClient) -> ServerInfo | None:
+    """Get first non-coordinator ServerInfo."""
+
+    coordinator_id = (await get_coordinator_host(manager=manager)).server_id
+    return next((s_info for s_info in await manager.running_servers() if s_info.server_id != coordinator_id), None)
 
 
 def get_uuid_from_str(string: str) -> str:
@@ -396,22 +470,22 @@ async def wait_new_coordinator_elected(manager: ManagerClient, expected_num_of_e
     await wait_for(new_coordinator_elected, deadline=deadline)
 
 @asynccontextmanager
-async def new_test_keyspace(cql, opts):
+async def new_test_keyspace(cql, opts, host=None):
     """
     A utility function for creating a new temporary keyspace with given
     options. It can be used in a "async with", as:
         async with new_test_keyspace(cql, '...') as keyspace:
     """
     keyspace = unique_name()
-    await cql.run_async("CREATE KEYSPACE " + keyspace + " " + opts)
+    await cql.run_async("CREATE KEYSPACE " + keyspace + " " + opts, host=host)
     try:
         yield keyspace
     finally:
-        await cql.run_async("DROP KEYSPACE " + keyspace)
+        await cql.run_async("DROP KEYSPACE " + keyspace, host=host)
 
 previously_used_table_names = []
 @asynccontextmanager
-async def new_test_table(cql, keyspace, schema, extra=""):
+async def new_test_table(cql, keyspace, schema, extra="", host=None, reuse_tables=True):
     """
     A utility function for creating a new temporary table with a given schema.
     Because Scylla becomes slower when a huge number of uniquely-named tables
@@ -422,16 +496,20 @@ async def new_test_table(cql, keyspace, schema, extra=""):
        async with create_table(cql, test_keyspace, '...') as table:
     """
     global previously_used_table_names
-    if not previously_used_table_names:
-        previously_used_table_names.append(unique_name())
-    table_name = previously_used_table_names.pop()
+    if reuse_tables:
+        if not previously_used_table_names:
+            previously_used_table_names.append(unique_name())
+        table_name = previously_used_table_names.pop()
+    else:
+        table_name = unique_name()
     table = keyspace + "." + table_name
-    await cql.run_async("CREATE TABLE " + table + "(" + schema + ")" + extra)
+    await cql.run_async("CREATE TABLE " + table + "(" + schema + ")" + extra, host=host)
     try:
         yield table
     finally:
-        await cql.run_async("DROP TABLE " + table)
-        previously_used_table_names.append(table_name)
+        await cql.run_async("DROP TABLE " + table, host=host)
+        if reuse_tables:
+            previously_used_table_names.append(table_name)
 
 @asynccontextmanager
 async def new_materialized_view(cql, table, select, pk, where, extra=""):
@@ -446,3 +524,28 @@ async def new_materialized_view(cql, table, select, pk, where, extra=""):
         yield mv
     finally:
         await cql.run_async(f"DROP MATERIALIZED VIEW {mv}")
+
+
+async def get_raft_log_size(cql, host) -> int:
+    query = "select count(\"index\") from system.raft"
+    return (await cql.run_async(query, host=host))[0][0]
+
+
+async def get_raft_snap_id(cql, host) -> str:
+    query = "select snapshot_id from system.raft limit 1"
+    return (await cql.run_async(query, host=host))[0].snapshot_id
+
+
+@contextmanager
+def disable_schema_agreement_wait(cql: Session):
+    """
+    A context manager that temporarily disables the schema agreement wait
+    for the given cql session.
+    """
+    assert hasattr(cql.cluster, "max_schema_agreement_wait")
+    old_value = cql.cluster.max_schema_agreement_wait
+    cql.cluster.max_schema_agreement_wait = 0
+    try:
+        yield
+    finally:
+        cql.cluster.max_schema_agreement_wait = old_value

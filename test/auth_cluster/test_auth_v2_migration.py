@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2024-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 import asyncio
@@ -10,13 +10,20 @@ import pytest
 import time
 
 from test.pylib.manager_client import ManagerClient
-from test.pylib.util import read_barrier, wait_for_cql_and_get_hosts, unique_name
+from test.pylib.rest_client import get_host_api_address, read_barrier
+from test.pylib.util import wait_for_cql_and_get_hosts, unique_name
 from cassandra.cluster import ConsistencyLevel
 from test.topology.util import wait_until_topology_upgrade_finishes, enter_recovery_state, reconnect_driver, \
         delete_raft_topology_state, delete_raft_data_and_upgrade_state, wait_until_upgrade_finishes
 
 def auth_data():
     return [
+        {
+            "statement": "INSERT INTO system_distributed.service_levels (service_level, timeout, workload_type) VALUES (?, ?, ?)",
+            "rows": [
+                ("sl1", None, None),
+            ]
+        },
         {
             "statement": "INSERT INTO system_auth.roles (role, can_login, is_superuser, member_of, salted_hash) VALUES (?, ?, ?, ?, ?)",
             "rows": [
@@ -35,7 +42,7 @@ def auth_data():
         {
             "statement": "INSERT INTO system_auth.role_attributes (role, name, value) VALUES (?, ?, ?)",
             "rows": [
-                ("users", "service_level", "sl:fefe"),
+                ("users", "service_level", "sl1"),
             ]
         },
     ]
@@ -86,7 +93,7 @@ async def check_auth_v2_data_migration(manager: ManagerClient, hosts):
     cql = manager.get_cql()
     # auth reads are eventually consistent so we need to make sure hosts are up-to-date
     assert hosts
-    await asyncio.gather(*(read_barrier(cql, host) for host in hosts))
+    await asyncio.gather(*(read_barrier(manager.api, get_host_api_address(host)) for host in hosts))
 
     data = auth_data()
 
@@ -101,17 +108,17 @@ async def check_auth_v2_data_migration(manager: ManagerClient, hosts):
             continue
         member_of = frozenset(row.member_of) if row.member_of else None
         roles.add((row.role, row.can_login, row.is_superuser, member_of, row.salted_hash))
-    assert roles == set(data[0]["rows"])
+    assert roles == set(data[1]["rows"])
 
     role_members = set()
     for row in await cql.run_async("SELECT * FROM system.role_members"):
         role_members.add((row.role, row.member))
-    assert role_members == set(data[1]["rows"])
+    assert role_members == set(data[2]["rows"])
 
     role_attributes = set()
     for row in await cql.run_async("SELECT * FROM system.role_attributes"):
         role_attributes.add((row.role, row.name, row.value))
-    assert role_attributes == set(data[2]["rows"])
+    assert role_attributes == set(data[3]["rows"])
 
 
 async def check_auth_v2_works(manager: ManagerClient, hosts):
@@ -128,7 +135,7 @@ async def check_auth_v2_works(manager: ManagerClient, hosts):
     username = unique_name("user_after_migration_")
     logging.info(f"Create role after migration: {username}")
     await cql.run_async(f"CREATE ROLE {username}")
-    await asyncio.gather(*(read_barrier(cql, host) for host in hosts))
+    await asyncio.gather(*(read_barrier(manager.api, get_host_api_address(host)) for host in hosts))
     # see warmup_v1_static_values for background about checks below
     # check if it was added to a new table
     assert len(await cql.run_async(f"SELECT role FROM system.roles WHERE role = '{username}'")) == 1
@@ -188,7 +195,7 @@ async def test_auth_v2_during_recovery(manager: ManagerClient):
     role_name = "ro" + unique_name()
     await cql.run_async(f"CREATE ROLE {role_name}")
     # auth reads are eventually consistent so we need to sync all nodes
-    await asyncio.gather(*(read_barrier(cql, host) for host in hosts))
+    await asyncio.gather(*(read_barrier(manager.api, get_host_api_address(host)) for host in hosts))
 
     logging.info("Read roles before recovery")
     roles = [row.role for row in await cql.run_async(f"LIST ROLES")]

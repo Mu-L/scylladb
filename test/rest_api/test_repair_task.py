@@ -1,8 +1,4 @@
-import sys
-
-# Use the util.py library from ../cql-pytest:
-sys.path.insert(1, sys.path[0] + '/test/cql-pytest')
-from util import new_test_table, new_test_keyspace
+from ..cqlpy.util import new_test_table, new_test_keyspace
 from test.rest_api.rest_util import set_tmp_task_ttl, scylla_inject_error
 from test.rest_api.task_manager_utils import list_tasks, drain_module_tasks, get_task_status, get_task_status_recursively, wait_for_task, check_child_parent_relationship, get_children
 
@@ -105,9 +101,9 @@ def test_repair_task_progress(cql, this_dc, rest_api):
                         status = statuses[0]
                         assert "children_ids" in status, "No child tasks created"
 
-                        for child_id in status["children_ids"]:
+                        for child_ident in status["children_ids"]:
                             # Check if task state is correct.
-                            child_status = get_task_status(rest_api, child_id)
+                            child_status = get_task_status(rest_api, child_ident["task_id"])
                             assert child_status["state"] == "running", "Incorrect task progress"
                             assert child_status["progress_completed"] * 2 <= child_status["progress_total"], "Incorrect task progress"
 

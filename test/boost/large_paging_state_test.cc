@@ -3,16 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
+#include "utils/assert.hh"
 #include <boost/test/unit_test.hpp>
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 
 #include "test/lib/cql_test_env.hh"
 #include "transport/messages/result_message.hh"
 #include "types/types.hh"
+
+BOOST_AUTO_TEST_SUITE(large_paging_state_test)
 
 static lw_shared_ptr<service::pager::paging_state> extract_paging_state(::shared_ptr<cql_transport::messages::result_message> res) {
     auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(res);
@@ -69,7 +73,7 @@ SEASTAR_TEST_CASE(test_use_high_bits_of_remaining_rows_in_paging_state) {
             test_remaining = test_remaining - rows_fetched;
             if (has_more_pages(msg)) {
                 paging_state = extract_paging_state(msg);
-                assert(paging_state);
+                SCYLLA_ASSERT(paging_state);
                 BOOST_REQUIRE_EQUAL(test_remaining, paging_state->get_remaining());
             }
         }
@@ -107,9 +111,11 @@ SEASTAR_TEST_CASE(test_use_high_bits_of_remaining_rows_in_paging_state_filtering
             test_remaining = test_remaining - rows_fetched;
             if (has_more_pages(msg)) {
                 paging_state = extract_paging_state(msg);
-                assert(paging_state);
+                SCYLLA_ASSERT(paging_state);
                 BOOST_REQUIRE_EQUAL(test_remaining, paging_state->get_remaining());
             }
         }
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

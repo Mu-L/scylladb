@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "standard_service_level_distributed_data_accessor.hh"
@@ -17,8 +17,8 @@ standard_service_level_distributed_data_accessor::standard_service_level_distrib
 _sys_dist_ks(sys_dist_ks) {
 }
 
-future<qos::service_levels_info> standard_service_level_distributed_data_accessor::get_service_levels() const {
-    return _sys_dist_ks.get_service_levels();
+future<qos::service_levels_info> standard_service_level_distributed_data_accessor::get_service_levels(qos::query_context ctx) const {
+    return _sys_dist_ks.get_service_levels(ctx);
 }
 
 future<qos::service_levels_info> standard_service_level_distributed_data_accessor::get_service_level(sstring service_level_name) const {

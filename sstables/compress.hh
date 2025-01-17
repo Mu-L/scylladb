@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -33,6 +33,7 @@
 // are read using O_DIRECT), nor uncompressed data. We intend to cache high-
 // level Cassandra rows, not disk blocks.
 
+#include "utils/assert.hh"
 #include <vector>
 #include <cstdint>
 #include <iterator>
@@ -171,7 +172,7 @@ struct compression {
             const_iterator(const const_iterator& other) = default;
 
             const_iterator& operator=(const const_iterator& other) {
-                assert(&_offsets == &other._offsets);
+                SCYLLA_ASSERT(&_offsets == &other._offsets);
                 _index = other._index;
                 return *this;
             }
@@ -368,11 +369,13 @@ compressor_ptr get_sstable_compressor(const compression&);
 // sstable alive, and the compression metadata is only a part of it.
 input_stream<char> make_compressed_file_k_l_format_input_stream(file f,
                 sstables::compression* cm, uint64_t offset, size_t len,
-                class file_input_stream_options options, reader_permit permit);
+                class file_input_stream_options options, reader_permit permit,
+                std::optional<uint32_t> digest);
 
 input_stream<char> make_compressed_file_m_format_input_stream(file f,
                 sstables::compression* cm, uint64_t offset, size_t len,
-                class file_input_stream_options options, reader_permit permit);
+                class file_input_stream_options options, reader_permit permit,
+                std::optional<uint32_t> digest);
 
 output_stream<char> make_compressed_file_m_format_output_stream(output_stream<char> out,
                 sstables::compression* cm,

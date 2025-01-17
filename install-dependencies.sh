@@ -49,6 +49,9 @@ debian_base_packages=(
     librapidxml-dev
     libcrypto++-dev
     libxxhash-dev
+    slapd
+    ldap-utils
+    libcpp-jwt-dev
 )
 
 fedora_packages=(
@@ -68,6 +71,7 @@ fedora_packages=(
     systemd-devel
     cryptopp-devel
     git
+    git-lfs
     python
     sudo
     patchelf
@@ -97,6 +101,7 @@ fedora_packages=(
     xxhash-devel
     makeself
     libzstd-static libzstd-devel
+    lz4-static lz4-devel
     rpm-build
     devscripts
     debhelper
@@ -111,7 +116,18 @@ fedora_packages=(
     wabt
     binaryen
     lcov
+    java-11-openjdk-devel # for tools/java
+
     llvm-bolt
+    moreutils
+    iproute
+    llvm
+    openldap-servers
+    openldap-devel
+    toxiproxy
+    cyrus-sasl
+    fipscheck
+    cpp-jwt-devel
 )
 
 # lld is not available on s390x, see
@@ -141,6 +157,8 @@ declare -A pip_packages=(
     [scylla-api-client]=
     [treelib]=
     [allure-pytest]=
+    [pytest-xdist]=
+    [pykmip]=
 )
 
 pip_symlinks=(
@@ -158,6 +176,9 @@ centos_packages=(
     scylla-python34-pyparsing20
     systemd-devel
     pigz
+    openldap-servers
+    openldap-devel
+    cpp-jwt-devel
 )
 
 # 1) glibc 2.30-3 has sys/sdt.h (systemtap include)
@@ -184,7 +205,7 @@ arch_packages=(
 )
 
 go_arch() {
-    declare -A local GO_ARCH=(
+    local -A GO_ARCH=(
         ["x86_64"]=amd64
         ["aarch64"]=arm64
         ["s390x"]=s390x
@@ -192,11 +213,11 @@ go_arch() {
     echo ${GO_ARCH["$(arch)"]}
 }
 
-NODE_EXPORTER_VERSION=1.7.0
+NODE_EXPORTER_VERSION=1.8.2
 declare -A NODE_EXPORTER_CHECKSUM=(
-    ["x86_64"]=a550cd5c05f760b7934a2d0afad66d2e92e681482f5f57a917465b1fba3b02a6
-    ["aarch64"]=e386c7b53bc130eaf5e74da28efc6b444857b77df8070537be52678aefd34d96
-    ["s390x"]=aeda68884918f10b135b76bbcd4977cb7a1bb3c4c98a8551f8d2183bafdd9264
+    ["x86_64"]=6809dd0b3ec45fd6e992c19071d6b5253aed3ead7bf0686885a51d85c6643c66
+    ["aarch64"]=627382b9723c642411c33f48861134ebe893e70a63bcc8b3fc0619cd0bfac4be
+    ["s390x"]=971481f06a985e9fcaee9bcd8da99a830d5b9e5f21e5225694de7e23401327c4
 )
 NODE_EXPORTER_DIR=/opt/scylladb/dependencies
 
@@ -302,7 +323,6 @@ fi
 umask 0022
 
 ./seastar/install-dependencies.sh
-./tools/jmx/install-dependencies.sh
 ./tools/java/install-dependencies.sh
 
 if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
@@ -316,8 +336,11 @@ if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
     else
         apt-get -y install libsystemd-dev antlr3 libyaml-cpp-dev
     fi
+    apt-get -y install libssl-dev
+
     echo -e "Configure example:\n\t./configure.py --enable-dpdk --mode=release --static-boost --static-yaml-cpp --compiler=/opt/scylladb/bin/g++-7 --cflags=\"-I/opt/scylladb/include -L/opt/scylladb/lib/x86-linux-gnu/\" --ldflags=\"-Wl,-rpath=/opt/scylladb/lib\""
 elif [ "$ID" = "fedora" ]; then
+    fedora_packages+=(openssl-devel)
     if rpm -q --quiet yum-utils; then
         echo
         echo "This script will install dnf-utils package, witch will conflict with currently installed package: yum-utils"
@@ -327,7 +350,7 @@ elif [ "$ID" = "fedora" ]; then
     dnf install -y "${fedora_packages[@]}" "${fedora_python3_packages[@]}"
     PIP_DEFAULT_ARGS="--only-binary=:all: -v"
     pip_constrained_packages=""
-    for package in ${!pip_packages[@]}
+    for package in "${!pip_packages[@]}"
     do
         pip_constrained_packages="${pip_constrained_packages} ${package}${pip_packages[$package]}"
     done
@@ -344,6 +367,7 @@ elif [ "$ID" = "fedora" ]; then
         fi
     fi
 elif [ "$ID" = "centos" ]; then
+    centos_packages+=(openssl-devel)
     dnf install -y "${centos_packages[@]}"
     echo -e "Configure example:\n\tpython3.4 ./configure.py --enable-dpdk --mode=release --static-boost --compiler=/opt/scylladb/bin/g++-7.3 --python python3.4 --ldflag=-Wl,-rpath=/opt/scylladb/lib64 --cflags=-I/opt/scylladb/include --with-antlr3=/opt/scylladb/bin/antlr3"
 elif [ "$ID" == "arch" ]; then

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "reader.hh"
@@ -14,7 +14,9 @@
 #include "sstables/m_format_read_helpers.hh"
 #include "sstables/sstable_mutation_reader.hh"
 #include "sstables/processing_result_generator.hh"
+#include "utils/assert.hh"
 #include "utils/to_string.hh"
+#include "utils/value_or_reference.hh"
 
 namespace sstables {
 namespace mx {
@@ -74,22 +76,6 @@ public:
     };
     std::vector<cell> _cells;
     collection_mutation_description _cm;
-
-    struct range_tombstone_start {
-        clustering_key_prefix ck;
-        bound_kind kind;
-        tombstone tomb;
-
-        position_in_partition_view position() const {
-            return position_in_partition_view(position_in_partition_view::range_tag_t{}, bound_view(ck, kind));
-        }
-    };
-
-    inline friend std::ostream& operator<<(std::ostream& o, const mp_row_consumer_m::range_tombstone_start& rt_start) {
-        fmt::print(o, "{{ clustering: {}, kind: {}, tombstone: {}}}",
-                   rt_start.ck, rt_start.kind, rt_start.tomb);
-        return o;
-    }
 
     data_consumer::proceed consume_range_tombstone_start(clustering_key_prefix ck, bound_kind k, tombstone t) {
         sstlog.trace("mp_row_consumer_m {}: consume_range_tombstone_start(ck={}, k={}, t={})", fmt::ptr(this), ck, k, t);
@@ -192,7 +178,7 @@ public:
     void check_column_missing_in_current_schema(const column_translation::column_info& column_info,
                                                 api::timestamp_type timestamp) const {
         if (!column_info.id) {
-            sstring name = sstring(to_sstring_view(*column_info.name));
+            sstring name = sstring(to_string_view(*column_info.name));
             auto it = _schema->dropped_columns().find(name);
             if (it == _schema->dropped_columns().end() || timestamp > it->second.timestamp) {
                 throw malformed_sstable_exception(format("Column {} missing in current schema", name));
@@ -318,7 +304,7 @@ public:
     }
 
     row_processing_result consume_row_start(const std::vector<fragmented_temporary_buffer>& ecp) {
-        auto key = clustering_key_prefix::from_range(ecp | boost::adaptors::transformed(
+        auto key = clustering_key_prefix::from_range(ecp | std::views::transform(
             [] (const fragmented_temporary_buffer& b) { return fragmented_temporary_buffer::view(b); }));
 
         _sst->get_stats().on_row_read();
@@ -491,7 +477,7 @@ public:
     data_consumer::proceed consume_range_tombstone(const std::vector<fragmented_temporary_buffer>& ecp,
                                             bound_kind kind,
                                             tombstone tomb) {
-        auto ck = clustering_key_prefix::from_range(ecp | boost::adaptors::transformed(
+        auto ck = clustering_key_prefix::from_range(ecp | std::views::transform(
             [] (const fragmented_temporary_buffer& b) { return fragmented_temporary_buffer::view(b); }));
         if (kind == bound_kind::incl_start || kind == bound_kind::excl_start) {
             return consume_range_tombstone_start(std::move(ck), kind, std::move(tomb));
@@ -504,7 +490,7 @@ public:
                                             sstables::bound_kind_m kind,
                                             tombstone end_tombstone,
                                             tombstone start_tombstone) {
-        auto ck = clustering_key_prefix::from_range(ecp | boost::adaptors::transformed(
+        auto ck = clustering_key_prefix::from_range(ecp | std::views::transform(
             [] (const fragmented_temporary_buffer& b) { return fragmented_temporary_buffer::view(b); }));
         switch (kind) {
         case bound_kind_m::incl_end_excl_start: {
@@ -516,7 +502,7 @@ public:
             return consume_range_tombstone_boundary(std::move(pos), end_tombstone, start_tombstone);
         }
         default:
-            assert(false && "Invalid boundary type");
+            SCYLLA_ASSERT(false && "Invalid boundary type");
         }
     }
 
@@ -725,7 +711,7 @@ private:
     std::vector<fragmented_temporary_buffer> _row_key;
 
     struct row_schema {
-        using column_range = boost::iterator_range<std::vector<column_translation::column_info>::const_iterator>;
+        using column_range = std::ranges::subrange<std::vector<column_translation::column_info>::const_iterator>;
 
         // All columns for this kind of row inside column_translation of the current sstable
         column_range _all_columns;
@@ -743,7 +729,7 @@ private:
 
     uint64_t _missing_columns_to_read;
 
-    boost::iterator_range<std::vector<std::optional<uint32_t>>::const_iterator> _ck_column_value_fix_lengths;
+    std::ranges::subrange<std::vector<std::optional<uint32_t>>::const_iterator> _ck_column_value_fix_lengths;
 
     tombstone _row_tombstone;
     tombstone _row_shadowable_tombstone;
@@ -780,7 +766,7 @@ private:
         _row->_columns = _row->_all_columns;
     }
     void setup_columns(row_schema& rs, const std::vector<column_translation::column_info>& columns) {
-        rs._all_columns = boost::make_iterator_range(columns);
+        rs._all_columns = std::ranges::subrange(columns);
         rs._columns_selector = boost::dynamic_bitset<uint64_t>(columns.size());
     }
     void skip_absent_columns() {
@@ -788,7 +774,7 @@ private:
         if (pos == boost::dynamic_bitset<uint64_t>::npos) {
             pos = _row->_columns.size();
         }
-        _row->_columns.advance_begin(pos);
+        _row->_columns.advance(pos);
     }
     bool no_more_columns() const { return _row->_columns.empty(); }
     void move_to_next_column() {
@@ -796,7 +782,7 @@ private:
         size_t next_pos = _row->_columns_selector.find_next(current_pos);
         size_t jump_to_next = (next_pos == boost::dynamic_bitset<uint64_t>::npos) ? _row->_columns.size()
                                                                                   : next_pos - current_pos;
-        _row->_columns.advance_begin(jump_to_next);
+        _row->_columns.advance(jump_to_next);
     }
     bool is_column_simple() const { return !_row->_columns.front().is_collection; }
     bool is_column_counter() const { return _row->_columns.front().is_counter; }
@@ -810,16 +796,16 @@ private:
         _row_key.clear();
         _row_key.reserve(column_value_fix_lengths.size());
         if (column_value_fix_lengths.empty()) {
-            _ck_column_value_fix_lengths = boost::make_iterator_range(column_value_fix_lengths);
+            _ck_column_value_fix_lengths = std::ranges::subrange(column_value_fix_lengths);
         } else {
-            _ck_column_value_fix_lengths = boost::make_iterator_range(std::begin(column_value_fix_lengths),
-                                                                      std::begin(column_value_fix_lengths) + _ck_size);
+            _ck_column_value_fix_lengths = std::ranges::subrange(std::begin(column_value_fix_lengths),
+                                                                 std::begin(column_value_fix_lengths) + _ck_size);
         }
         _ck_blocks_header_offset = 0u;
     }
     bool no_more_ck_blocks() const { return _ck_column_value_fix_lengths.empty(); }
     void move_to_next_ck_block() {
-        _ck_column_value_fix_lengths.advance_begin(1);
+        _ck_column_value_fix_lengths.advance(1);
         ++_ck_blocks_header_offset;
         if (_ck_blocks_header_offset == 32u) {
             _ck_blocks_header_offset = 0u;
@@ -1047,6 +1033,8 @@ private:
         column_label:
             if (_subcolumns_to_read == 0) {
                 if (no_more_columns()) {
+                    // Release buffer used to read column values.
+                    _column_value = fragmented_temporary_buffer();
                     _state = state::FLAGS;
                     if (_consumer.consume_row_end() == data_consumer::proceed::no) {
                         co_yield data_consumer::proceed::no;
@@ -1262,22 +1250,6 @@ public:
     }
 };
 
-template <typename T>
-struct value_or_reference {
-    std::optional<T> _opt;
-    const T& _ref;
-
-    value_or_reference(T&& v) : _opt(std::move(v)), _ref(*_opt) {}
-    value_or_reference(const T& v) : _ref(v) {}
-
-    value_or_reference(value_or_reference&& o) : _opt(std::move(o._opt)), _ref(_opt ? *_opt : o._ref) {}
-    value_or_reference(const value_or_reference& o) : _opt(o._opt), _ref(_opt ? *_opt : o._ref) {}
-
-    const T& get() const {
-        return _ref;
-    }
-};
-
 class mx_sstable_mutation_reader : public mp_row_consumer_reader_mx {
     using DataConsumeRowsContext = data_consume_rows_context_m<mp_row_consumer_m>;
     using Consumer = mp_row_consumer_m;
@@ -1295,6 +1267,8 @@ class mx_sstable_mutation_reader : public mp_row_consumer_reader_mx {
     streamed_mutation::forwarding _fwd;
     mutation_reader::forwarding _fwd_mr;
     read_monitor& _monitor;
+    integrity_check _integrity;
+    lw_shared_ptr<checksum> _checksum;
 
     // For reversed (single partition) reads, points to the current position in the sstable
     // of the reversing data source used underneath (see `partition_reversing_data_source`).
@@ -1309,7 +1283,8 @@ public:
                             tracing::trace_state_ptr trace_state,
                             streamed_mutation::forwarding fwd,
                             mutation_reader::forwarding fwd_mr,
-                            read_monitor& mon)
+                            read_monitor& mon,
+                            integrity_check integrity)
             : mp_row_consumer_reader_mx(std::move(schema), permit, std::move(sst))
             , _slice_holder(std::move(slice))
             , _slice(_slice_holder.get())
@@ -1321,7 +1296,8 @@ public:
             , _pr(pr)
             , _fwd(fwd)
             , _fwd_mr(fwd_mr)
-            , _monitor(mon) {
+            , _monitor(mon)
+            , _integrity(integrity) {
         if (reversed()) {
             if (!_single_partition_read) {
                 on_internal_error(sstlog, format(
@@ -1330,7 +1306,7 @@ public:
                         " partition range: {}", pr));
             }
             // FIXME: if only the defaults were better...
-            //assert(fwd_mr == mutation_reader::forwarding::no);
+            //SCYLLA_ASSERT(fwd_mr == mutation_reader::forwarding::no);
         }
     }
 
@@ -1375,7 +1351,7 @@ private:
                 _read_enabled = false;
                 return make_ready_future<>();
             }
-            assert(_index_reader->element_kind() == indexable_element::partition);
+            SCYLLA_ASSERT(_index_reader->element_kind() == indexable_element::partition);
             return skip_to(_index_reader->element_kind(), start).then([this] {
                 _sst->get_stats().on_partition_seek();
             });
@@ -1455,7 +1431,7 @@ private:
         if (!pos || pos->is_before_all_fragments(*_schema)) {
             return make_ready_future<>();
         }
-        assert (_current_partition_key);
+        SCYLLA_ASSERT (_current_partition_key);
         return [this] {
             if (!_index_in_current_partition) {
                 _index_in_current_partition = true;
@@ -1473,7 +1449,7 @@ private:
                     // The reversing data source will notice the skip and update the data ranges
                     // from which it prepares the data given to us.
 
-                    assert(_reversed_read_sstable_position);
+                    SCYLLA_ASSERT(_reversed_read_sstable_position);
                     auto ip = _index_reader->data_file_positions();
                     if (ip.end >= *_reversed_read_sstable_position) {
                         // The reversing data source was already ahead (in reverse - its position was smaller)
@@ -1521,16 +1497,43 @@ private:
         if (is_initialized()) {
             co_return true;
         }
+
+        _will_likely_slice = will_likely_slice(_slice);
+
         if (_single_partition_read) {
             _sst->get_stats().on_single_partition_read();
             const auto& key = dht::ring_position_view(_pr.start()->value());
-            position_in_partition_view pos = get_slice_upper_bound(*_schema, _slice, key);
-            const auto present = co_await get_index_reader().advance_lower_and_check_if_present(key, pos);
+
+            const auto present = co_await get_index_reader().advance_lower_and_check_if_present(key);
 
             if (!present) {
                 _sst->get_filter_tracker().add_false_positive();
                 co_return false;
             }
+
+            if (_will_likely_slice && !reversed()) {
+                // Warm up the clustered cursor using lower bound so that later upper bound lookup
+                // works on a populated cached_promoted_index.
+                // We use lower bound so that we read the same blocks as later lower-bound slicing would,
+                // so that we don't incur extra IO for cases where looking up upper bound is not worth it, that
+                // is when upper bound is far from the lower bound. If upper bound is near lower bound, then
+                // warming up using lower bound will populate cached_promoted_index with blocks which will
+                // allow us to locate the upper bound block accurately.
+                // This is especially important for single-row reads, where the bounds are around the same key.
+                // In this case we want to read the data file range which belongs to a single promoted index block.
+                // It doesn't matter that the upper bound is not exactly the same. They both will likely lie in the
+                // same block, and if not, binary search will bring adjacent blocks into cache.
+                // Even if upper bound is not near, the binary search will populate the cache with blocks
+                // which can be used to narrow down the data file range somewhat.
+                position_in_partition_view lb = get_slice_lower_bound(*_schema, _slice, key);
+                clustered_index_cursor *cur = _index_reader->current_clustered_cursor();
+                if (cur) {
+                    co_await cur->advance_to(lb);
+                }
+            }
+
+            position_in_partition_view pos = get_slice_upper_bound(*_schema, _slice, key);
+            co_await _index_reader->advance_upper_past(pos);
 
             _sst->get_filter_tracker().add_true_positive();
             if (reversed()) {
@@ -1542,28 +1545,41 @@ private:
         }
 
         auto [begin, end] = _index_reader->data_file_positions();
-        assert(end);
+        SCYLLA_ASSERT(end);
+
+        sstlog.trace("sstable_reader: {}: data file range [{}, {})", fmt::ptr(this), begin, *end);
+
+        if (_integrity) {
+            // Caller must retain a reference to checksum component while in use by the stream.
+            _checksum = co_await _sst->read_checksum();
+            // The stream checks the digest only if the read range covers all data.
+            if (begin == 0 && *end == _sst->data_size()) {
+                co_await _sst->read_digest();
+            }
+        }
 
         if (_single_partition_read) {
             _read_enabled = (begin != *end);
             if (reversed()) {
+                if (_integrity) {
+                    on_internal_error(sstlog, "mx reader: integrity checking not supported for single-partition reversed reads");
+                }
                 auto reversed_context = data_consume_reversed_partition<DataConsumeRowsContext>(
                         *_schema, _sst, *_index_reader, _consumer, { begin, *end });
                 _context = std::move(reversed_context.the_context);
                 _reversed_read_sstable_position = &reversed_context.current_position_in_sstable;
             } else {
-                _context = data_consume_single_partition<DataConsumeRowsContext>(*_schema, _sst, _consumer, { begin, *end });
+                _context = data_consume_single_partition<DataConsumeRowsContext>(*_schema, _sst, _consumer, { begin, *end }, _integrity);
             }
         } else {
             sstable::disk_read_range drr{begin, *end};
             auto last_end = _fwd_mr ? _sst->data_size() : drr.end;
             _read_enabled = bool(drr);
-            _context = data_consume_rows<DataConsumeRowsContext>(*_schema, _sst, _consumer, std::move(drr), last_end);
+            _context = data_consume_rows<DataConsumeRowsContext>(*_schema, _sst, _consumer, std::move(drr), last_end, _integrity);
         }
 
         _monitor.on_read_started(_context->reader_position());
         _index_in_current_partition = true;
-        _will_likely_slice = will_likely_slice(_slice);
         co_return true;
     }
     future<> skip_to(indexable_element el, uint64_t begin) {
@@ -1601,11 +1617,11 @@ public:
                 _partition_finished = true;
                 _before_partition = true;
                 _end_of_stream = false;
-                assert(_index_reader);
+                SCYLLA_ASSERT(_index_reader);
                 auto f1 = _index_reader->advance_to(pr);
                 return f1.then([this] {
                     auto [start, end] = _index_reader->data_file_positions();
-                    assert(end);
+                    SCYLLA_ASSERT(end);
                     if (start != *end) {
                         _read_enabled = true;
                         _index_in_current_partition = true;
@@ -1717,21 +1733,11 @@ static mutation_reader make_reader(
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr,
-        read_monitor& monitor) {
-    // If we're provided a reversed slice we must fix it since currently callers
-    // provide them in a 'half-reversed' format: the order of ranges in the slice is reversed,
-    // but the ranges themselves are not.
-    // FIXME: drop this workaround when callers are fixed to provide the slice
-    // in 'native-reversed' format (if ever).
-    if (slice.get().is_reversed()) {
-        return make_mutation_reader<mx_sstable_mutation_reader>(
-            std::move(sstable), schema, std::move(permit), range,
-            legacy_reverse_slice_to_native_reverse_slice(*schema, slice.get()), std::move(trace_state), fwd, fwd_mr, monitor);
-    }
-
+        read_monitor& monitor,
+        integrity_check integrity) {
     return make_mutation_reader<mx_sstable_mutation_reader>(
         std::move(sstable), std::move(schema), std::move(permit), range,
-        std::move(slice), std::move(trace_state), fwd, fwd_mr, monitor);
+        std::move(slice), std::move(trace_state), fwd, fwd_mr, monitor, integrity);
 }
 
 mutation_reader make_reader(
@@ -1743,9 +1749,10 @@ mutation_reader make_reader(
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr,
-        read_monitor& monitor) {
+        read_monitor& monitor,
+        integrity_check integrity) {
     return make_reader(std::move(sstable), std::move(schema), std::move(permit), range,
-            value_or_reference(slice), std::move(trace_state), fwd, fwd_mr, monitor);
+            value_or_reference(slice), std::move(trace_state), fwd, fwd_mr, monitor, integrity);
 }
 
 mutation_reader make_reader(
@@ -1757,43 +1764,76 @@ mutation_reader make_reader(
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr,
-        read_monitor& monitor) {
+        read_monitor& monitor,
+        integrity_check integrity) {
     return make_reader(std::move(sstable), std::move(schema), std::move(permit), range,
-            value_or_reference(std::move(slice)), std::move(trace_state), fwd, fwd_mr, monitor);
+            value_or_reference(std::move(slice)), std::move(trace_state), fwd, fwd_mr, monitor, integrity);
 }
 
-class mx_crawling_sstable_mutation_reader : public mp_row_consumer_reader_mx {
+/// a reader which does not support seeking to given position.
+///
+/// unlike mx_sstable_mutation_reader which allows fast forwarding read,
+/// mx_sstable_full_scan_reader
+///
+/// - always reads the full range, and it is not able to read a subset of the
+///   sstable
+/// - does not support fast forwarding
+///
+/// It is designed to be used in conditions where:
+/// - the index is not reliable, or
+/// - the consumer reads the whole sstable
+class mx_sstable_full_scan_reader : public mp_row_consumer_reader_mx {
     using DataConsumeRowsContext = data_consume_rows_context_m<mp_row_consumer_m>;
     using Consumer = mp_row_consumer_m;
     static_assert(RowConsumer<Consumer>);
     Consumer _consumer;
     std::unique_ptr<DataConsumeRowsContext> _context;
     read_monitor& _monitor;
+    integrity_check _integrity;
+    lw_shared_ptr<checksum> _checksum;
 public:
-    mx_crawling_sstable_mutation_reader(shared_sstable sst, schema_ptr schema,
+    mx_sstable_full_scan_reader(shared_sstable sst, schema_ptr schema,
              reader_permit permit,
              tracing::trace_state_ptr trace_state,
-             read_monitor& mon)
+             read_monitor& mon,
+             integrity_check integrity)
         : mp_row_consumer_reader_mx(std::move(schema), permit, std::move(sst))
         , _consumer(this, _schema, std::move(permit), _schema->full_slice(), std::move(trace_state), streamed_mutation::forwarding::no, _sst)
-        , _context(data_consume_rows<DataConsumeRowsContext>(*_schema, _sst, _consumer))
-        , _monitor(mon) {
+        , _monitor(mon)
+        , _integrity(integrity) {}
+private:
+    bool is_initialized() const {
+        return bool(_context);
+    }
+    future<> maybe_initialize() {
+        if (is_initialized()) {
+            co_return;
+        }
+        if (_integrity) {
+            // Caller must retain a reference to checksum component while in use by the stream.
+            _checksum = co_await _sst->read_checksum();
+            co_await _sst->read_digest();
+        }
+        _context = data_consume_rows<DataConsumeRowsContext>(*_schema, _sst, _consumer, _integrity);
         _monitor.on_read_started(_context->reader_position());
     }
 public:
     void on_out_of_clustering_range() override { }
     virtual future<> fast_forward_to(const dht::partition_range& pr) override {
-        on_internal_error(sstlog, "mx_crawling_sstable_mutation_reader: doesn't support fast_forward_to(const dht::partition_range&)");
+        on_internal_error(sstlog, "mx_sstable_full_scan_reader: doesn't support fast_forward_to(const dht::partition_range&)");
     }
     virtual future<> fast_forward_to(position_range cr) override {
-        on_internal_error(sstlog, "mx_crawling_sstable_mutation_reader: doesn't support fast_forward_to(position_range)");
+        on_internal_error(sstlog, "mx_sstable_full_scan_reader: doesn't support fast_forward_to(position_range)");
     }
     virtual future<> next_partition() override {
-        on_internal_error(sstlog, "mx_crawling_sstable_mutation_reader: doesn't support next_partition()");
+        on_internal_error(sstlog, "mx_sstable_full_scan_reader: doesn't support next_partition()");
     }
     virtual future<> fill_buffer() override {
         if (_end_of_stream) {
             return make_ready_future<>();
+        }
+        if (!is_initialized()) {
+            return maybe_initialize().then([this] { return fill_buffer(); });
         }
         if (_context->eof()) {
             _end_of_stream = true;
@@ -1807,19 +1847,20 @@ public:
         }
         _monitor.on_read_completed();
         return _context->close().handle_exception([_ = std::move(_context)] (std::exception_ptr ep) {
-            sstlog.warn("Failed closing of mx_crawling_sstable_mutation_reader: {}. Ignored since the reader is already done.", ep);
+            sstlog.warn("Failed closing of mx_sstable_full_scan_reader: {}. Ignored since the reader is already done.", ep);
         });
     }
 };
 
-mutation_reader make_crawling_reader(
+mutation_reader make_full_scan_reader(
         shared_sstable sstable,
         schema_ptr schema,
         reader_permit permit,
         tracing::trace_state_ptr trace_state,
-        read_monitor& monitor) {
-    return make_mutation_reader<mx_crawling_sstable_mutation_reader>(std::move(sstable), std::move(schema), std::move(permit),
-            std::move(trace_state), monitor);
+        read_monitor& monitor,
+        integrity_check integrity) {
+    return make_mutation_reader<mx_sstable_full_scan_reader>(std::move(sstable), std::move(schema), std::move(permit),
+            std::move(trace_state), monitor, integrity);
 }
 
 void mp_row_consumer_reader_mx::on_next_partition(dht::decorated_key key, tombstone tomb) {
@@ -1872,7 +1913,7 @@ private:
 
 private:
     clustering_key from_fragmented_buffer(const std::vector<fragmented_temporary_buffer>& ecp) {
-        return clustering_key_prefix::from_range(ecp | boost::adaptors::transformed(
+        return clustering_key_prefix::from_range(ecp | std::views::transform(
                 [] (const fragmented_temporary_buffer& b) { return fragmented_temporary_buffer::view(b); }));
     }
     void validate_fragment_order(mutation_fragment_v2::kind kind, std::optional<tombstone> new_current_tombstone) {
@@ -2029,7 +2070,7 @@ public:
         case bound_kind_m::excl_end_incl_start:
             return consume_range_tombstone(ecp, bound_kind::incl_start, start_tombstone);
         default:
-            assert(false && "Invalid boundary type");
+            SCYLLA_ASSERT(false && "Invalid boundary type");
         }
     }
 
@@ -2065,7 +2106,7 @@ future<uint64_t> validate(
         sstables::read_monitor& monitor) {
     auto schema = sstable->get_schema();
     validating_consumer consumer(schema, permit, sstable, std::move(error_handler));
-    auto context = data_consume_rows<data_consume_rows_context_m<validating_consumer>>(*schema, sstable, consumer);
+    auto context = data_consume_rows<data_consume_rows_context_m<validating_consumer>>(*schema, sstable, consumer, integrity_check::yes);
 
     std::optional<sstables::index_reader> idx_reader;
     idx_reader.emplace(sstable, permit, tracing::trace_state_ptr{}, sstables::use_caching::no, false);

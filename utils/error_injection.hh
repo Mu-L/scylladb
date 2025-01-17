@@ -3,14 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
+#include "utils/from_chars_exactly.hh"
 #include <seastar/core/future.hh>
 #include <seastar/core/sleep.hh>
-#include <seastar/core/seastar.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/on_internal_error.hh>
@@ -19,16 +20,12 @@
 
 #include "log.hh"
 
+#include <ranges>
 #include <algorithm>
 #include <chrono>
 #include <type_traits>
 #include <optional>
 #include <unordered_map>
-
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/adaptor/filtered.hpp>
-#include <boost/lexical_cast.hpp>
-
 
 namespace utils {
 
@@ -42,6 +39,14 @@ public:
 extern logging::logger errinj_logger;
 
 using error_injection_parameters = std::unordered_map<sstring, sstring>;
+
+// Wraps the argument to breakpoint injection (see the relevant inject() overload
+// in class error_injection below). The only parameter is the timeout after which
+// the pause is aborted
+struct wait_for_message {
+    std::chrono::milliseconds timeout;
+    wait_for_message(std::chrono::milliseconds tmo) noexcept : timeout(tmo) {}
+};
 
 /**
  * Error injection class can be used to create and manage code injections
@@ -155,7 +160,10 @@ class error_injection {
             if constexpr (std::is_same_v<T, std::string_view>) {
                 return s;
             } else {
-                return boost::lexical_cast<T>(s.data(), s.size());
+                return utils::from_chars_exactly<T>(s, [&] (std::string_view s) {
+                    return std::runtime_error(fmt::format("Failed to convert injected value [{}] for parameter [{}], injection [{}]",
+                        s, name, injection_name));
+                });
             }
         }
     };
@@ -234,7 +242,7 @@ public:
         }
 
         template <typename T = std::string_view>
-        std::optional<T> get(std::string_view key) {
+        std::optional<T> get(std::string_view key) const {
             if (!_shared_data) {
                 on_internal_error(errinj_logger, "injection_shared_data is not initialized");
             }
@@ -274,7 +282,7 @@ private:
             , shared_data(make_lw_shared<injection_shared_data>(std::move(parameters), injection_name)) {}
 
         void receive_message() {
-            assert(shared_data);
+            SCYLLA_ASSERT(shared_data);
 
             ++shared_data->received_message_count;
             shared_data->received_message_cv.broadcast();
@@ -353,20 +361,18 @@ public:
     }
 
     std::vector<sstring> enabled_injections() const {
-        return boost::copy_range<std::vector<sstring>>(_enabled | boost::adaptors::filtered([] (const auto& pair) {
-            return !pair.second.is_ongoing_oneshot();
-        }) | boost::adaptors::map_keys);
+        return _enabled
+                | std::views::filter([] (const auto& pair) { return !pair.second.is_ongoing_oneshot(); })
+                | std::views::keys
+                | std::ranges::to<std::vector<sstring>>();
     }
 
     // \brief Inject a lambda call
     // \param f lambda to be run
     [[gnu::always_inline]]
     void inject(const std::string_view& name, handler_fun f) {
-        if (!is_enabled(name)) {
+        if (!enter(name)) {
             return;
-        }
-        if (is_one_shot(name)) {
-            disable(name);
         }
         errinj_logger.debug("Triggering injection \"{}\"", name);
         f();
@@ -374,14 +380,9 @@ public:
 
     // \brief Inject a sleep for milliseconds
     [[gnu::always_inline]]
-    future<> inject(const std::string_view& name,
-            const std::chrono::milliseconds duration) {
-
-        if (!is_enabled(name)) {
+    future<> inject(const std::string_view& name, const std::chrono::milliseconds duration) {
+        if (!enter(name)) {
             return make_ready_future<>();
-        }
-        if (is_one_shot(name)) {
-            disable(name);
         }
         errinj_logger.debug("Triggering sleep injection \"{}\" ({}ms)", name, duration.count());
         return seastar::sleep(duration);
@@ -391,12 +392,8 @@ public:
     template <typename Clock, typename Duration>
     [[gnu::always_inline]]
     future<> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline) {
-
-        if (!is_enabled(name)) {
+        if (!enter(name)) {
             return make_ready_future<>();
-        }
-        if (is_one_shot(name)) {
-            disable(name);
         }
 
         // Time left until deadline
@@ -405,40 +402,17 @@ public:
         return seastar::sleep<Clock>(duration);
     }
 
-    // \brief Inject a sleep to deadline with lambda(timeout)
-    // Avoid adding a sleep continuation in the chain for disabled error injection
-    template <typename Clock, typename Duration, typename Func>
-    [[gnu::always_inline]]
-    std::invoke_result_t<Func> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline,
-                Func&& func) {
-        if (is_enabled(name)) {
-            if (is_one_shot(name)) {
-                disable(name);
-            }
-            std::chrono::milliseconds duration = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
-            errinj_logger.debug("Triggering sleep injection \"{}\" ({}ms)", name, duration.count());
-            return seastar::sleep<Clock>(duration).then([func = std::move(func)] {
-                    return func(); });
-        } else {
-            return func();
-        }
-    }
-
     // \brief Inject exception
     // \param exception_factory function returning an exception pointer
     template <typename Func>
     requires std::is_invocable_r_v<std::exception_ptr, Func>
     [[gnu::always_inline]]
     future<>
-    inject(const std::string_view& name,
-            Func&& exception_factory) {
-
-        if (!is_enabled(name)) {
+    inject(const std::string_view& name, Func&& exception_factory) {
+        if (!enter(name)) {
             return make_ready_future<>();
         }
-        if (is_one_shot(name)) {
-            disable(name);
-        }
+
         errinj_logger.debug("Triggering exception injection \"{}\"", name);
         return make_exception_future<>(exception_factory());
     }
@@ -470,6 +444,18 @@ public:
         });
 
         co_await func(handler);
+    }
+
+    // \brief Inject "breakpoint"
+    // Injects a pause in the code execution that's woken up explicitly by the injector
+    // request
+    // \param wfm -- the wait_for_message instance that describes details of the pause
+    future<> inject(const std::string_view& name, utils::wait_for_message wfm) {
+        co_await inject(name, [name, wfm] (injection_handler& handler) -> future<> {
+            errinj_logger.info("{}: waiting for message", name);
+            co_await handler.wait_for_message(std::chrono::steady_clock::now() + wfm.timeout);
+            errinj_logger.info("{}: message received", name);
+        });
     }
 
     template <typename T = std::string_view>
@@ -598,15 +584,6 @@ public:
         return make_ready_future<>();
     }
 
-    // \brief Inject a sleep to deadline (timeout) with lambda
-    // Avoid adding a continuation in the chain for disabled error injections
-    template <typename Clock, typename Duration, typename Func>
-    [[gnu::always_inline]]
-    std::invoke_result_t<Func> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline,
-                Func&& func) {
-        return func();
-    }
-
     // Inject exception
     template <typename Func>
     requires std::is_invocable_r_v<std::exception_ptr, Func>
@@ -621,6 +598,12 @@ public:
     // \param func function returning a future and taking an injection handler
     [[gnu::always_inline]]
     future<> inject(const std::string_view& name, waiting_handler_fun func, bool share_messages = true) {
+        return make_ready_future<>();
+    }
+
+    // \brief Inject "breakpoint"
+    [[gnu::always_inline]]
+    future<> inject(const std::string_view& name, utils::wait_for_message wfm) {
         return make_ready_future<>();
     }
 

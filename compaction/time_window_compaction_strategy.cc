@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "time_window_compaction_strategy.hh"
@@ -16,8 +16,8 @@
 #include <boost/range/algorithm/find.hpp>
 #include <boost/range/algorithm/remove_if.hpp>
 #include <boost/range/algorithm/min_element.hpp>
-#include <boost/range/algorithm/partial_sort.hpp>
-#include <boost/range/adaptor/reversed.hpp>
+
+#include <ranges>
 
 namespace sstables {
 
@@ -266,7 +266,7 @@ time_window_compaction_strategy::get_reshaping_job(std::vector<shared_sstable> i
             single_window.size(), !single_window.empty() && sstable_set_overlapping_count(schema, single_window) == 0);
 
     auto get_job_size = [] (const std::vector<shared_sstable>& ssts) {
-        return boost::accumulate(ssts | boost::adaptors::transformed(std::mem_fn(&sstable::bytes_on_disk)), uint64_t(0));
+        return std::ranges::fold_left(ssts | std::views::transform(std::mem_fn(&sstable::bytes_on_disk)), uint64_t(0), std::plus{});
     };
 
     // Targets a space overhead of 10%. All disjoint sstables can be compacted together as long as they won't
@@ -295,8 +295,9 @@ time_window_compaction_strategy::get_reshaping_job(std::vector<shared_sstable> i
             // When trimming, let's keep sstables with overlapping time window, so as to reduce write amplification.
             // For example, if there are N sstables spanning window W, where N <= 32, then we can produce all data for W
             // in a single compaction round, removing the need to later compact W to reduce its number of files.
-            boost::partial_sort(multi_window, multi_window.begin() + max_sstables, [](const shared_sstable &a, const shared_sstable &b) {
-                return a->get_stats_metadata().max_timestamp < b->get_stats_metadata().max_timestamp;
+            auto sort_size = std::min(max_sstables, multi_window.size());
+            std::ranges::partial_sort(multi_window, multi_window.begin() + sort_size, std::ranges::less(), [] (const shared_sstable &a) {
+                return a->get_stats_metadata().max_timestamp;
             });
             maybe_trim_job(multi_window, job_size, disjoint);
         }
@@ -309,10 +310,9 @@ time_window_compaction_strategy::get_reshaping_job(std::vector<shared_sstable> i
     auto all_disjoint = !single_window.empty() && is_disjoint(single_window);
     auto all_buckets = get_buckets(single_window, _options);
     single_window.clear();
-    for (auto& pair : all_buckets.first) {
-        auto ssts = std::move(pair.second);
+    for (auto& [bucket, ssts] : all_buckets.first) {
         if (ssts.size() >= offstrategy_threshold) {
-            clogger.debug("time_window_compaction_strategy::get_reshaping_job: bucket={} bucket_size={}", pair.first, ssts.size());
+            clogger.debug("time_window_compaction_strategy::get_reshaping_job: bucket={} bucket_size={}", bucket, ssts.size());
             if (all_disjoint) {
                 std::copy(ssts.begin(), ssts.end(), std::back_inserter(single_window));
                 continue;
@@ -343,7 +343,6 @@ time_window_compaction_strategy::get_sstables_for_compaction(table_state& table_
     auto candidates = control.candidates(table_s);
 
     if (candidates.empty()) {
-        state.estimated_remaining_tasks = 0;
         return compaction_descriptor();
     }
 
@@ -417,25 +416,21 @@ time_window_compaction_strategy::get_next_non_expired_sstables(table_state& tabl
 std::vector<shared_sstable>
 time_window_compaction_strategy::get_compaction_candidates(table_state& table_s, strategy_control& control, std::vector<shared_sstable> candidate_sstables) {
     auto& state = get_state(table_s);
-    auto p = get_buckets(std::move(candidate_sstables), _options);
+    auto [buckets, max_timestamp] = get_buckets(std::move(candidate_sstables), _options);
     // Update the highest window seen, if necessary
-    state.highest_window_seen = std::max(state.highest_window_seen, p.second);
+    state.highest_window_seen = std::max(state.highest_window_seen, max_timestamp);
 
-    update_estimated_compaction_by_tasks(state, p.first, table_s.min_compaction_threshold(), table_s.schema()->max_compaction_threshold());
-
-    return newest_bucket(table_s, control, std::move(p.first), table_s.min_compaction_threshold(), table_s.schema()->max_compaction_threshold(),
+    return newest_bucket(table_s, control, std::move(buckets), table_s.min_compaction_threshold(), table_s.schema()->max_compaction_threshold(),
         state.highest_window_seen);
 }
 
 timestamp_type
 time_window_compaction_strategy::get_window_lower_bound(std::chrono::seconds sstable_window_size, timestamp_type timestamp) {
     using namespace std::chrono;
-    auto timestamp_in_sec = duration_cast<seconds>(microseconds(timestamp)).count();
-
     // mask out window size from timestamp to get lower bound of its window
-    auto window_lower_bound_in_sec = seconds(timestamp_in_sec - (timestamp_in_sec % sstable_window_size.count()));
+    auto num_windows = microseconds(timestamp) / sstable_window_size;
 
-    return timestamp_type(duration_cast<microseconds>(window_lower_bound_in_sec).count());
+    return duration_cast<microseconds>(num_windows * sstable_window_size).count();
 }
 
 std::pair<std::map<timestamp_type, std::vector<shared_sstable>>, timestamp_type>
@@ -463,7 +458,7 @@ struct fmt::formatter<std::map<sstables::timestamp_type, std::vector<sstables::s
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
     auto format(const std::map<sstables::timestamp_type, std::vector<sstables::shared_sstable>>& buckets, fmt::format_context& ctx) const {
         auto out = fmt::format_to(ctx.out(), "  buckets = {{\n");
-        for (auto& [timestamp, sstables] : buckets | boost::adaptors::reversed) {
+        for (auto& [timestamp, sstables] : buckets | std::views::reverse) {
             out = fmt::format_to(out, "    key={}, size={}\n", timestamp, sstables.size());
         }
         return fmt::format_to(out, "  }}\n");
@@ -478,10 +473,7 @@ time_window_compaction_strategy::newest_bucket(table_state& table_s, strategy_co
     auto& state = get_state(table_s);
     clogger.debug("time_window_compaction_strategy::newest_bucket:\n  now {}\n{}", now, buckets);
 
-    for (auto&& key_bucket : buckets | boost::adaptors::reversed) {
-        auto key = key_bucket.first;
-        auto& bucket = key_bucket.second;
-
+    for (auto&& [key, bucket] : buckets | std::views::reverse) {
         bool last_active_bucket = is_last_active_bucket(key, now);
         if (last_active_bucket) {
             state.recent_active_windows.insert(key);
@@ -523,24 +515,21 @@ std::vector<shared_sstable>
 time_window_compaction_strategy::trim_to_threshold(std::vector<shared_sstable> bucket, int max_threshold) {
     auto n = std::min(bucket.size(), size_t(max_threshold));
     // Trim the largest sstables off the end to meet the maxThreshold
-    boost::partial_sort(bucket, bucket.begin() + n, [] (auto& i, auto& j) {
-        return i->ondisk_data_size() < j->ondisk_data_size();
-    });
+    std::ranges::partial_sort(bucket, bucket.begin() + n, std::ranges::less(), std::mem_fn(&sstable::ondisk_data_size));
     bucket.resize(n);
     return bucket;
 }
 
-void time_window_compaction_strategy::update_estimated_compaction_by_tasks(time_window_compaction_strategy_state& state,
-                                                                           std::map<timestamp_type, std::vector<shared_sstable>>& tasks,
-                                                                           int min_threshold, int max_threshold) {
+int64_t time_window_compaction_strategy::estimated_pending_compactions(table_state& table_s) const {
+    auto& state = get_state(table_s);
+    auto min_threshold = table_s.min_compaction_threshold();
+    auto max_threshold = table_s.schema()->max_compaction_threshold();
+    auto candidate_sstables = *table_s.main_sstable_set().all() | std::ranges::to<std::vector>();
+    auto [buckets, max_timestamp] = get_buckets(std::move(candidate_sstables), _options);
+
     int64_t n = 0;
-    timestamp_type now = state.highest_window_seen;
-
-    for (auto& task : tasks) {
-        const bucket_t& bucket = task.second;
-        timestamp_type bucket_key = task.first;
-
-        switch (compaction_mode(state, bucket, bucket_key, now, min_threshold)) {
+    for (auto& [bucket_key, bucket] : buckets) {
+        switch (compaction_mode(state, bucket, bucket_key, max_timestamp, min_threshold)) {
         case bucket_compaction_mode::size_tiered:
             n += size_tiered_compaction_strategy::estimated_pending_compactions(bucket, min_threshold, max_threshold, _stcs_options);
             break;
@@ -551,7 +540,7 @@ void time_window_compaction_strategy::update_estimated_compaction_by_tasks(time_
             break;
         }
     }
-    state.estimated_remaining_tasks = n;
+    return n;
 }
 
 std::vector<compaction_descriptor>

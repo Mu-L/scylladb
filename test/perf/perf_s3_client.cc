@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <chrono>
@@ -99,7 +99,7 @@ private:
 
 public:
     future<> run() {
-        co_await coroutine::parallel_for_each(boost::irange(0u, _parallel), [this] (auto fnr) -> future<> {
+        co_await coroutine::parallel_for_each(std::views::iota(0u, _parallel), [this] (auto fnr) -> future<> {
             plog.debug("Running {} fiber", fnr);
             co_await seastar::sleep(std::chrono::milliseconds(fnr)); // make some discrepancy
             co_await do_run();

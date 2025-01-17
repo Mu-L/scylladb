@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -28,6 +28,5 @@ public:
 private:
     inet_address _local_public_address;
     sstring _local_private_address;
-    bool _broadcast_rpc_address_specified_by_user;
 };
 } // namespace locator

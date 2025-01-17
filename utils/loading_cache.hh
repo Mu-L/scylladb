@@ -3,32 +3,29 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <chrono>
-#include <unordered_map>
 #include <memory_resource>
 #include <optional>
+#include <ranges>
+#include <algorithm>
 
 #include <boost/intrusive/list.hpp>
-#include <boost/intrusive/unordered_set.hpp>
 #include <boost/intrusive/parent_from_member.hpp>
-#include <boost/range/adaptor/filtered.hpp>
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/join.hpp>
 
-#include <seastar/core/seastar.hh>
-#include <seastar/core/future-util.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/core/gate.hh>
 
 #include "exceptions/exceptions.hh"
+#include "utils/assert.hh"
 #include "utils/loading_shared_values.hh"
 #include "utils/chunked_vector.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace bi = boost::intrusive;
 
@@ -144,7 +141,7 @@ class loading_cache {
         timestamped_val(timestamped_val&&) = default;
 
         timestamped_val& operator=(value_type new_val) {
-            assert(_lru_entry_ptr);
+            SCYLLA_ASSERT(_lru_entry_ptr);
 
             _value = std::move(new_val);
             _loaded = loading_cache_clock_type::now();
@@ -305,7 +302,7 @@ public:
     requires std::is_invocable_r_v<future<value_type>, LoadFunc, const key_type&>
     future<value_ptr> get_ptr(const Key& k, LoadFunc&& load) {
         // We shouldn't be here if caching is disabled
-        assert(caching_enabled());
+        SCYLLA_ASSERT(caching_enabled());
 
         return _loading_values.get_or_load(k, [load = std::forward<LoadFunc>(load)] (const Key& k) mutable {
             return load(k).then([] (value_type val) {
@@ -658,13 +655,17 @@ private:
         // Future is waited on indirectly in `stop()` (via `_timer_reads_gate`).
         // FIXME: error handling
         (void)with_gate(_timer_reads_gate, [this] {
-            auto to_reload = boost::copy_range<utils::chunked_vector<timestamped_val_ptr>>(boost::range::join(_unprivileged_lru_list, _lru_list)
-                    | boost::adaptors::filtered([this] (ts_value_lru_entry& lru_entry) {
-                        return lru_entry.timestamped_value().loaded() + _cfg.refresh < loading_cache_clock_type::now();
+            auto now = loading_cache_clock_type::now();
+            auto to_reload = std::array<lru_list_type*, 2>({&_unprivileged_lru_list, &_lru_list})
+                    | std::views::transform([] (auto* list_ptr) -> decltype(auto) { return *list_ptr; })
+                    | std::views::join
+                    | std::views::filter([this, now] (ts_value_lru_entry& lru_entry) {
+                        return lru_entry.timestamped_value().loaded() + _cfg.refresh < now;
                     })
-                    | boost::adaptors::transformed([] (ts_value_lru_entry& lru_entry) {
+                    | std::views::transform([] (ts_value_lru_entry& lru_entry) {
                         return lru_entry.timestamped_value_ptr();
-                    }));
+                    })
+                    | std::ranges::to<utils::chunked_vector<timestamped_val_ptr>>();
 
             return parallel_for_each(std::move(to_reload), [this] (timestamped_val_ptr ts_value_ptr) {
                 _logger.trace("on_timer(): {}: reloading the value", loading_values_type::to_key(ts_value_ptr));
@@ -748,7 +749,7 @@ public:
         , _touch_count(0)
     {
         // We don't want to allow SectionHitThreshold to be greater than half the max value of _touch_count to avoid a wrap around
-        static_assert(SectionHitThreshold <= std::numeric_limits<typeof(_touch_count)>::max() / 2, "SectionHitThreshold value is too big");
+        static_assert(SectionHitThreshold <= std::numeric_limits<decltype(_touch_count)>::max() / 2, "SectionHitThreshold value is too big");
 
         _ts_val_ptr->set_anchor_back_reference(this);
         owning_section_size() += _ts_val_ptr->size();

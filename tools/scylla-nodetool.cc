@@ -3,19 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <concepts>
+#include <cstdlib>
+#include <future>
 #include <limits>
 #include <iterator>
 #include <numeric>
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/algorithm/string/classification.hpp>
-#include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/make_shared.hpp>
@@ -38,16 +39,19 @@
 
 #include "api/scrub_status.hh"
 #include "gms/application_state.hh"
+#include "db/config.hh"
 #include "db_clock.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "release.hh"
 #include "tools/format_printers.hh"
 #include "tools/utils.hh"
+#include "utils/assert.hh"
 #include "utils/estimated_histogram.hh"
 #include "utils/http.hh"
 #include "utils/pretty_printers.hh"
 #include "utils/rjson.hh"
 #include "utils/UUID.hh"
+#include "locator/token_metadata.hh"
 
 namespace bpo = boost::program_options;
 
@@ -121,7 +125,18 @@ struct operation_failed_with_status : public std::runtime_error {
 };
 
 struct api_request_failed : public std::runtime_error {
+    http::reply::status_type status;
+
     using std::runtime_error::runtime_error;
+    api_request_failed(http::reply::status_type s, sstring message)
+        : std::runtime_error(std::move(message))
+        , status(s)
+    {}
+};
+
+struct request_body {
+    sstring content_type;
+    sstring content;
 };
 
 class scylla_rest_client {
@@ -130,11 +145,15 @@ class scylla_rest_client {
     sstring _host_name;
     http::experimental::client _api_client;
 
-    rjson::value do_request(sstring type, sstring path, std::unordered_map<sstring, sstring> params) {
+    rjson::value do_request(sstring type, sstring path,
+                            std::unordered_map<sstring, sstring> params,
+                            std::optional<request_body> body = {}) {
         auto req = http::request::make(type, _host_name, path);
         auto url = req.get_url();
         req.query_parameters = params;
-
+        if (body) {
+            req.write_body(body->content_type, body->content);
+        }
         nlog.trace("Making {} request to {} with parameters {}", type, url, params);
 
 
@@ -153,7 +172,7 @@ class scylla_rest_client {
             } catch (...) {
                 message = res;
             }
-            throw api_request_failed(fmt::format("error executing {} request to {} with parameters {}: remote replied with status code {}:\n{}",
+            throw api_request_failed(status, fmt::format("error executing {} request to {} with parameters {}: remote replied with status code {}:\n{}",
                     type, url, params, status, message));
         }
 
@@ -178,8 +197,8 @@ public:
         _api_client.close().get();
     }
 
-    rjson::value post(sstring path, std::unordered_map<sstring, sstring> params = {}) {
-        return do_request("POST", std::move(path), std::move(params));
+    rjson::value post(sstring path, std::unordered_map<sstring, sstring> params = {}, std::optional<request_body> body = {}) {
+        return do_request("POST", std::move(path), std::move(params), std::move(body));
     }
 
     rjson::value get(sstring path, std::unordered_map<sstring, sstring> params = {}) {
@@ -309,7 +328,7 @@ keyspace_and_tables parse_keyspace_and_tables(scylla_rest_client& client, const 
         throw std::invalid_argument(fmt::format("keyspace {} does not exist", ret.keyspace));
     }
 
-    if (vm.count("table")) {
+    if (vm.contains("table")) {
         ret.tables = vm["table"].as<std::vector<sstring>>();
     }
 
@@ -362,15 +381,69 @@ keyspace_and_table parse_keyspace_and_table(scylla_rest_client& client, const bp
 }
 
 using operation_func = void(*)(scylla_rest_client&, const bpo::variables_map&);
+struct operation_action{
+    std::optional<operation_func> func = std::nullopt;
+    std::map<sstring, operation_action> suboperation_funcs = {};
 
-std::map<operation, operation_func> get_operations_with_func();
+    operation_action(operation_func f)
+        : func(std::move(f))
+    {}
+
+    operation_action(std::map<sstring, operation_action> subfs)
+        : suboperation_funcs(std::move(subfs))
+    {}
+};
+
+const std::map<operation, operation_action>& get_operations_with_func();
+
+void backup_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    std::unordered_map<sstring, sstring> params;
+    for (auto required_param : {"endpoint", "bucket", "prefix", "keyspace", "table"}) {
+        if (!vm.contains(required_param)) {
+            throw std::invalid_argument(fmt::format("missing required parameter: {}", required_param));
+        }
+        params[required_param] = vm[required_param].as<sstring>();
+    }
+    if (vm.contains("snapshot")) {
+        params["snapshot"] = vm["snapshot"].as<sstring>();
+    }
+    const auto backup_res = client.post("/storage_service/backup", std::move(params));
+    const auto task_id = rjson::to_string_view(backup_res);
+    if (vm.contains("nowait")) {
+        fmt::print(R"(The task id of this operation is {}
+Please use the 'task' subcommands to manage the task.
+)",
+                   task_id);
+        return;
+    }
+
+    const auto url = seastar::format("/task_manager/wait_task/{}", task_id);
+    const auto wait_res = client.get(url);
+    const auto& status = wait_res.GetObject();
+    auto state = rjson::to_string_view(status["state"]);
+    fmt::print("{}", state);
+    int exit_code = EXIT_SUCCESS;
+    if (state != "done") {
+        exit_code = EXIT_FAILURE;
+        fmt::print(": {}", rjson::to_string_view(status["error"]));
+    }
+    fmt::print(R"(
+start: {}
+end: {}
+)",
+               rjson::to_string_view(status["start_time"]),
+               rjson::to_string_view(status["end_time"]));
+    if (exit_code != EXIT_SUCCESS) {
+        throw operation_failed_with_status{exit_code};
+    }
+}
 
 void checkandrepaircdcstreams_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     client.post("/storage_service/cdc_streams_check_and_repair");
 }
 
 void cleanup_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
-    if (vm.count("cleanup_arg")) {
+    if (vm.contains("cleanup_arg")) {
         const auto [keyspace, tables] = parse_keyspace_and_tables(client, vm, "cleanup_arg");
         std::unordered_map<sstring, sstring> params;
         if (!tables.empty()) {
@@ -385,7 +458,7 @@ void cleanup_operation(scylla_rest_client& client, const bpo::variables_map& vm)
 void clearsnapshot_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     std::unordered_map<sstring, sstring> params;
 
-    if (vm.count("keyspaces")) {
+    if (vm.contains("keyspaces")) {
         std::vector<sstring> keyspaces;
         const auto all_keyspaces = get_keyspaces(client);
         for (const auto& keyspace : vm["keyspaces"].as<std::vector<sstring>>()) {
@@ -400,7 +473,7 @@ void clearsnapshot_operation(scylla_rest_client& client, const bpo::variables_ma
         }
     }
 
-    if (vm.count("tag")) {
+    if (vm.contains("tag")) {
         params["tag"] = vm["tag"].as<sstring>();
     }
 
@@ -408,16 +481,20 @@ void clearsnapshot_operation(scylla_rest_client& client, const bpo::variables_ma
 }
 
 void compact_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
-    if (vm.count("user-defined")) {
+    if (vm.contains("user-defined")) {
         throw std::invalid_argument("--user-defined flag is unsupported");
     }
 
     std::unordered_map<sstring, sstring> params;
-    if (vm.count("flush-memtables")) {
+    if (vm.contains("flush-memtables")) {
         params["flush_memtables"] = vm["flush-memtables"].as<bool>() ? "true" : "false";
     }
 
-    if (vm.count("compaction_arg")) {
+    if (vm.contains("consider-only-existing-data")) {
+        params["consider_only_existing_data"] = vm["consider-only-existing-data"].as<bool>() ? "true" : "false";
+    }
+
+    if (vm.contains("compaction_arg")) {
         const auto [keyspace, tables] = parse_keyspace_and_tables(client, vm, "compaction_arg");
         if (!tables.empty()) {
             params["cf"] = fmt::to_string(fmt::join(tables.begin(), tables.end(), ","));
@@ -447,7 +524,12 @@ void print_compactionhistory(const std::vector<Entry>& history) {
         output->add_item("compacted_at", format_compacted_at(e.compacted_at));
         output->add_item("bytes_in", e.bytes_in);
         output->add_item("bytes_out", e.bytes_out);
-        output->add_item("rows_merged", "");
+        auto seq = output->add_seq("rows_merged");
+        for (const auto& [key, value] : e.rows_merged) {
+            auto output = seq->add_map();
+            output->add_item("key", key);
+            output->add_item("value", value);
+        }
     }
 }
 
@@ -468,11 +550,18 @@ void compactionhistory_operation(scylla_rest_client& client, const bpo::variable
         int64_t compacted_at;
         int64_t bytes_in;
         int64_t bytes_out;
+        std::map<int32_t, int64_t> rows_merged;
     };
     std::vector<history_entry> history;
 
     for (const auto& history_entry_json : history_json.GetArray()) {
         const auto& history_entry_json_object = history_entry_json.GetObject();
+
+        std::map<int32_t, int64_t> rows_merged;
+        for (const auto& rows_merged_json : history_entry_json_object["rows_merged"].GetArray()) {
+            const auto& rows_merged_json_object = rows_merged_json.GetObject();
+            rows_merged.emplace(rows_merged_json_object["key"].GetInt(), rows_merged_json_object["value"].GetInt64());
+        }
 
         history.emplace_back(history_entry{
                 .id = utils::UUID(rjson::to_string_view(history_entry_json_object["id"])),
@@ -480,7 +569,8 @@ void compactionhistory_operation(scylla_rest_client& client, const bpo::variable
                 .keyspace = std::string(rjson::to_string_view(history_entry_json_object["ks"])),
                 .compacted_at = history_entry_json_object["compacted_at"].GetInt64(),
                 .bytes_in = history_entry_json_object["bytes_in"].GetInt64(),
-                .bytes_out = history_entry_json_object["bytes_out"].GetInt64()});
+                .bytes_out = history_entry_json_object["bytes_out"].GetInt64(),
+                .rows_merged = std::move(rows_merged)});
     }
 
     std::ranges::sort(history, [] (const history_entry& a, const history_entry& b) { return a.compacted_at > b.compacted_at; });
@@ -496,7 +586,7 @@ void compactionhistory_operation(scylla_rest_client& client, const bpo::variable
         rows.reserve(history.size());
         for (const auto& e : history) {
             rows.push_back({fmt::to_string(e.id), e.keyspace, e.table, format_compacted_at(e.compacted_at), fmt::to_string(e.bytes_in),
-                    fmt::to_string(e.bytes_out), ""});
+                    fmt::to_string(e.bytes_out), fmt::to_string(e.rows_merged)});
             for (size_t c = 0; c < rows.back().size(); ++c) {
                 max_column_length[c] = std::max(max_column_length[c], rows.back()[c].size());
             }
@@ -504,7 +594,7 @@ void compactionhistory_operation(scylla_rest_client& client, const bpo::variable
 
         const auto header_row_format = fmt::format("{{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}}\n", max_column_length[0],
                 max_column_length[1], max_column_length[2], max_column_length[3], max_column_length[4], max_column_length[5], max_column_length[6]);
-        const auto regular_row_format = fmt::format("{{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:>{}}} {{:>{}}} {{:>{}}}\n", max_column_length[0],
+        const auto regular_row_format = fmt::format("{{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:>{}}} {{:>{}}} {{:<{}}}\n", max_column_length[0],
                 max_column_length[1], max_column_length[2], max_column_length[3], max_column_length[4], max_column_length[5], max_column_length[6]);
 
         fmt::print(std::cout, "Compaction History:\n");
@@ -669,7 +759,7 @@ void describering_operation(scylla_rest_client& client, const bpo::variables_map
     const auto schema_version_res = client.get("/storage_service/schema_version");
 
     std::unordered_map<sstring, sstring> params;
-    if (vm.count("table")) {
+    if (vm.contains("table")) {
         auto tables = vm["table"].as<std::vector<sstring>>();
         if (tables.size() != 1) {
             throw std::invalid_argument(fmt::format("expected a single table parameter, got {}", tables.size()));
@@ -686,7 +776,7 @@ void describering_operation(scylla_rest_client& client, const bpo::variables_map
         const auto endpoints = ring_info["endpoints"].GetArray() | std::views::transform([] (const auto& ep) { return rjson::to_string_view(ep); });
         const auto rpc_endpoints = ring_info["rpc_endpoints"].GetArray() | std::views::transform([] (const auto& ep) { return rjson::to_string_view(ep); });
         const auto endpoint_details = ring_info["endpoint_details"].GetArray() | std::views::transform([] (const auto& ep_details) {
-            return format("EndpointDetails(host:{}, datacenter:{}, rack:{})",
+            return seastar::format("EndpointDetails(host:{}, datacenter:{}, rack:{})",
                     rjson::to_string_view(ep_details["host"]),
                     rjson::to_string_view(ep_details["datacenter"]),
                     rjson::to_string_view(ep_details["rack"]));
@@ -735,7 +825,7 @@ void describecluster_operation(scylla_rest_client& client, const bpo::variables_
 }
 
 void disableautocompaction_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
-    if (!vm.count("keyspace")) {
+    if (!vm.contains("keyspace")) {
         for (const auto& keyspace :  get_keyspaces(client)) {
             client.del(format("/storage_service/auto_compaction/{}", keyspace));
         }
@@ -766,7 +856,7 @@ void drain_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
 }
 
 void enableautocompaction_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
-    if (!vm.count("keyspace")) {
+    if (!vm.contains("keyspace")) {
         for (const auto& keyspace :  get_keyspaces(client)) {
             client.post(format("/storage_service/auto_compaction/{}", keyspace));
         }
@@ -806,7 +896,7 @@ void flush_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
 }
 
 void getendpoints_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
-    if (!vm.count("keyspace") || !vm.count("table") || !vm.count("key")) {
+    if (!vm.contains("keyspace") || !vm.contains("table") || !vm.contains("key")) {
         throw std::invalid_argument("getendpoint requires keyspace, table and partition key arguments");
     }
     auto res = client.get(seastar::format("/storage_service/natural_endpoints/{}",
@@ -834,7 +924,7 @@ void getlogginglevels_operation(scylla_rest_client& client, const bpo::variables
 }
 
 void getsstables_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
-    if (!vm.count("keyspace") || !vm.count("table") || !vm.count("key")) {
+    if (!vm.contains("keyspace") || !vm.contains("table") || !vm.contains("key")) {
         throw std::invalid_argument("getsstables requires keyspace, table and partition key arguments");
     }
 
@@ -850,7 +940,7 @@ void getsstables_operation(scylla_rest_client& client, const bpo::variables_map&
     }
 
     auto params = std::unordered_map<sstring, sstring>{{"key", vm["key"].as<sstring>()}};
-    if (vm.count("hex-format")) {
+    if (vm.contains("hex-format")) {
         params["format"] = "hex";
     }
 
@@ -1100,7 +1190,7 @@ void print_stream_session(
 
 void netstats_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     const auto mode = sstring(rjson::to_string_view(client.get("/storage_service/operation_mode")));
-    const bool human_readable = vm.count("human-readable");
+    const bool human_readable = vm.contains("human-readable");
 
     fmt::print(std::cout, "Mode: {}\n", mode);
 
@@ -1186,20 +1276,38 @@ void proxyhistograms_operation(scylla_rest_client& client, const bpo::variables_
     fmt::print(std::cout, "\n");
 }
 
+sstring get_command_name(const std::vector<sstring>& cmds) {
+    sstring res = "";
+    sstring delim = "";
+    for (const auto& cmd: cmds) {
+        res += delim + cmd;
+        delim = " ";
+    }
+    return res;
+}
+
 void help_operation(const tool_app_template::config& cfg, const bpo::variables_map& vm) {
-    if (vm.count("command")) {
-        const auto command = vm["command"].as<sstring>();
-        auto ops = get_operations_with_func();
-        auto keys = ops | boost::adaptors::map_keys;
-        auto it = std::ranges::find_if(keys, [&] (const operation& op) { return op.name() == command; });
+    if (vm.contains("command")) {
+        const auto command = vm["command"].as<std::vector<sstring>>();
+        const auto& ops = get_operations_with_func();
+        auto keys = ops | std::views::keys;
+        auto it = std::ranges::find_if(keys, [&] (const operation& op) { return op.name() == command[0]; });
         if (it == keys.end()) {
-            throw std::invalid_argument(fmt::format("unknown command {}", command));
+            throw std::invalid_argument(fmt::format("unknown command {}", get_command_name(command)));
+        }
+        // Search the subcommands.
+        const operation* op = &*it;
+        for (size_t i = 1; i < command.size(); ++i) {
+            auto subcommand = op->suboperations();
+            auto it = std::ranges::find_if(subcommand, [&] (const operation& subop) { return subop.name() == command[i]; });
+            if (it == subcommand.end()) {
+                throw std::invalid_argument(fmt::format("unknown command {}", get_command_name(command)));
+            }
+            op = &*it;
         }
 
-        const auto& op = *it;
-
-        fmt::print(std::cout, "{}\n\n", op.summary());
-        fmt::print(std::cout, "{}\n\n", op.description());
+        fmt::print(std::cout, "{}\n\n", op->summary());
+        fmt::print(std::cout, "{}\n\n", op->description());
 
         // FIXME
         // The below code is needed because we don't have complete access to the
@@ -1222,14 +1330,14 @@ void help_operation(const tool_app_template::config& cfg, const bpo::variables_m
             }
         }
 
-        bpo::options_description op_opts_desc(op.name());
-        for (const auto& opt : op.options()) {
+        bpo::options_description op_opts_desc(op->name());
+        for (const auto& opt : op->options()) {
             opt.add_option(op_opts_desc);
         }
-        for (const auto& opt : op.positional_options()) {
+        for (const auto& opt : op->positional_options()) {
             opt.add_option(opts_desc);
         }
-        if (!op.options().empty()) {
+        if (!op->options().empty()) {
             opts_desc.add(op_opts_desc);
         }
 
@@ -1246,22 +1354,28 @@ void help_operation(const tool_app_template::config& cfg, const bpo::variables_m
 
 void rebuild_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     std::unordered_map<sstring, sstring> params;
-    if (vm.count("source-dc")) {
+    if (vm.contains("source-dc")) {
         params["source_dc"] = vm["source-dc"].as<sstring>();
+    }
+    if (vm.contains("force")) {
+        params["force"] = "true";
     }
     client.post("/storage_service/rebuild", std::move(params));
 }
 
 void refresh_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
-    if (!vm.count("keyspace") || !vm.count("table")) {
-        throw std::invalid_argument("required parameters are missing: keyspace and/or table");
+    if (!vm.contains("keyspace")) {
+        throw std::invalid_argument("required parameters are missing: keyspace and table");
+    }
+    if (!vm.contains("table")) {
+        throw std::invalid_argument("required parameter is missing: table");
     }
     std::unordered_map<sstring, sstring> params{{"cf", vm["table"].as<sstring>()}};
-    if (vm.count("load-and-stream")) {
+    if (vm.contains("load-and-stream")) {
         params["load_and_stream"] = "true";
     }
-    if (vm.count("primary-replica-only")) {
-        if (!vm.count("load-and-stream")) {
+    if (vm.contains("primary-replica-only")) {
+        if (!vm.contains("load-and-stream")) {
             throw std::invalid_argument("--primary-replica-only|-pro takes no effect without --load-and-stream|-las");
         }
         params["primary_replica_only"] = "true";
@@ -1270,12 +1384,12 @@ void refresh_operation(scylla_rest_client& client, const bpo::variables_map& vm)
 }
 
 void removenode_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
-    if (!vm.count("remove-operation")) {
+    if (!vm.contains("remove-operation")) {
         throw std::invalid_argument("required parameters are missing: remove-operation, pass one of (status, force or a host id)");
     }
     const auto op = vm["remove-operation"].as<sstring>();
     if (op == "status" || op == "force") {
-        if (vm.count("ignore-dead-nodes")) {
+        if (vm.contains("ignore-dead-nodes")) {
             throw std::invalid_argument("cannot use --ignore-dead-nodes with status or force");
         }
         fmt::print(std::cout, "RemovalStatus: {}\n", rjson::to_string_view(client.get("/storage_service/removal_status")));
@@ -1284,8 +1398,14 @@ void removenode_operation(scylla_rest_client& client, const bpo::variables_map& 
         }
     } else {
         std::unordered_map<sstring, sstring> params{{"host_id", op}};
-        if (vm.count("ignore-dead-nodes")) {
+        if (vm.contains("ignore-dead-nodes")) {
             params["ignore_nodes"] = vm["ignore-dead-nodes"].as<sstring>();
+            const auto str_ids  = utils::split_comma_separated_list(params["ignore_nodes"]);
+            if (!locator::check_host_ids_contain_only_uuid(str_ids)) {
+                fmt::print(std::cout, "\nWarning: Using IP addresses for '--ignore-dead-nodes' is deprecated and"
+                " will be disabled in a future release. Please use host IDs instead. Run \"nodetool status\" to list all"
+                " node IDs.\n\n");
+            }
         }
         client.post("/storage_service/remove_node", std::move(params));
     }
@@ -1326,7 +1446,7 @@ void repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
     if (vm.contains("start-token") || vm.contains("end-token")) {
         const auto st = vm.contains("start-token") ? fmt::to_string(vm["start-token"].as<uint64_t>()) : "";
         const auto et = vm.contains("end-token") ? fmt::to_string(vm["end-token"].as<uint64_t>()) : "";
-        repair_params["ranges"] = format("{}:{}", st, et);
+        repair_params["ranges"] = seastar::format("{}:{}", st, et);
     }
 
     if (vm.contains("ignore-unreplicated-keyspaces")) {
@@ -1400,6 +1520,62 @@ void repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
         } else {
             throw operation_failed_on_scylladb(format("Repair session {} failed", id));
         }
+    }
+}
+
+void restore_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    std::unordered_map<sstring, sstring> params;
+    for (auto required_param : {"endpoint", "bucket", "prefix", "keyspace", "table"}) {
+        if (!vm.contains(required_param)) {
+            throw std::invalid_argument(fmt::format("missing required parameter: {}", required_param));
+        }
+        params[required_param] = vm[required_param].as<sstring>();
+    }
+    if (!vm.contains("sstables")) {
+      throw std::invalid_argument("missing required possitional argument: sstables");
+    }
+    if (vm.contains("scope")) {
+        params["scope"] = vm["scope"].as<sstring>();
+    }
+    sstring sstables_body = std::invoke([&vm] {
+        std::stringstream output;
+        rjson::streaming_writer writer(output);
+        writer.StartArray();
+        for (auto& toc_fn : vm["sstables"].as<std::vector<sstring>>()) {
+            writer.String(toc_fn);
+        }
+        writer.EndArray();
+        return make_sstring(output.view());
+    });
+    const auto restore_res = client.post("/storage_service/restore", std::move(params),
+                                         request_body{"application/json", std::move(sstables_body)});
+    const auto task_id = rjson::to_string_view(restore_res);
+    if (vm.contains("nowait")) {
+        fmt::print(R"(The task id of this operation is {}
+Please use the 'task' subcommands to manage the task.
+)",
+                   task_id);
+        return;
+    }
+
+    const auto url = seastar::format("/task_manager/wait_task/{}", task_id);
+    const auto wait_res = client.get(url);
+    const auto& status = wait_res.GetObject();
+    auto state = rjson::to_string_view(status["state"]);
+    fmt::print("{}", state);
+    int exit_code = EXIT_SUCCESS;
+    if (state != "done") {
+        exit_code = EXIT_FAILURE;
+        fmt::print(": {}", rjson::to_string_view(status["error"]));
+    }
+    fmt::print(R"(
+start: {}
+end: {}
+)",
+               rjson::to_string_view(status["start_time"]),
+               rjson::to_string_view(status["end_time"]));
+    if (exit_code != EXIT_SUCCESS) {
+        throw operation_failed_with_status{exit_code};
     }
 }
 
@@ -1533,7 +1709,7 @@ std::string last_token_in_hosts(const std::vector<std::pair<sstring, std::string
                                    [&last_host] (auto& token_endpoint) {
                                        return token_endpoint.second == last_host.endpoint;
                                    });
-    assert(last_token != tokens_endpoint.rend());
+    SCYLLA_ASSERT(last_token != tokens_endpoint.rend());
     return last_token->first;
 }
 
@@ -1695,7 +1871,7 @@ void scrub_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     } else {
         keyspaces.push_back(std::move(keyspace));
     }
-    if (vm.count("skip-corrupted") && vm.count("mode")) {
+    if (vm.contains("skip-corrupted") && vm.contains("mode")) {
         throw std::invalid_argument("cannot use --skip-corrupted when --mode is used");
     }
 
@@ -1705,17 +1881,17 @@ void scrub_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
         params["cf"] = fmt::to_string(fmt::join(tables.begin(), tables.end(), ","));
     }
 
-    if (vm.count("mode")) {
+    if (vm.contains("mode")) {
         params["scrub_mode"] = vm["mode"].as<sstring>();
-    } else if (vm.count("skip-corrupted")) {
+    } else if (vm.contains("skip-corrupted")) {
         params["scrub_mode"] = "SKIP";
     }
 
-    if (vm.count("quarantine-mode")) {
+    if (vm.contains("quarantine-mode")) {
         params["quarantine_mode"] = vm["quarantine-mode"].as<sstring>();
     }
 
-    if (vm.count("no-snapshot")) {
+    if (vm.contains("no-snapshot")) {
         params["disable_snapshot"] = "true";
     }
 
@@ -1738,14 +1914,14 @@ void scrub_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
 }
 
 void setlogginglevel_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
-    if (!vm.count("logger") || !vm.count("level")) {
+    if (!vm.contains("logger") || !vm.contains("level")) {
         throw std::invalid_argument("resetting logger(s) is not supported yet, the logger and level parameters are required");
     }
     client.post(format("/system/logger/{}", vm["logger"].as<sstring>()), {{"level", vm["level"].as<sstring>()}});
 }
 
 void settraceprobability_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
-    if (!vm.count("trace_probability")) {
+    if (!vm.contains("trace_probability")) {
         throw std::invalid_argument("required parameters are missing: trace_probability");
     }
     const auto value = vm["trace_probability"].as<double>();
@@ -1775,20 +1951,20 @@ void snapshot_operation(scylla_rest_client& client, const bpo::variables_map& vm
     };
 
     std::vector<sstring> kt_list;
-    if (vm.count("keyspace-table-list")) {
-        if (vm.count("table")) {
+    if (vm.contains("keyspace-table-list")) {
+        if (vm.contains("table")) {
             throw std::invalid_argument("when specifying the keyspace-table list for a snapshot, you should not specify table(s)");
         }
-        if (vm.count("keyspaces")) {
+        if (vm.contains("keyspaces")) {
             throw std::invalid_argument("when specifying the keyspace-table list for a snapshot, you should not specify keyspace(s)");
         }
 
         const auto kt_list_str = vm["keyspace-table-list"].as<sstring>();
         boost::split(kt_list, kt_list_str, boost::algorithm::is_any_of(","));
-    } else if (vm.count("keyspaces")) {
+    } else if (vm.contains("keyspaces")) {
         kt_list = vm["keyspaces"].as<std::vector<sstring>>();
 
-        if (kt_list.size() > 1 && vm.count("table")) {
+        if (kt_list.size() > 1 && vm.contains("table")) {
             throw std::invalid_argument("when specifying the table for the snapshot, you must specify one and only one keyspace");
         }
     }
@@ -1803,19 +1979,19 @@ void snapshot_operation(scylla_rest_client& client, const bpo::variables_map& vm
             kn_msg = kt_list.front();
         } else {
             params["kn"] = fmt::to_string(fmt::join(kt_list.begin(), kt_list.end(), ","));
-            if (vm.count("table")) {
+            if (vm.contains("table")) {
                 params["cf"] = vm["table"].as<sstring>();
             }
         }
     }
 
-    if (vm.count("tag")) {
+    if (vm.contains("tag")) {
         params["tag"] = vm["tag"].as<sstring>();
     } else {
         params["tag"] = fmt::to_string(db_clock::now().time_since_epoch().count());
     }
 
-    if (vm.count("skip-flush")) {
+    if (vm.contains("skip-flush")) {
         params["sf"] = "true";
     } else {
         params["sf"] = "false";
@@ -1836,12 +2012,12 @@ void snapshot_operation(scylla_rest_client& client, const bpo::variables_map& vm
 
 void sstableinfo_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     std::vector<keyspace_and_table> requests;
-    if (vm.count("table")) {
+    if (vm.contains("table")) {
         const auto keyspace = vm["keyspace"].as<sstring>();
         for (const auto& table : vm["table"].as<std::vector<sstring>>()) {
             requests.push_back(keyspace_and_table{.keyspace = keyspace, .table = table});
         }
-    } else if (vm.count("keyspace")) {
+    } else if (vm.contains("keyspace")) {
         requests.push_back(keyspace_and_table{.keyspace = vm["keyspace"].as<sstring>()});
     } else {
         requests.push_back(keyspace_and_table{});
@@ -1905,16 +2081,16 @@ void sstableinfo_operation(scylla_rest_client& client, const bpo::variables_map&
 
 void status_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     std::optional<sstring> keyspace;
-    if (vm.count("keyspace")) {
+    if (vm.contains("keyspace")) {
         keyspace.emplace(vm["keyspace"].as<sstring>());
     }
 
     std::optional<sstring> table;
-    if (vm.count("table")) {
+    if (vm.contains("table")) {
         table.emplace(vm["table"].as<sstring>());
     }
 
-    const auto resolve_ips = vm.count("resolve-ip");
+    const auto resolve_ips = vm.contains("resolve-ip");
 
     const auto live = get_endpoints_of_status(client, "live");
     const auto down = get_endpoints_of_status(client, "down");
@@ -1922,7 +2098,6 @@ void status_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
     const auto leaving = get_nodes_of_state(client, "leaving");
     const auto moving = get_nodes_of_state(client, "moving");
     const auto endpoint_load = rjson_to_map<size_t>(client.get("/storage_service/load_map"));
-    const auto endpoint_host_id = rjson_to_map<sstring>(client.get("/storage_service/host_id"));
 
     const auto tablets_keyspace = keyspace && keyspace_uses_tablets(client, *keyspace);
 
@@ -1941,10 +2116,16 @@ void status_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
         tokens_endpoint_params["cf"] = *table;
     }
     const auto tokens_endpoint_res = client.get("/storage_service/tokens_endpoint", std::move(tokens_endpoint_params));
+
+    const auto endpoint_host_id = rjson_to_map<sstring>(client.get("/storage_service/host_id"));
+
     for (const auto& te : tokens_endpoint_res.GetArray()) {
         const auto ep = sstring(rjson::to_string_view(te["value"]));
          // We are not printing the actual tokens, so it is enough just to count them.
         ++endpoint_tokens[ep];
+    }
+
+    for (const auto& [ep, host_id] : endpoint_host_id) {
         if (endpoint_rack.contains(ep)) {
             continue;
         }
@@ -1992,7 +2173,7 @@ void status_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
                     fmt::format("{}{}", status, state),
                     address,
                     load,
-                    token_count_unknown ? "?" : fmt::to_string(endpoint_tokens.at(ep)),
+                    token_count_unknown ? "?" : fmt::to_string(endpoint_tokens.contains(ep) ? endpoint_tokens.at(ep) : 0),
                     !is_effective_ownership_unknown ? format("{:.1f}%", endpoint_ownership.at(ep) * 100) : "?",
                     endpoint_host_id.contains(ep) ? endpoint_host_id.at(ep) : "?",
                     endpoint_rack.at(ep));
@@ -2023,10 +2204,10 @@ void statusgossip_operation(scylla_rest_client& client, const bpo::variables_map
 }
 
 void stop_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
-    if (vm.count("id")) {
+    if (vm.contains("id")) {
         throw std::invalid_argument("stopping compactions by id is not implemented");
     }
-    if (!vm.count("compaction_type")) {
+    if (!vm.contains("compaction_type")) {
         throw std::invalid_argument("missing required parameter: compaction_type");
     }
 
@@ -2045,7 +2226,7 @@ void tablehistograms_operation(scylla_rest_client& client, const bpo::variables_
     const auto [keyspace, table] = parse_keyspace_and_table(client, vm, "table");
 
     auto get_estimated_histogram = [&client, &keyspace, &table] (std::string_view histogram) {
-        const auto res = client.get(format("/column_family/metrics/{}/{}:{}", histogram, keyspace, table));
+        const auto res = client.get(seastar::format("/column_family/metrics/{}/{}:{}", histogram, keyspace, table));
         const auto res_object = res.GetObject();
         if (!res.HasMember("bucket_offsets")) {
             return utils::estimated_histogram(0);
@@ -2054,7 +2235,7 @@ void tablehistograms_operation(scylla_rest_client& client, const bpo::variables_
         const auto& bucket_offsets_array = res["bucket_offsets"].GetArray();
 
         if (bucket_offsets_array.Size() + 1 != buckets_array.Size()) {
-            throw std::runtime_error(format("invalid estimated histogram {}, buckets must have one more element than bucket_offsets", histogram));
+            throw std::runtime_error(fmt::format("invalid estimated histogram {}, buckets must have one more element than bucket_offsets", histogram));
         }
 
         std::vector<int64_t> bucket_offsets, buckets;
@@ -2174,7 +2355,11 @@ public:
     double compression_ratio() {
         return get<double>("compression_ratio");
     }
-    uint64_t estimated_row_count() {
+    uint64_t estimated_partition_count() {
+        // The API endpoint still uses "row" in "/metrics/estimated_row_count"
+        // although it returns partition counts. The endpoint name remains unchanged
+        // for backward compatibility while server-side variables were renamed.
+        // See also 26ac2c23ef22186dcca73c6b88a3dda34549d2d0
         return get<uint64_t>("estimated_row_count");
     }
     uint64_t memtable_columns_count() {
@@ -2296,7 +2481,7 @@ public:
         map.emplace("off_heap_memory_used_total",
                     fmt::to_string(file_size_printer(total_off_heap_size, human_readable)));
         map.emplace("sstable_compression_ratio", compression_ratio());
-        map.emplace("number_of_partitions_estimate", estimated_row_count());
+        map.emplace("number_of_partitions_estimate", estimated_partition_count());
         map.emplace("memtable_cell_count", memtable_columns_count());
         map.emplace("memtable_data_size",
                     fmt::to_string(file_size_printer(memtable_live_data_size(), human_readable)));
@@ -2362,7 +2547,7 @@ public:
                                     compression_metadata_off_heap_mem_size);
         fmt::print("\t\tOff heap memory used (total): {}\n", file_size_printer(total_off_heap_size, human_readable));
         fmt::print("\t\tSSTable Compression Ratio: {:.1f}\n", compression_ratio());
-        fmt::print("\t\tNumber of partitions (estimate): {}\n", estimated_row_count());
+        fmt::print("\t\tNumber of partitions (estimate): {}\n", estimated_partition_count());
         fmt::print("\t\tMemtable cell count: {}\n", memtable_columns_count());
         fmt::print("\t\tMemtable data size: {}\n", memtable_live_data_size());
         fmt::print("\t\tMemtable off heap memory used: {}\n", file_size_printer(memtable_off_heap_mem_size, human_readable));
@@ -2608,19 +2793,292 @@ void table_stats_operation(scylla_rest_client& client, const bpo::variables_map&
     }
 }
 
+void tasks_print_status(const rjson::value& res) {
+    auto status = res.GetObject();
+    for (const auto& x: status) {
+        if (x.value.IsString()) {
+            fmt::print("{}: {}\n", x.name.GetString(), x.value.GetString());
+        } else if (x.value.IsArray()) {
+            fmt::print("{}: [", x.name.GetString());
+            sstring delim = "";
+            for (const auto& el : x.value.GetArray()) {
+                fmt::print("{}{{", delim);
+                sstring ident_delim = "";
+                for (const auto& child_info : el.GetObject()) {
+                    fmt::print("{}{}: {}", ident_delim, child_info.name.GetString(), child_info.value.GetString());
+                    ident_delim = ", ";
+                }
+                fmt::print(" }}");
+                delim = ", ";
+            }
+            fmt::print("]\n");
+        } else {
+            fmt::print("{}: {}\n", x.name.GetString(), x.value);
+        }
+    }
+}
+
+void tasks_add_tree_to_statuses_lists(Tabulate& table, const rjson::value& res) {
+    auto statuses = res.GetArray();
+    for (auto& element : statuses) {
+        const auto& status = element.GetObject();
+
+        sstring children_ids = "[";
+        sstring delim = "";
+        if (status.HasMember("children_ids")) {
+            for (const auto& el : status["children_ids"].GetArray()) {
+                children_ids += format("{}{{", delim);
+                sstring ident_delim = "";
+                for (const auto& child_info : el.GetObject()) {
+                    children_ids += format("{}{}: {}", ident_delim, child_info.name.GetString(), child_info.value.GetString());
+                    ident_delim = ", ";
+                }
+                children_ids += format(" }}");
+                delim = ", ";
+            }
+        }
+        children_ids += "]";
+
+        table.add(rjson::to_string_view(status["id"]),
+                rjson::to_string_view(status["type"]),
+                rjson::to_string_view(status["kind"]),
+                rjson::to_string_view(status["scope"]),
+                rjson::to_string_view(status["state"]),
+                status["is_abortable"].GetBool(),
+                rjson::to_string_view(status["start_time"]),
+                rjson::to_string_view(status["end_time"]),
+                rjson::to_string_view(status["error"]),
+                rjson::to_string_view(status["parent_id"]),
+                status["sequence_number"].GetUint64(),
+                status["shard"].GetUint(),
+                rjson::to_string_view(status["keyspace"]),
+                rjson::to_string_view(status["table"]),
+                rjson::to_string_view(status["entity"]),
+                rjson::to_string_view(status["progress_units"]),
+                status["progress_total"].GetDouble(),
+                status["progress_completed"].GetDouble(),
+                children_ids);
+    }
+}
+
+void tasks_print_trees(const std::vector<rjson::value>& res) {
+    Tabulate table;
+    table.add("id", "type", "kind", "scope", "state",
+        "is_abortable", "start_time", "end_time", "error", "parent_id",
+        "sequence_number", "shard", "keyspace", "table", "entity",
+        "progress_units", "total", "completed", "children_ids");
+
+    for (const auto& res_el : res) {
+        tasks_add_tree_to_statuses_lists(table, res_el);
+    }
+
+    table.print();
+}
+
+void tasks_print_stats_list(const rjson::value& res) {
+    auto stats = res.GetArray();
+    Tabulate table;
+    table.add("task_id", "type", "kind", "scope", "state", "sequence_number", "keyspace", "table", "entity");
+    for (auto& element : stats) {
+        const auto& s = element.GetObject();
+
+        table.add(rjson::to_string_view(s["task_id"]),
+                rjson::to_string_view(s["type"]),
+                rjson::to_string_view(s["kind"]),
+                rjson::to_string_view(s["scope"]),
+                rjson::to_string_view(s["state"]),
+                s["sequence_number"].GetUint64(),
+                rjson::to_string_view(s["keyspace"]),
+                rjson::to_string_view(s["table"]),
+                rjson::to_string_view(s["entity"]));
+    }
+    table.print();
+}
+
+void tasks_abort_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    if (!vm.contains("id")) {
+        throw std::invalid_argument("required parameter is missing: id");
+    }
+    auto id = vm["id"].as<sstring>();
+
+    try {
+        auto res = client.post(format("/task_manager/abort_task/{}", id));
+    } catch (const api_request_failed& e) {
+        if (e.status != http::reply::status_type::forbidden) {
+            throw;
+        }
+
+        fmt::print("Task with id {} is not abortable\n", id);
+    }
+}
+
+void tasks_user_ttl_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    if (!vm.contains("set")) {
+        auto res = client.get("/task_manager/user_ttl");
+        fmt::print("Current user ttl: {}\n", res);
+        return;
+    }
+    auto new_ttl = vm["set"].as<uint32_t>();
+    std::unordered_map<sstring, sstring> params = {{ "user_ttl", fmt::to_string(new_ttl) }};
+
+    auto res = client.post("/task_manager/user_ttl", std::move(params));
+}
+
+void tasks_list_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    if (!vm.contains("module")) {
+        throw std::invalid_argument("required parameter is missing: module");
+    }
+    auto module = vm["module"].as<sstring>();
+    std::unordered_map<sstring, sstring> params;
+    if (vm.contains("keyspace")) {
+        params["keyspace"] = vm["keyspace"].as<sstring>();
+    }
+    if (vm.contains("table")) {
+        params["table"] = vm["table"].as<sstring>();
+    }
+    if (vm.contains("internal")) {
+        params["internal"] = "true";
+    }
+    int interval = vm["interval"].as<int>();
+    int iterations = vm["iterations"].as<int>();
+
+    auto res = client.get(format("/task_manager/list_module_tasks/{}", module), params);
+    tasks_print_stats_list(res);
+
+    for (auto i = 0; i < iterations; ++i) {
+        sleep(interval);
+        auto res = client.get(format("/task_manager/list_module_tasks/{}", module), params);
+        fmt::print("\n\n");
+        tasks_print_stats_list(res);
+    }
+}
+
+void tasks_modules_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    auto res = client.get("/task_manager/list_modules");
+
+    for (auto& x: res.GetArray()) {
+        fmt::print("{}\n", rjson::to_string_view(x));
+    }
+}
+
+void tasks_status_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    if (!vm.contains("id")) {
+        throw std::invalid_argument("required parameter is missing: id");
+    }
+    auto id = vm["id"].as<sstring>();
+
+    auto res = client.get(format("/task_manager/task_status/{}", id));
+
+    tasks_print_status(res);
+}
+
+void tasks_tree_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    std::vector<rjson::value> res;
+    if (vm.contains("id")) {
+        auto id = vm["id"].as<sstring>();
+
+        res.push_back(client.get(format("/task_manager/task_status_recursive/{}", id)));
+
+        tasks_print_trees(res);
+        return;
+    }
+
+    auto module_res = client.get("/task_manager/list_modules");
+    for (const auto& module : module_res.GetArray()) {
+        auto list_res = client.get(format("/task_manager/list_module_tasks/{}", module.GetString()));
+        for (const auto& stats : list_res.GetArray()) {
+            try {
+                res.push_back(client.get(format("/task_manager/task_status_recursive/{}", stats.GetObject()["task_id"].GetString())));
+            } catch (const api_request_failed& e) {
+                if (e.status == http::reply::status_type::bad_request) {
+                    // Task has already been unregistered.
+                    continue;
+                }
+                throw;
+            }
+        }
+    }
+    tasks_print_trees(res);
+}
+
+void tasks_ttl_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    if (!vm.contains("set")) {
+        auto res = client.get("/task_manager/ttl");
+        fmt::print("Current ttl: {}\n", res);
+        return;
+    }
+    auto new_ttl = vm["set"].as<uint32_t>();
+    std::unordered_map<sstring, sstring> params = {{ "ttl", fmt::to_string(new_ttl) }};
+
+    auto res = client.post("/task_manager/ttl", std::move(params));
+}
+
+enum class tasks_exit_code {
+    ok = 0,
+    failed = 123,
+    timeout = 124,
+    request_error = 125
+};
+
+void tasks_wait_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    if (!vm.contains("id")) {
+        throw std::invalid_argument("required parameter is missing: id");
+    }
+    std::unordered_map<sstring, sstring> params;
+    auto id = vm["id"].as<sstring>();
+    bool quiet = vm.contains("quiet");
+    if (vm.contains("timeout")) {
+        params["timeout"] = fmt::format("{}", vm["timeout"].as<uint32_t>());
+    }
+
+    std::exception_ptr ex = nullptr;
+    tasks_exit_code exit_code = tasks_exit_code::ok;
+    try {
+        auto res = client.get(format("/task_manager/wait_task/{}", id), params);
+        if (!quiet) {
+            tasks_print_status(res);
+            return;
+        }
+        exit_code = res.GetObject()["state"] == "failed" ? tasks_exit_code::failed : tasks_exit_code::ok;
+    } catch (const api_request_failed& e) {
+        if (e.status == http::reply::status_type::request_timeout) {
+            if (!quiet) {
+                fmt::print("Operation timed out");
+                return;
+            }
+            exit_code = tasks_exit_code::timeout;
+        } else {
+            exit_code = tasks_exit_code::request_error;
+            ex = std::current_exception();
+        }
+    } catch (...) {
+        exit_code = tasks_exit_code::request_error;
+        ex = std::current_exception();
+    }
+
+    if (quiet) {
+        if (exit_code == tasks_exit_code::ok) {
+            return;
+        }
+        throw operation_failed_with_status(int(exit_code));
+    } else if (ex) {
+        std::rethrow_exception(ex);
+    }
+}
+
 void toppartitions_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     // sanity check the arguments
     sstring table_filters;
     int duration_in_milli = 0;
     const auto positional_args = {"keyspace", "table", "duration-milli"};
     if (std::ranges::all_of(positional_args,
-                            [&] (auto& arg) { return vm.count(arg); })) {
+                            [&] (auto& arg) { return vm.contains(arg); })) {
         table_filters = seastar::format("{}:{}",
                                         vm["keyspace"].as<sstring>(),
                                         vm["table"].as<sstring>());
         duration_in_milli = vm["duration-milli"].as<int>();
     } else if (std::ranges::none_of(positional_args,
-                                    [&] (auto& arg) { return vm.count(arg); })) {
+                                    [&] (auto& arg) { return vm.contains(arg); })) {
         table_filters = vm["cf-filters"].as<sstring>();
         duration_in_milli = vm["duration"].as<int>();
     } else {
@@ -2724,7 +3182,7 @@ void upgradesstables_operation(scylla_rest_client& client, const bpo::variables_
 
     std::unordered_map<sstring, sstring> params;
 
-    if (!vm.count("include-all-sstables")) {
+    if (!vm.contains("include-all-sstables")) {
         params["exclude_current_version"] = "true";
     }
 
@@ -2792,6 +3250,42 @@ void version_operation(scylla_rest_client& client, const bpo::variables_map& vm)
     fmt::print(std::cout, "ReleaseVersion: {}\n", rjson::to_string_view(version_json));
 }
 
+void getcompactionthroughput_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    auto res = client.get("/storage_service/compaction_throughput");
+    uint32_t compaction_throughput_mb_per_sec = res.GetInt();
+    fmt::print("{}\n", compaction_throughput_mb_per_sec);
+}
+
+void setcompactionthroughput_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    std::unordered_map<sstring, sstring> params;
+    if (vm.contains("mbs")) {
+        params["value"] = fmt::to_string(vm["mbs"].as<uint32_t>());
+    } else {
+        throw std::invalid_argument(fmt::format("The throughput value must be specified"));
+    }
+    client.post("/storage_service/compaction_throughput", std::move(params));
+}
+
+void getstreamthroughput_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    auto res = client.get("/storage_service/stream_throughput");
+    uint32_t throughput_mb_per_sec = res.GetInt();
+    if (vm.contains("mib")) {
+        fmt::print("{}\n", throughput_mb_per_sec);
+    } else {
+        fmt::print("{}\n", (((uint64_t)throughput_mb_per_sec) << 23) / 1'000'000);
+    }
+}
+
+void setstreamthroughput_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    std::unordered_map<sstring, sstring> params;
+    if (vm.contains("mbs")) {
+        params["value"] = fmt::to_string(vm["mbs"].as<uint32_t>());
+    } else {
+        throw std::invalid_argument(fmt::format("The throughput value must be specified"));
+    }
+    client.post("/storage_service/stream_throughput", std::move(params));
+}
+
 const std::vector<operation_option> global_options{
     typed_option<sstring>("host,h", "localhost", "the hostname or ip address of the ScyllaDB node"),
     typed_option<uint16_t>("port,p", 10000, "the port of the REST API of the ScyllaDB node"),
@@ -2834,9 +3328,28 @@ const std::map<std::string_view, std::string_view> option_substitutions{
     {"-hf", "--hex-format"},
 };
 
-std::map<operation, operation_func> get_operations_with_func() {
+const std::map<operation, operation_action>& get_operations_with_func() {
 
-    const static std::map<operation, operation_func> operations_with_func {
+    const static std::map<operation, operation_action> operations_with_func {
+        {
+            {
+                "backup",
+                "copy SSTables from a specified keyspace's snapshot to a designated bucket in object storage",
+fmt::format(R"(
+For more information, see: {}"
+)", doc_link("operating-scylla/nodetool-commands/backup.html")),
+                {
+                    typed_option<sstring>("keyspace", "Name of a keyspace to copy SSTables from"),
+                    typed_option<sstring>("table", "Name of a table to copy SSTables from"),
+                    typed_option<sstring>("snapshot", "Name of a snapshot to copy SSTables from"),
+                    typed_option<sstring>("endpoint", "ID of the configured object storage endpoint to copy SSTables to"),
+                    typed_option<sstring>("bucket", "Name of the bucket to backup SSTables to"),
+                    typed_option<sstring>("prefix", "The prefix to backup SSTables under"),
+                    typed_option<>("nowait", "Don't wait on the backup process"),
+                },
+            },
+            backup_operation
+        },
         {
             {
                 "checkAndRepairCdcStreams",
@@ -2848,7 +3361,9 @@ bootstrapping or decommissioning a node.
 For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/checkandrepaircdcstreams.html")),
             },
-            checkandrepaircdcstreams_operation
+            {
+                checkandrepaircdcstreams_operation
+            }
         },
         {
             {
@@ -2871,7 +3386,9 @@ For more information, see: {}
                     typed_option<std::vector<sstring>>("cleanup_arg", "[<keyspace> <tables>...]", -1),
                 }
             },
-            cleanup_operation
+            {
+                cleanup_operation
+            }
         },
         {
             {
@@ -2889,7 +3406,9 @@ For more information, see: {}
                     typed_option<std::vector<sstring>>("keyspaces", "[<keyspaces>...]", -1),
                 }
             },
-            clearsnapshot_operation
+            {
+                clearsnapshot_operation
+            }
         },
         {
             {
@@ -2909,6 +3428,7 @@ For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/compact.html")),
                 {
                     typed_option<bool>("flush-memtables", "Control flushing of tables before major compaction (true by default)"),
+                    typed_option<bool>("consider-only-existing-data", "Check only the SSTables being compacted to garbage collect the tombstones and do not check memtables, commit log and other uncompacting SSTables (false by default). Enabling this will also force flush all memtables before starting major compaction."),
 
                     typed_option<>("split-output,s", "Don't create a single big file (unused)"),
                     typed_option<>("user-defined", "Submit listed SStable files for user-defined compaction (unused)"),
@@ -2919,7 +3439,9 @@ For more information, see: {}
                     typed_option<std::vector<sstring>>("compaction_arg", "[<keyspace> <tables>...] or [<SStable files>...] ", -1),
                 }
             },
-            compact_operation
+            {
+                compact_operation
+            }
         },
         {
             {
@@ -2932,7 +3454,9 @@ For more information, see: {}
                     typed_option<sstring>("format,F", "text", "Output format, one of: (json, yaml or text); defaults to text"),
                 },
             },
-            compactionhistory_operation
+            {
+                compactionhistory_operation
+            }
         },
         {
             {
@@ -2945,7 +3469,9 @@ For more information, see: {}
                     typed_option<bool>("human-readable,H", false, "Display bytes in human readable form, i.e. KiB, MiB, GiB, TiB"),
                 },
             },
-            compactionstats_operation
+            {
+                compactionstats_operation
+            }
         },
         {
             {
@@ -2955,7 +3481,9 @@ fmt::format(R"(
 For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/decommission.html")),
             },
-            decommission_operation
+            {
+                decommission_operation
+            }
         },
         {
             {
@@ -2973,7 +3501,9 @@ For more information, see: {}
                     typed_option<std::vector<sstring>>("table", "The table to describe the ring for (for tablet keyspaces)", -1),
                 },
             },
-            describering_operation
+            {
+                describering_operation
+            }
         },
         {
             {
@@ -2983,7 +3513,9 @@ fmt::format(R"(
 For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/describecluster.html")),
             },
-            describecluster_operation
+            {
+                describecluster_operation
+            }
         },
         {
             {
@@ -2998,7 +3530,9 @@ For more information, see: {}
                     typed_option<std::vector<sstring>>("table", "The table(s) to disable automatic compaction for", -1),
                 }
             },
-            disableautocompaction_operation
+            {
+                disableautocompaction_operation
+            }
         },
         {
             {
@@ -3008,7 +3542,9 @@ fmt::format(R"(
 For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/disablebackup.html")),
             },
-            disablebackup_operation
+            {
+                disablebackup_operation
+            }
         },
         {
             {
@@ -3018,7 +3554,9 @@ fmt::format(R"(
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/disablebinary.html")),
             },
-            disablebinary_operation
+            {
+                disablebinary_operation
+            }
         },
         {
             {
@@ -3028,7 +3566,9 @@ fmt::format(R"(
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/disablegossip.html")),
             },
-            disablegossip_operation
+            {
+                disablegossip_operation
+            }
         },
         {
             {
@@ -3045,7 +3585,9 @@ flush command.
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/drain.html")),
             },
-            drain_operation
+            {
+                drain_operation
+            }
         },
         {
             {
@@ -3060,7 +3602,9 @@ For more information, see: {}"
                     typed_option<std::vector<sstring>>("table", "The table(s) to enable automatic compaction for", -1),
                 }
             },
-            enableautocompaction_operation
+            {
+                enableautocompaction_operation
+            }
         },
         {
             {
@@ -3070,7 +3614,9 @@ fmt::format(R"(
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/enablebackup.html")),
             },
-            enablebackup_operation
+            {
+                enablebackup_operation
+            }
         },
         {
             {
@@ -3082,7 +3628,9 @@ The native protocol is enabled by default.
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/enablebinary.html")),
             },
-            enablebinary_operation
+            {
+                enablebinary_operation
+            }
         },
         {
             {
@@ -3094,7 +3642,9 @@ The gossip protocol is enabled by default.
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/enablegossip.html")),
             },
-            enablegossip_operation
+            {
+                enablegossip_operation
+            }
         },
         {
             {
@@ -3113,7 +3663,9 @@ For more information, see: {}"
                     typed_option<std::vector<sstring>>("table", "The table(s) to flush", -1),
                 }
             },
-            flush_operation
+            {
+                flush_operation
+            }
         },
         {
             {
@@ -3129,7 +3681,9 @@ For more information, see: {}"
                     typed_option<sstring>("key", "The partition key for which we need to find the endpoint", 1),
                 },
             },
-            getendpoints_operation
+            {
+                getendpoints_operation
+            }
         },
         {
             {
@@ -3139,7 +3693,9 @@ R"(
 Prints a table with the name and current logging level for each logger in ScyllaDB.
 )",
             },
-            getlogginglevels_operation
+            {
+                getlogginglevels_operation
+            }
         },
         {
             {
@@ -3157,7 +3713,9 @@ For more information, see: {}"
                     typed_option<sstring>("key", "The partition key for which we need to find the sstables", 1),
                 },
             },
-            getsstables_operation
+            {
+                getsstables_operation
+            }
         },
         {
             {
@@ -3169,7 +3727,9 @@ This value is the probability for tracing a request. To change this value see se
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/gettraceprobability.html")),
             },
-            gettraceprobability_operation
+            {
+                gettraceprobability_operation
+            }
         },
         {
             {
@@ -3179,7 +3739,9 @@ fmt::format(R"(
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/gossipinfo.html")),
             },
-            gossipinfo_operation
+            {
+                gossipinfo_operation
+            }
         },
         {
             {
@@ -3188,10 +3750,12 @@ For more information, see: {}"
                 "",
                 { },
                 {
-                    typed_option<sstring>("command", "The command to get more information about", 1),
+                    typed_option<std::vector<sstring>>("command", "The command to get more information about", -1),
                 },
             },
-            [] (scylla_rest_client&, const bpo::variables_map&) {}
+            {
+                [] (scylla_rest_client&, const bpo::variables_map&) {}
+            }
         },
         {
             {
@@ -3204,7 +3768,9 @@ For more information, see: {}"
                     typed_option<>("tokens,T", "Display all tokens"),
                 },
             },
-            info_operation
+            {
+                info_operation
+            }
         },
         {
             {
@@ -3218,7 +3784,9 @@ For more information, see: {}"
                 { },
                 { },
             },
-            listsnapshots_operation
+            {
+                listsnapshots_operation
+            }
         },
         {
             {
@@ -3232,7 +3800,9 @@ This operation is not supported.
                     typed_option<sstring>("new-token", "The new token to move to this node", 1),
                 },
             },
-            move_operation
+            {
+                move_operation
+            }
         },
         {
             {
@@ -3246,7 +3816,9 @@ For more information, see: {}"
                 },
                 { },
             },
-            netstats_operation
+            {
+                netstats_operation
+            }
         },
         {
             {
@@ -3263,7 +3835,9 @@ For more information, see: {}"
                     typed_option<std::vector<sstring>>("table", "<keyspace> <table>, <keyspace>.<table> or <keyspace>-<table>", 2),
                 }
             },
-            proxyhistograms_operation
+            {
+                proxyhistograms_operation
+            }
         },
         {
             {
@@ -3278,12 +3852,16 @@ Finally, Scylla streams the data to the local node.
 
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/rebuild.html")),
-                { },
+                {
+                    typed_option<>("force", "Enforce the source_dc option, even if it unsafe to use for rebuild"),
+                },
                 {
                     typed_option<sstring>("source-dc", "DC from which to stream data (default: any DC)", 1),
                 },
             },
-            rebuild_operation
+            {
+                rebuild_operation
+            }
         },
         {
             {
@@ -3307,7 +3885,9 @@ For more information, see: {}"
                     typed_option<sstring>("table", "The table to load sstable(s) into", 1),
                 },
             },
-            refresh_operation
+            {
+                refresh_operation
+            }
         },
         {
             {
@@ -3322,13 +3902,15 @@ by any means!
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/removenode.html")),
                 {
-                    typed_option<sstring>("ignore-dead-nodes", "Comma-separated list of dead nodes to ignore during removenode"),
+                    typed_option<sstring>("ignore-dead-nodes", "Comma-separated list of dead node host IDs to ignore during removenode"),
                 },
                 {
                     typed_option<sstring>("remove-operation", "status|force|$HOST_ID - show status of current node removal, force completion of pending removal, or remove provided ID", 1),
                 },
             },
-            removenode_operation
+            {
+                removenode_operation
+            }
         },
         {
             {
@@ -3366,7 +3948,9 @@ For more information, see: {}"
                     typed_option<std::vector<sstring>>("table", "The table(s) to repair, if missing all tables are repaired", -1),
                 },
             },
-            repair_operation
+            {
+                repair_operation
+            }
         },
         {
             {
@@ -3378,7 +3962,31 @@ For more information, see: https://opensource.docs.scylladb.com/stable/operating
                 { },
                 { },
             },
-            resetlocalschema_operation
+            {
+                resetlocalschema_operation
+            }
+        },
+        {
+            {
+                "restore",
+                "Copy SSTables from a designated bucket in object store to a specified keyspace or table",
+fmt::format(R"(
+For more information, see: {}"
+)", doc_link("operating-scylla/nodetool-commands/restore.html")),
+                {
+                    typed_option<sstring>("endpoint", "ID of the configured object storage endpoint to copy SSTables from"),
+                    typed_option<sstring>("bucket", "Name of the bucket to copy SSTables from"),
+                    typed_option<sstring>("prefix", "The shared prefix of the object keys for the backuped SSTables"),
+                    typed_option<sstring>("keyspace", "Name of a keyspace to copy SSTables to"),
+                    typed_option<sstring>("table", "Name of a table to copy SSTables to"),
+                    typed_option<>("nowait", "Don't wait on the restore process"),
+                    typed_option<sstring>("scope", "Load-and-stream scope (node, rack or dc)"),
+                },
+                {
+                    typed_option<std::vector<sstring>>("sstables", "The object keys of the TOC component of the SSTables to be restored", -1),
+                },
+            },
+            restore_operation
         },
         {
             {
@@ -3395,7 +4003,9 @@ For more information, see: {}"
                     typed_option<sstring>("table", "The table to print the ring for (needed for tablet keyspaces)", 1),
                 },
             },
-            ring_operation
+            {
+                ring_operation
+            }
         },
         {
             {
@@ -3418,7 +4028,9 @@ For more information, see: {}"
                     typed_option<std::vector<sstring>>("table", "The table(s) to scrub (if unspecified, all tables in the keyspace are scrubbed)", -1),
                 },
             },
-            scrub_operation
+            {
+                scrub_operation
+            }
         },
         {
             {
@@ -3435,7 +4047,9 @@ For more information, see: {}"
                     typed_option<sstring>("level", "The log level to set, one of (trace, debug, info, warn and error), if unspecified, default level is reset to default log level", 1),
                 },
             },
-            setlogginglevel_operation
+            {
+                setlogginglevel_operation
+            }
         },
         {
             {
@@ -3453,7 +4067,9 @@ For more information, see: {}"
                     typed_option<double>("trace_probability", "trace probability value, must between 0 and 1, e.g. 0.2", 1),
                 },
             },
-            settraceprobability_operation
+            {
+                settraceprobability_operation
+            }
         },
         {
             {
@@ -3472,7 +4088,9 @@ For more information, see: {}"
                     typed_option<std::vector<sstring>>("keyspaces", "The keyspaces to snapshot", -1),
                 },
             },
-            snapshot_operation
+            {
+                snapshot_operation
+            }
         },
         {
             {
@@ -3487,7 +4105,9 @@ For more information, see: {}"
                     typed_option<std::vector<sstring>>("table", "The table names (optional)", -1),
                 },
             },
-            sstableinfo_operation,
+            {
+                sstableinfo_operation,
+            }
         },
         {
             {
@@ -3504,7 +4124,9 @@ For more information, see: {}"
                     typed_option<sstring>("table", "The table name (needed to display load information, if the keyspace uses tablets)", 1),
                 },
             },
-            status_operation
+            {
+                status_operation
+            }
         },
         {
             {
@@ -3518,7 +4140,9 @@ By default, the incremental backup status is `not running`.
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/statusbackup.html")),
             },
-            statusbackup_operation
+            {
+                statusbackup_operation
+            }
         },
         {
             {
@@ -3535,7 +4159,9 @@ By default, the native transport is `running`.
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/statusbinary.html")),
             },
-            statusbinary_operation
+            {
+                statusbinary_operation
+            }
         },
         {
             {
@@ -3550,7 +4176,9 @@ By default, the gossip protocol is `running`.
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/statusgossip.html")),
             },
-            statusgossip_operation
+            {
+                statusgossip_operation
+            }
         },
         {
             {
@@ -3568,7 +4196,9 @@ For more information, see: {}"
                     typed_option<sstring>("compaction_type", "The type of compaction to be stopped", 1),
                 },
             },
-            stop_operation
+            {
+                stop_operation
+            }
         },
         {
             {
@@ -3589,7 +4219,9 @@ For more information, see: {}"
                     typed_option<std::vector<sstring>>("table", "<keyspace> <table>, <keyspace>.<table> or <keyspace>-<table>", 2),
                 }
             },
-            tablehistograms_operation
+            {
+                tablehistograms_operation
+            }
         },
         {
             {
@@ -3608,7 +4240,171 @@ For more information, see: {}"
                     typed_option<std::vector<sstring>>("tables", "List of tables (or keyspace) names", -1),
                 },
             },
-            table_stats_operation
+            {
+                table_stats_operation
+            }
+        },
+        {
+            {
+                "tasks",
+                "Manages task manager tasks",
+                "",
+                { },
+                {
+                    typed_option<sstring>("command", "The uuid of a task", 1),
+                },
+                {
+                        {
+                            "abort",
+                            "Aborts the task",
+fmt::format(R"(
+Aborts a task with given id. If the task is not abortable, appropriate message
+will be printed, depending on why the abort failed.
+
+For more information, see: {}"
+)", doc_link("operating-scylla/nodetool-commands/tasks/abort.html")),
+                            { },
+                            {
+                                typed_option<sstring>("id", "The uuid of a task", 1),
+                            },
+                        },
+                        {
+                            "user-ttl",
+                            "Gets or sets user task ttl",
+fmt::format(R"(
+Gets or sets the time in seconds for which tasks started by user will be kept in task manager after
+they are finished.
+
+For more information, see: {}"
+)", doc_link("operating-scylla/nodetool-commands/tasks/user-ttl.html")),
+                            {
+                                typed_option<uint32_t>("set", "New user_task_ttl value", -1),
+                            },
+                            { },
+                        },
+                        {
+                            "list",
+                            "Gets a list of tasks in a given module",
+fmt::format(R"(
+Lists short stats (including id, type, kind, scope, state, sequence_number,
+keyspace, table, and entity) of tasks in a specified module.
+
+Allows to monitor tasks for extended time.
+
+For more information, see: {}"
+)", doc_link("operating-scylla/nodetool-commands/tasks/list.html")),
+                            {
+                                typed_option<>("internal", "Show internal tasks"),
+                                typed_option<sstring>("keyspace,ks", "The keyspace name; if specified only the tasks for this keyspace are shown"),
+                                typed_option<sstring>("table,t", "The table name; if specified only the tasks for this table are shown"),
+                                typed_option<int>("interval", 10, "Re-print the task list after interval seconds. Can be used to monitor the task-list for extended period of time"),
+                                typed_option<int>("iterations,i", 0, "The number of times the task list will be re-printed. Use interval to control the frequency of re-printing the list"),
+                            },
+                            {
+                                typed_option<sstring>("module", "The module to query about", 1),
+                            },
+                        },
+                        {
+                            "modules",
+                            "Gets a list of modules supported by task manager",
+fmt::format(R"(
+For more information, see: {}"
+)", doc_link("operating-scylla/nodetool-commands/tasks/modules.html")),
+                            { },
+                            { },
+                        },
+                        {
+                            "status",
+                            "Gets a status of the task",
+fmt::format(R"(
+For more information, see: {}"
+)", doc_link("operating-scylla/nodetool-commands/tasks/status.html")),
+                            { },
+                            {
+                                typed_option<sstring>("id", "The uuid of a task", 1),
+                            },
+                        },
+                        {
+                            "tree",
+                            "Gets statuses of the task tree with a given root",
+fmt::format(R"(
+Lists statuses of a specified task and all its descendants in BFS order.
+If id param isn't specified, trees of all non-internal tasks are listed.
+
+For more information, see: {}"
+)", doc_link("operating-scylla/nodetool-commands/tasks/tree.html")),
+                            { },
+                            {
+                                typed_option<sstring>("id", "The uuid of a root task", -1),
+                            },
+                        },
+                        {
+                            "ttl",
+                            "Gets or sets task ttl",
+fmt::format(R"(
+Gets or sets the time in seconds for which tasks will be kept in task manager after
+they are finished.
+
+For more information, see: {}"
+)", doc_link("operating-scylla/nodetool-commands/tasks/ttl.html")),
+                            {
+                                typed_option<uint32_t>("set", "New task_ttl value", -1),
+                            },
+                            { },
+                        },
+                        {
+                            "wait",
+                            "Waits for the task to finish and returns its status",
+fmt::format(R"(
+Waits until task is finished and returns it status. If task does not finish before
+timeout, the appropriate message with failure reason will be printed.
+
+If quiet flag is set, nothing is printed. Instead the right exit code is returned:
+- 0, if the task finished successfully;
+- 123, if the task failed;
+- 124, if the operation timed out;
+- 125, if there was an error.
+
+For more information, see: {}"
+)", doc_link("operating-scylla/nodetool-commands/tasks/wait.html")),
+                            {
+                                typed_option<>("quiet,q", "If set, status isn't printed"),
+                                typed_option<uint32_t>("timeout", "Timeout in seconds"),
+                            },
+                            {
+                                typed_option<sstring>("id", "The uuid of a root task", 1),
+                            },
+                        }
+                }
+            },
+            {
+                {
+                    {
+                        "abort", { tasks_abort_operation }
+                    },
+                    {
+                        "user-ttl", { tasks_user_ttl_operation }
+                    },
+                    {
+                        "list", { tasks_list_operation }
+                    },
+                    {
+                        "modules", { tasks_modules_operation }
+                    },
+                    {
+                        "status", { tasks_status_operation }
+                    },
+                    {
+                        "tree", { tasks_tree_operation }
+                    },
+                    {
+                        "ttl", { tasks_ttl_operation }
+                    },
+                    {
+                        "wait", { tasks_wait_operation }
+                    },
+                }
+            }
         },
         {
             {
@@ -3631,7 +4427,9 @@ For more information, see: {}"
                     typed_option<int>("duration-milli", "Duration in milliseconds", 1),
                 },
             },
-            toppartitions_operation
+            {
+                toppartitions_operation
+            }
         },
         {
             {
@@ -3655,7 +4453,9 @@ For more information, see: {}"
                     typed_option<std::vector<sstring>>("table", "Table to upgrade sstables for, if missing, all tables in the keyspace are upgraded", -1),
                 },
             },
-            upgradesstables_operation
+            {
+                upgradesstables_operation
+            }
         },
         {
             {
@@ -3669,7 +4469,9 @@ For more information, see: {}"
                     typed_option<std::vector<sstring>>("keyspace_view", "<keyspace> <view> | <keyspace.view>, The keyspace and view name ", -1),
                 },
             },
-            viewbuildstatus_operation
+            {
+                viewbuildstatus_operation
+            }
         },
         {
             {
@@ -3683,7 +4485,69 @@ run `scylla --version`.
 For more information, see: {}"
 )", doc_link("operating-scylla/nodetool-commands/version.html")),
             },
-            version_operation
+            {
+                version_operation
+            }
+        },
+        {
+            {
+                "getcompactionthroughput",
+                "Get compaction IO throughput",
+R"(
+Print the MiB/s throughput cap for compaction in the system
+)",
+            },
+            {
+                getcompactionthroughput_operation
+            }
+        },
+        {
+            {
+                "setcompactionthroughput",
+                "Set compaction IO throughput",
+R"(
+Set the MiB/s throughput for compaction, or 0 to disable throttling
+)",
+                {},
+                {
+                    typed_option<uint32_t>("mbs", "Value in MiB, 0 to disable throttling ", 1),
+                },
+            },
+            {
+                setcompactionthroughput_operation
+            }
+        },
+        {
+            {
+                "getstreamthroughput",
+                "Get streaming throughput",
+R"(
+Print throughput cap for streaming in the system in megabits
+)",
+                {
+                        typed_option<>("mib", "Print the throughput cap for streaming in MiB/s"),
+                },
+                {},
+            },
+            {
+                getstreamthroughput_operation
+            },
+        },
+        {
+            {
+                "setstreamthroughput",
+                "Set compaction IO throughput",
+R"(
+Set the MiB/s throughput for streaming, or 0 to disable throttling
+)",
+                {},
+                {
+                    typed_option<uint32_t>("mbs", "Value in MiB, 0 to disable throttling ", 1),
+                },
+            },
+            {
+                setstreamthroughput_operation
+            }
         },
     };
 
@@ -3743,6 +4607,26 @@ std::vector<char*> massage_argv(int argc, char** argv) {
     return new_argv;
 }
 
+operation_func get_operation_function(const operation& op) noexcept {
+    auto operations_with_func = get_operations_with_func();
+    auto name = op.fullname();
+
+    // Find main operation's action.
+    auto it = std::find_if(operations_with_func.begin(), operations_with_func.end(), [&op_name = name.back()] (const auto& el) {
+        return el.first.name() == op_name;
+    });
+    assert(it != operations_with_func.end());
+    auto& action = it->second;
+    name.pop_back();
+
+    // Check suboperations.
+    for (auto n : name | std::views::reverse) {
+        action = action.suboperation_funcs.at(n);
+    }
+
+    return action.func.value();
+}
+
 } // anonymous namespace
 
 #if FMT_VERSION == 100000
@@ -3770,11 +4654,11 @@ Supported Nodetool operations:
 
 For more information, see: {})";
 
-    const auto operations = boost::copy_range<std::vector<operation>>(get_operations_with_func() | boost::adaptors::map_keys);
+    const auto operations = get_operations_with_func() | std::views::keys | std::ranges::to<std::vector>();
     tool_app_template::config app_cfg{
             .name = app_name,
-            .description = format(description_template, app_name, nlog.name(), boost::algorithm::join(operations | boost::adaptors::transformed([] (const auto& op) {
-                return format("* {}: {}", op.name(), op.summary());
+            .description = seastar::format(description_template, app_name, nlog.name(), fmt::join(operations | std::views::transform([] (const auto& op) {
+                return seastar::format("* {}: {}", op.name(), op.summary());
             }), "\n"), doc_link("operating-scylla/nodetool.html")),
             .logger_name = nlog.name(),
             .lsa_segment_pool_backend_size_mb = 1,
@@ -3798,7 +4682,7 @@ For more information, see: {})";
                     port = app_config["port"].as<uint16_t>();
                 }
                 scylla_rest_client client(app_config["host"].as<sstring>(), port);
-                get_operations_with_func().at(operation)(client, app_config);
+                get_operation_function(operation)(client, app_config);
             }
         } catch (std::invalid_argument& e) {
             fmt::print(std::cerr, "error processing arguments: {}\n", e.what());

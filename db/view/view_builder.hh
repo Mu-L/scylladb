@@ -3,19 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "query-request.hh"
 #include "service/migration_listener.hh"
+#include "service/raft/raft_group0_client.hh"
 #include "utils/serialized_action.hh"
+#include "utils/cross-shard-barrier.hh"
 #include "replica/database.hh"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_future.hh>
@@ -150,6 +151,8 @@ class view_builder final : public service::migration_listener::only_view_notific
     replica::database& _db;
     db::system_keyspace& _sys_ks;
     db::system_distributed_keyspace& _sys_dist_ks;
+    service::raft_group0_client& _group0_client;
+    cql3::query_processor& _qp;
     service::migration_notifier& _mnotifier;
     view_update_generator&  _vug;
     reader_permit _permit;
@@ -164,20 +167,24 @@ class view_builder final : public service::migration_listener::only_view_notific
     future<> _started = make_ready_future<>();
     // Used to coordinate between shards the conclusion of the build process for a particular view.
     std::unordered_set<table_id> _built_views;
-    // Counter and promise (both on shard 0 only!) allowing to wait for all
-    // shards to have read the view build statuses
-    unsigned _shards_finished_read = 0;
-    seastar::shared_promise<> _shards_finished_read_promise;
     // Used for testing.
     std::unordered_map<std::pair<sstring, sstring>, seastar::shared_promise<>, utils::tuple_hash> _build_notifiers;
     stats _stats;
     metrics::metric_groups _metrics;
+
+    enum class view_build_status_location { sys_dist_ks, group0, both };
+
+    view_build_status_location _view_build_status_on = view_build_status_location::sys_dist_ks;
+    bool _init_virtual_table_on_upgrade = false;
+    utils::phased_barrier _upgrade_phaser;
 
     struct view_builder_init_state {
         std::vector<future<>> bookkeeping_ops;
         std::vector<std::vector<view_build_status>> status_per_shard;
         std::unordered_set<table_id> built_views;
     };
+
+    future<> start_in_background(service::migration_manager&, utils::cross_shard_barrier b);
 
 public:
     // The view builder processes the base table in steps of batch_size rows.
@@ -190,7 +197,8 @@ public:
     replica::database& get_db() noexcept { return _db; }
 
 public:
-    view_builder(replica::database&, db::system_keyspace&, db::system_distributed_keyspace&, service::migration_notifier&, view_update_generator& vug);
+    view_builder(replica::database&, db::system_keyspace&, db::system_distributed_keyspace&, service::migration_notifier&, view_update_generator& vug,
+            service::raft_group0_client& group0_client, cql3::query_processor& qp);
     view_builder(view_builder&&) = delete;
 
     /**
@@ -198,7 +206,7 @@ public:
      * Requires that all views have been loaded from the system tables and are accessible
      * through the database, and that the commitlog has been replayed.
      */
-    future<> start(service::migration_manager&);
+    future<> start(service::migration_manager&, utils::cross_shard_barrier b = utils::cross_shard_barrier(utils::cross_shard_barrier::solo{}));
 
     /**
      * Drains view building in order to prepare it for shutdown.
@@ -210,6 +218,16 @@ public:
      */
     future<> stop();
 
+    static future<> generate_mutations_on_node_left(replica::database& db, db::system_keyspace& sys_ks, api::timestamp_type timestamp, locator::host_id host_id, std::vector<canonical_mutation>& muts);
+
+    static future<> migrate_to_v1_5(locator::token_metadata_ptr tmptr, db::system_keyspace& sys_ks, cql3::query_processor& qp, service::raft_group0_client& group0_client, abort_source& as, service::group0_guard guard);
+    static future<> migrate_to_v2(locator::token_metadata_ptr tmptr, db::system_keyspace& sys_ks, cql3::query_processor& qp, service::raft_group0_client& group0_client, abort_source& as, service::group0_guard guard);
+
+    future<> upgrade_to_v1_5();
+    future<> upgrade_to_v2();
+
+    void init_virtual_table();
+
     virtual void on_create_view(const sstring& ks_name, const sstring& view_name) override;
     virtual void on_update_view(const sstring& ks_name, const sstring& view_name, bool columns_changed) override;
     virtual void on_drop_view(const sstring& ks_name, const sstring& view_name) override;
@@ -217,7 +235,7 @@ public:
     // For tests
     future<> wait_until_built(const sstring& ks_name, const sstring& view_name);
 
-    future<std::unordered_map<sstring, sstring>> view_build_statuses(sstring keyspace, sstring view_name) const;
+    future<std::unordered_map<sstring, sstring>> view_build_statuses(sstring keyspace, sstring view_name, const gms::gossiper& g) const;
 
     // Can only be called on shard-0
     future<> mark_existing_views_as_built();
@@ -237,6 +255,27 @@ private:
     future<> maybe_mark_view_as_built(view_ptr, dht::token);
     future<> mark_as_built(view_ptr);
     void setup_metrics();
+
+    template <typename Func1, typename Func2>
+    future<> write_view_build_status(Func1&& fn_group0, Func2&& fn_sys_dist) {
+        auto op = _upgrade_phaser.start();
+
+        // read locally so it doesn't change between async calls
+        const auto v = _view_build_status_on;
+
+        if (v == view_build_status_location::group0 || v == view_build_status_location::both) {
+            co_await fn_group0();
+        }
+
+        if (v == view_build_status_location::sys_dist_ks || v == view_build_status_location::both) {
+            co_await fn_sys_dist();
+        }
+    }
+
+    future<> mark_view_build_started(sstring ks_name, sstring view_name);
+    future<> mark_view_build_success(sstring ks_name, sstring view_name);
+    future<> remove_view_build_status(sstring ks_name, sstring view_name);
+    future<std::unordered_map<locator::host_id, sstring>> view_status(sstring ks_name, sstring view_name) const;
 
     struct consumer;
 };

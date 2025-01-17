@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "test/lib/key_utils.hh"
@@ -42,7 +42,7 @@ std::vector<DecoratedKey> generate_keys(
         }
         auto raw_key = RawKey::from_deeply_exploded(*s, components);
         // discard empty keys on the off chance that we generate one
-        if (raw_key.is_empty() || (types.size() == 1 && raw_key.begin(*s)->empty())) {
+        if (raw_key.is_empty() || (types.size() == 1 && (*raw_key.begin(*s)).empty())) {
             continue;
         }
         if constexpr (std::is_same_v<RawKey, DecoratedKey>) {

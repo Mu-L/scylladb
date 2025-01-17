@@ -3,18 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
 #include <fmt/ranges.h>
 #include <seastar/core/thread.hh>
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
+#include <seastar/testing/thread_test_case.hh>
 
 #include "test/lib/cql_test_env.hh"
 #include "service/storage_proxy.hh"
 #include "query_ranges_to_vnodes.hh"
 #include "schema/schema_builder.hh"
+
+BOOST_AUTO_TEST_SUITE(storage_proxy_test)
 
 // Returns random keys sorted in ring order.
 // The schema must have a single bytes_type partition key column.
@@ -44,15 +48,15 @@ SEASTAR_TEST_CASE(test_get_restricted_ranges) {
             if (!std::equal(actual.begin(), actual.end(), expected.begin(), [&s](auto&& r1, auto&& r2) {
                 return r1.equal(r2, dht::ring_position_comparator(*s));
             })) {
-                BOOST_FAIL(format("Ranges differ, expected {} but got {}", expected, actual));
+                BOOST_FAIL(fmt::format("Ranges differ, expected {} but got {}", expected, actual));
             }
         };
 
         {
             // Ring with minimum token
-            auto tmptr = locator::make_token_metadata_ptr(locator::token_metadata::config{});
+            auto tmptr = locator::make_token_metadata_ptr(locator::token_metadata::config{e.shared_token_metadata().local().get()->get_topology().get_config()});
             const auto host_id = locator::host_id{utils::UUID(0, 1)};
-            tmptr->update_topology(host_id, locator::endpoint_dc_rack{"dc1", "rack1"});
+            tmptr->update_topology(host_id, locator::endpoint_dc_rack{"dc1", "rack1"}, locator::node::state::normal);
             tmptr->update_normal_tokens(std::unordered_set<dht::token>({dht::minimum_token()}), host_id).get();
 
             check(tmptr, dht::partition_range::make_singular(ring[0]), {
@@ -65,12 +69,12 @@ SEASTAR_TEST_CASE(test_get_restricted_ranges) {
         }
 
         {
-            auto tmptr = locator::make_token_metadata_ptr(locator::token_metadata::config{});
+            auto tmptr = locator::make_token_metadata_ptr(locator::token_metadata::config{e.shared_token_metadata().local().get()->get_topology().get_config()});
             const auto id1 = locator::host_id{utils::UUID(0, 1)};
             const auto id2 = locator::host_id{utils::UUID(0, 2)};
-            tmptr->update_topology(id1, locator::endpoint_dc_rack{"dc1", "rack1"});
+            tmptr->update_topology(id1, locator::endpoint_dc_rack{"dc1", "rack1"}, locator::node::state::normal);
             tmptr->update_normal_tokens(std::unordered_set<dht::token>({ring[2].token()}), id1).get();
-            tmptr->update_topology(id2, locator::endpoint_dc_rack{"dc1", "rack1"});
+            tmptr->update_topology(id2, locator::endpoint_dc_rack{"dc1", "rack1"}, locator::node::state::normal);
             tmptr->update_normal_tokens(std::unordered_set<dht::token>({ring[5].token()}), id2).get();
 
             check(tmptr, dht::partition_range::make_singular(ring[0]), {
@@ -103,7 +107,7 @@ SEASTAR_TEST_CASE(test_get_restricted_ranges) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_split_stats) {
-    auto ep1 = gms::inet_address("127.0.0.1");
+    auto ep1 = locator::host_id{};
     auto sg1 = create_scheduling_group("apa1", 100).get();
     auto sg2 = create_scheduling_group("apa2", 100).get();
 
@@ -131,3 +135,5 @@ SEASTAR_THREAD_TEST_CASE(test_split_stats) {
     stats1->register_metrics_for("DC1", ep1);
     stats2->register_metrics_for("DC1", ep1);
 }
+
+BOOST_AUTO_TEST_SUITE_END()

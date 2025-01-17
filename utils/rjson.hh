@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -26,6 +26,8 @@
  * or calling Size() on a non-array value.
  */
 
+#include <iostream>
+#include <map>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -64,7 +66,6 @@ public:
 #include <rapidjson/document.h>
 #include <rapidjson/writer.h>
 #include <rapidjson/stringbuffer.h>
-#include <rapidjson/error/en.h>
 #include <rapidjson/allocators.h>
 #include <rapidjson/ostreamwrapper.h>
 #include <seastar/core/sstring.hh>
@@ -415,6 +416,12 @@ public:
         }
     }
 };
+
+inline bool is_leaf(const rjson::value& value) {
+    return !value.IsObject() && !value.IsArray();
+}
+
+future<> destroy_gently(rjson::value&& value);
 
 } // end namespace rjson
 

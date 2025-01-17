@@ -2,7 +2,7 @@
  * Copyright 2021-present ScyllaDB
  */
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -32,7 +32,7 @@ public:
         return ser::serialize_to_buffer<bytes>(_tombstone_gc_options.to_map());
     }
     static std::map<seastar::sstring, seastar::sstring> deserialize(const bytes_view& buffer) {
-        return ser::deserialize_from_buffer(buffer, boost::type<std::map<seastar::sstring, seastar::sstring>>());
+        return ser::deserialize_from_buffer(buffer, std::type_identity<std::map<seastar::sstring, seastar::sstring>>());
     }
     const tombstone_gc_options& get_options() const {
         return _tombstone_gc_options;

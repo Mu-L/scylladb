@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,8 +12,6 @@
 #include <functional>
 #include <optional>
 #include <variant>
-#include <seastar/core/smp.hh>
-#include <seastar/core/file.hh>
 #include "sstables/types_fwd.hh"
 #include "sstables/sstable_set.hh"
 #include "compaction_fwd.hh"
@@ -172,6 +170,16 @@ struct compaction_descriptor {
 
     // Denotes if this compaction task is comprised solely of completely expired SSTables
     sstables::has_only_fully_expired has_only_fully_expired = has_only_fully_expired::no;
+
+    // If set to true, gc will check only the compacting sstables to collect tombstones.
+    // If set to false, gc will check the memtables, commit log and other uncompacting
+    // sstables to decide if a tombstone can be collected. Note that these checks are
+    // not perfect. W.r.to memtables and uncompacted SSTables, if their minimum timestamp
+    // is less than that of the tombstone and they contain the key, the tombstone will
+    // not be collected. No row-level, cell-level check takes place. W.r.to the commit
+    // log, there is currently no way to check if the key exists; only the minimum
+    // timestamp comparison, similar to memtables, is performed.
+    bool gc_check_only_compacting_sstables = false;
 
     compaction_descriptor() = default;
 

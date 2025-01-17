@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
@@ -38,7 +38,8 @@ struct hint_stats {
     uint64_t written                    = 0;
     uint64_t errors                     = 0;
     uint64_t dropped                    = 0;
-    uint64_t sent                       = 0;
+    uint64_t sent_total                 = 0;
+    uint64_t sent_hints_bytes_total     = 0;
     uint64_t discarded                  = 0;
     uint64_t send_errors                = 0;
     uint64_t corrupted_files            = 0;

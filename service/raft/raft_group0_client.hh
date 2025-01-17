@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -16,19 +16,34 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/rwlock.hh>
 #include <seastar/core/condition-variable.hh>
+#include <seastar/coroutine/generator.hh>
 #include <string>
 
 #include "service/broadcast_tables/experimental/query_result.hh"
-#include "service/raft/raft_group_registry.hh"
 #include "service/raft/group0_fwd.hh"
+#include "service/raft/raft_timeout.hh"
 #include "utils/UUID.hh"
 #include "timestamp.hh"
 #include "gc_clock.hh"
 #include "service/raft/group0_state_machine.hh"
-#include "db/system_keyspace.hh"
 #include "service/maintenance_mode.hh"
 
+class mutation;
+
+namespace db {
+
+class system_keyspace;
+
+}
+
+namespace locator {
+class shared_token_metadata;
+}
+
 namespace service {
+
+class raft_group_registry;
+
 // Obtaining this object means that all previously finished operations on group 0 are visible on this node.
 
 // It is also required in order to perform group 0 changes
@@ -72,6 +87,7 @@ public:
 class raft_group0_client {
     service::raft_group_registry& _raft_gr;
     db::system_keyspace& _sys_ks;
+    locator::shared_token_metadata& _token_metadata;
 
     // See `group0_guard::impl` for explanation of the purpose of these locks.
     semaphore _read_apply_mutex = semaphore(1);
@@ -103,13 +119,17 @@ class raft_group0_client {
         service::broadcast_tables::query_result get();
     };
 
+    template <typename Command>
+    void validate_change(const Command& change) {}
+    void validate_change(const topology_change& change);
+
 public:
-    raft_group0_client(service::raft_group_registry&, db::system_keyspace&, maintenance_mode_enabled);
+    raft_group0_client(service::raft_group_registry&, db::system_keyspace&, locator::shared_token_metadata&, maintenance_mode_enabled);
 
     // Call after `system_keyspace` is initialized.
     future<> init();
 
-    future<> add_entry(group0_command group0_cmd, group0_guard guard, seastar::abort_source* as, std::optional<raft_timeout> timeout = std::nullopt);
+    future<> add_entry(group0_command group0_cmd, group0_guard guard, seastar::abort_source& as, std::optional<raft_timeout> timeout = std::nullopt);
 
     future<> add_entry_unguarded(group0_command group0_cmd, seastar::abort_source* as);
 
@@ -133,7 +153,7 @@ public:
     // FIXME?: this is kind of annoying for the user.
     // we could forward the call to shard 0, have group0_guard keep a foreign_ptr to the internal data structures on shard 0,
     // and add_entry would again forward to shard 0.
-    future<group0_guard> start_operation(seastar::abort_source* as, std::optional<raft_timeout> timeout = std::nullopt);
+    future<group0_guard> start_operation(seastar::abort_source& as, std::optional<raft_timeout> timeout = std::nullopt);
 
     template<typename Command>
     requires std::same_as<Command, broadcast_table_query> || std::same_as<Command, write_mutations>
@@ -177,7 +197,6 @@ public:
     // Wait until group 0 upgrade enters the `use_post_raft_procedures` state.
     future<> wait_until_group0_upgraded(abort_source&);
 
-    future<semaphore_units<>> hold_read_apply_mutex();
     future<semaphore_units<>> hold_read_apply_mutex(abort_source&);
 
     db::system_keyspace& sys_ks();
@@ -215,11 +234,13 @@ private:
 
     future<> materialize_mutations();
 public:
-    explicit group0_batch(::service::group0_guard&& g) : _guard(std::move(g)) {}
+    explicit group0_batch(::service::group0_guard&& g);
     // Constructor with optional guard used to handle both legacy and current code.
     // There is no guard for legacy code but the whole class may be passed
     // through to simplify the flow.
-    explicit group0_batch(std::optional<::service::group0_guard> g) : _guard(std::move(g)) {}
+    explicit group0_batch(std::optional<::service::group0_guard> g);
+
+    ~group0_batch();
 
     // Annotation helper for cases where we need collector (e.g. some interface)
     // but the code is fully legacy and the collector won't be used.

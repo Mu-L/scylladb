@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,6 +12,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sharded.hh>
 
+#include "utils/assert.hh"
 #include "utils/disk-error-handler.hh"
 #include "gc_clock.hh"
 #include "sstables/sstables.hh"
@@ -125,11 +126,14 @@ private:
 
     scheduling_group _maintenance_sg;
 
+    const abort_source& _abort;
+
 public:
-    explicit sstables_manager(sstring name, db::large_data_handler& large_data_handler, const db::config& dbcfg, gms::feature_service& feat, cache_tracker&, size_t available_memory, directory_semaphore& dir_sem, noncopyable_function<locator::host_id()>&& resolve_host_id, scheduling_group maintenance_sg = current_scheduling_group(), storage_manager* shared = nullptr);
+    explicit sstables_manager(sstring name, db::large_data_handler& large_data_handler, const db::config& dbcfg, gms::feature_service& feat, cache_tracker&, size_t available_memory, directory_semaphore& dir_sem,
+                              noncopyable_function<locator::host_id()>&& resolve_host_id, const abort_source& abort, scheduling_group maintenance_sg = current_scheduling_group(), storage_manager* shared = nullptr);
     virtual ~sstables_manager();
 
-    shared_sstable make_sstable(schema_ptr schema, sstring table_dir,
+    shared_sstable make_sstable(schema_ptr schema,
             const data_dictionary::storage_options& storage,
             generation_type generation,
             sstable_state state = sstable_state::normal,
@@ -140,12 +144,12 @@ public:
             size_t buffer_size = default_sstable_buffer_size);
 
     shared_ptr<s3::client> get_endpoint_client(sstring endpoint) const {
-        assert(_storage != nullptr);
+        SCYLLA_ASSERT(_storage != nullptr);
         return _storage->get_endpoint_client(std::move(endpoint));
     }
 
     bool is_known_endpoint(sstring endpoint) const {
-        assert(_storage != nullptr);
+        SCYLLA_ASSERT(_storage != nullptr);
         return _storage->is_known_endpoint(std::move(endpoint));
     }
 
@@ -177,16 +181,23 @@ public:
 
     // Only for sstable::storage usage
     sstables::sstables_registry& sstables_registry() const noexcept {
-        assert(_sstables_registry && "sstables_registry is not plugged");
+        SCYLLA_ASSERT(_sstables_registry && "sstables_registry is not plugged");
         return *_sstables_registry;
     }
 
     future<> delete_atomically(std::vector<shared_sstable> ssts);
-    future<> init_table_storage(const data_dictionary::storage_options& so, sstring dir);
-    future<> destroy_table_storage(const data_dictionary::storage_options& so, sstring dir);
+    future<lw_shared_ptr<const data_dictionary::storage_options>> init_table_storage(const schema& s, const data_dictionary::storage_options& so);
+    future<> destroy_table_storage(const data_dictionary::storage_options& so);
     future<> init_keyspace_storage(const data_dictionary::storage_options& so, sstring dir);
 
     void validate_new_keyspace_storage_options(const data_dictionary::storage_options&);
+
+    const abort_source& get_abort_source() const noexcept { return _abort; }
+
+    // To be called by the sstable to signal its unlinking
+    void on_unlink(sstable* sst);
+
+    std::vector<std::filesystem::path> get_local_directories(const data_dictionary::storage_options::local& so) const;
 
 private:
     void add(sstable* sst);
@@ -208,6 +219,10 @@ private:
     // Fiber to reload reclaimed components back into memory when memory becomes available.
     future<> components_reloader_fiber();
     size_t get_memory_available_for_reclaimable_components();
+    // Reclaim memory from the SSTable and remove it from the memory tracking metrics.
+    // The method is idempotent and for an sstable that is deleted, it is called both
+    // during unlink and during deactivation.
+    void reclaim_memory_and_stop_tracking_sstable(sstable* sst);
 private:
     db::large_data_handler& get_large_data_handler() const {
         return _large_data_handler;

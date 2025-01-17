@@ -1,9 +1,10 @@
 #
 # Copyright (C) 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 from test.pylib.manager_client import ManagerClient
+from test.pylib.util import wait_for_first_completed
 from test.topology.conftest import skip_mode
 from collections.abc import Coroutine
 import pytest
@@ -11,13 +12,6 @@ import logging
 import asyncio
 
 logger = logging.getLogger(__name__)
-
-async def wait_for_first_completed(coros: list[Coroutine]):
-    done, pending = await asyncio.wait([asyncio.create_task(c) for c in coros], return_when = asyncio.FIRST_COMPLETED)
-    for t in pending:
-        t.cancel()
-    for t in done:
-        await t
 
 @pytest.mark.asyncio
 @skip_mode('release', 'error injections are not supported in release mode')
@@ -48,8 +42,8 @@ async def test_coordinator_queue_management(manager: ManagerClient):
 
     await wait_for_first_completed([l.wait_for("received request to join from host_id", m) for l, m in zip(logs[:3], marks[:3])])
 
-    marks[0] = await logs[0].wait_for("raft_topology - removenode: wait for completion", marks[0])
-    marks[0] = await logs[0].wait_for("raft_topology - removenode: wait for completion", marks[0])
+    marks[0] = await logs[0].wait_for("raft_topology - removenode: waiting for completion", marks[0])
+    marks[0] = await logs[0].wait_for("raft_topology - removenode: waiting for completion", marks[0])
 
     [await manager.api.message_injection(s.ip_addr, inj) for s in servers[:3]]
 
@@ -68,10 +62,7 @@ async def test_coordinator_queue_management(manager: ManagerClient):
 
     await wait_for_first_completed([l.wait_for("received request to join from host_id", m) for l, m in zip(logs[:3], marks[:3])])
 
-    # FIXME: we aren't actually awaiting this log -- this line is missing an `await`.
-    # But this log was actually removed in commit d576ed31dce292997d1cf32af5a9e89768b154d7.
-    # Should we be waiting for something else, or for nothing at all?
-    logs[1].wait_for("raft_topology - decommission: wait for completion", marks[1])
+    await logs[1].wait_for("raft_topology - decommission: waiting for completion", marks[1])
 
     [await manager.api.message_injection(s.ip_addr, inj) for s in servers[:3]]
 

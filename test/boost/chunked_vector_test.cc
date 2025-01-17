@@ -3,14 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE core
 
+#include <ranges>
 #include <stdexcept>
 #include <optional>
 #include <variant>
+#include <algorithm>
 #include <fmt/format.h>
 
 #include <boost/test/included/unit_test.hpp>
@@ -19,7 +21,6 @@
 #include "utils/chunked_vector.hh"
 #include "utils/amortized_reserve.hh"
 
-#include <boost/range/algorithm/sort.hpp>
 #include <boost/range/algorithm/equal.hpp>
 #include <boost/range/algorithm/reverse.hpp>
 #include <boost/range/irange.hpp>
@@ -46,7 +47,7 @@ BOOST_AUTO_TEST_CASE(test_random_walk) {
         }
         case 1: {
             auto nr_pushes = nr_dist(rand);
-            for (auto i : boost::irange(size_t(0), nr_pushes)) {
+            for (auto i : std::views::iota(size_t(0), nr_pushes)) {
                 (void)i;
                 auto n = rand();
                 c.push_back(n);
@@ -69,8 +70,8 @@ BOOST_AUTO_TEST_CASE(test_random_walk) {
             break;
         }
         case 4: {
-            boost::sort(c);
-            boost::sort(d);
+            std::ranges::sort(c);
+            std::ranges::sort(d);
             break;
         }
         case 5: {
@@ -170,6 +171,19 @@ BOOST_AUTO_TEST_CASE(tests_constructor_exception_safety) {
     checker.set_countdown(5);
     try {
         auto u = utils::chunked_vector<exception_safe_class>(v.begin(), v.end());
+        BOOST_REQUIRE(false);
+    } catch (...) {
+        v.clear();
+        BOOST_REQUIRE(checker.ok());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(tests_constructor_exception_safety_range) {
+    auto checker = exception_safety_checker();
+    auto v = std::vector<exception_safe_class>(100, exception_safe_class(checker));
+    checker.set_countdown(5);
+    try {
+        auto u = utils::chunked_vector<exception_safe_class, 128>(std::from_range, v);
         BOOST_REQUIRE(false);
     } catch (...) {
         v.clear();
@@ -426,6 +440,13 @@ BOOST_AUTO_TEST_CASE(test_initializer_list_ctor) {
         BOOST_REQUIRE(*it == *vit);
     }
     BOOST_REQUIRE(vit == vec.end());
+}
+
+
+BOOST_AUTO_TEST_CASE(test_range_ctor) {
+    auto range = std::views::iota(0, 12345);
+    auto vec = range | std::ranges::to<utils::chunked_vector<int, 512>>();
+    BOOST_REQUIRE(std::ranges::equal(range, vec));
 }
 
 BOOST_AUTO_TEST_CASE(test_value_default_init_ctor) {

@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include "consumer.hh"
 #include "column_translation.hh"
 #include "sstables/mx/parsers.hh"
@@ -70,7 +71,7 @@ private:
     };
 
     struct m_parser_context {
-        mc::promoted_index_block_parser block_parser;
+        mc::promoted_index_block_parser<temporary_buffer<char>> block_parser;
 
         m_parser_context(const schema& s, reader_permit permit, column_values_fixed_lengths cvfl)
             : block_parser(s, std::move(permit), std::move(cvfl))
@@ -172,7 +173,7 @@ public:
         std::visit([this, &data] (auto& ctx) mutable { return process_state(data, ctx); }, _ctx);
 
         if (_mode == consuming_mode::consume_until) {
-            assert(_pos);
+            SCYLLA_ASSERT(_pos);
             auto cmp_with_start = [this, pos_cmp = promoted_index_block_compare(_s)]
                     (position_in_partition_view pos, const promoted_index_block& block) -> bool {
                 return pos_cmp(pos, block.start(_s));

@@ -3,12 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <vector>
+#include <seastar/core/when_all.hh>
 #include "row_cache.hh"
 #include "mutation/mutation_fragment.hh"
 #include "query-request.hh"
@@ -199,7 +201,7 @@ class cache_mutation_reader final : public mutation_reader::impl {
     gc_clock::time_point get_gc_before(const schema& schema, dht::decorated_key dk, const gc_clock::time_point query_time) {
         auto gc_state = _read_context.tombstone_gc_state();
         if (gc_state) {
-            return gc_state->get_gc_before_for_key(schema.shared_from_this(), dk, query_time);
+            return gc_state->with_commitlog_check_disabled().get_gc_before_for_key(schema.shared_from_this(), dk, query_time);
         }
 
         return gc_clock::time_point::min();
@@ -283,7 +285,7 @@ future<> cache_mutation_reader::process_static_row() {
         return ensure_underlying().then([this] {
             return (*_underlying)().then([this] (mutation_fragment_v2_opt&& sr) {
                 if (sr) {
-                    assert(sr->is_static_row());
+                    SCYLLA_ASSERT(sr->is_static_row());
                     maybe_add_to_cache(sr->as_static_row());
                     push_mutation_fragment(std::move(*sr));
                 }
@@ -382,7 +384,7 @@ future<> cache_mutation_reader::do_fill_buffer() {
     if (_state == state::reading_from_underlying) {
         return read_from_underlying();
     }
-    // assert(_state == state::reading_from_cache)
+    // SCYLLA_ASSERT(_state == state::reading_from_cache)
     return _lsa_manager.run_in_read_section([this] {
         auto next_valid = _next_row.iterators_valid();
         clogger.trace("csm {}: reading_from_cache, range=[{}, {}), next={}, valid={}, rt={}", fmt::ptr(this), _lower_bound,
@@ -794,7 +796,6 @@ void cache_mutation_reader::copy_from_cache_to_buffer() {
             };
 
             if (row_tomb_expired(t) || is_row_dead(row)) {
-                can_gc_fn always_gc = [&](tombstone) { return true; };
                 const schema& row_schema = _next_row.latest_row_schema();
 
                 _read_context.cache()._tracker.on_row_compacted();
@@ -990,7 +991,7 @@ void cache_mutation_reader::offer_from_underlying(mutation_fragment_v2&& mf) {
         maybe_add_to_cache(mf.as_clustering_row());
         add_clustering_row_to_buffer(std::move(mf));
     } else {
-        assert(mf.is_range_tombstone_change());
+        SCYLLA_ASSERT(mf.is_range_tombstone_change());
         auto& chg = mf.as_range_tombstone_change();
         if (maybe_add_to_cache(chg)) {
             add_to_buffer(std::move(mf).as_range_tombstone_change());

@@ -4,13 +4,14 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "topology_state_machine.hh"
-#include "log.hh"
+#include "utils/log.hh"
+#include "db/system_keyspace.hh"
 
-#include <boost/range/adaptors.hpp>
+#include <boost/range/adaptor/map.hpp>
 
 namespace service {
 
@@ -110,17 +111,27 @@ std::set<sstring> calculate_not_yet_enabled_features(const std::set<sstring>& en
 std::set<sstring> topology_features::calculate_not_yet_enabled_features() const {
     return ::service::calculate_not_yet_enabled_features(
             enabled_features,
-            normal_supported_features | boost::adaptors::map_values);
+            normal_supported_features | std::views::values);
 }
 
 std::set<sstring> topology::calculate_not_yet_enabled_features() const {
     return ::service::calculate_not_yet_enabled_features(
             enabled_features,
             normal_nodes
-            | boost::adaptors::map_values
-            | boost::adaptors::transformed([] (const replica_state& rs) -> const std::set<sstring>& {
+            | std::views::values
+            | std::views::transform([] (const replica_state& rs) -> const std::set<sstring>& {
                 return rs.supported_features;
             }));
+}
+
+std::unordered_set<raft::server_id> topology::get_normal_zero_token_nodes() const {
+    std::unordered_set<raft::server_id> normal_zero_token_nodes;
+    for (const auto& node: normal_nodes) {
+        if (node.second.ring.value().tokens.empty()) {
+            normal_zero_token_nodes.insert(node.first);
+        }
+    }
+    return normal_zero_token_nodes;
 }
 
 size_t topology::size() const {
@@ -137,10 +148,15 @@ static std::unordered_map<topology::transition_state, sstring> transition_state_
     {topology::transition_state::write_both_read_old, "write both read old"},
     {topology::transition_state::write_both_read_new, "write both read new"},
     {topology::transition_state::tablet_migration, "tablet migration"},
-    {topology::transition_state::tablet_split_finalization, "tablet split finalization"},
+    {topology::transition_state::tablet_resize_finalization, "tablet resize finalization"},
     {topology::transition_state::tablet_draining, "tablet draining"},
     {topology::transition_state::left_token_ring, "left token ring"},
     {topology::transition_state::rollback_to_normal, "rollback to normal"},
+};
+
+// Allows old deprecated names to be recognized and point to the correct transition.
+static std::unordered_map<sstring, topology::transition_state> deprecated_name_to_transition_state = {
+    {"tablet split finalization", topology::transition_state::tablet_resize_finalization},
 };
 
 topology::transition_state transition_state_from_string(const sstring& s) {
@@ -148,6 +164,10 @@ topology::transition_state transition_state_from_string(const sstring& s) {
         if (e.second == s) {
             return e.first;
         }
+    }
+    auto it = deprecated_name_to_transition_state.find(s);
+    if (it != deprecated_name_to_transition_state.end()) {
+        return it->second;
     }
     on_internal_error(tsmlogger, format("cannot map name {} to transition_state", s));
 }
@@ -193,6 +213,7 @@ static std::unordered_map<global_topology_request, sstring> global_topology_requ
     {global_topology_request::new_cdc_generation, "new_cdc_generation"},
     {global_topology_request::cleanup, "cleanup"},
     {global_topology_request::keyspace_rf_change, "keyspace_rf_change"},
+    {global_topology_request::truncate_table, "truncate_table"},
 };
 
 global_topology_request global_topology_request_from_string(const sstring& s) {
@@ -239,6 +260,25 @@ future<> topology_state_machine::await_not_busy() {
     while (_topology.is_busy()) {
         co_await event.wait();
     }
+}
+
+future<sstring> topology_state_machine::wait_for_request_completion(db::system_keyspace& sys_ks, utils::UUID id, bool require_entry) {
+    tsmlogger.debug("Start waiting for topology request completion (request id {})", id);
+    while (true) {
+        auto c = reload_count;
+        auto [done, error] = co_await sys_ks.get_topology_request_state(id, require_entry);
+        if (done) {
+            tsmlogger.debug("Request with id {} is completed with status: {}", id, error.empty() ? sstring("success") : error);
+            co_return error;
+        }
+        if (c == reload_count) {
+            // wait only if the state was not reloaded while we were preempted
+            tsmlogger.debug("Waiting for a topology event while waiting for topology request completion (request id {})", id);
+            co_await event.when();
+        }
+    }
+
+    co_return sstring();
 }
 
 }

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -133,8 +133,23 @@ private:
     class memtable_encoding_stats_collector : public encoding_stats_collector {
     private:
         min_max_tracker<api::timestamp_type> min_max_timestamp;
+        min_tracker<api::timestamp_type> min_live_timestamp;
+        min_tracker<api::timestamp_type> min_live_row_marker_timestamp;
 
-        void update_timestamp(api::timestamp_type ts) noexcept;
+        void update_timestamp(api::timestamp_type ts, is_live is_live) noexcept {
+            if (ts == api::missing_timestamp) {
+                return;
+            }
+            encoding_stats_collector::update_timestamp(ts);
+            min_max_timestamp.update(ts);
+            if (is_live) {
+                min_live_timestamp.update(ts);
+            }
+        }
+
+        void update_live_row_marker_timestamp(api::timestamp_type ts) noexcept {
+            min_live_row_marker_timestamp.update(ts);
+        }
 
     public:
         memtable_encoding_stats_collector() noexcept;
@@ -155,6 +170,14 @@ private:
         api::timestamp_type get_max_timestamp() const noexcept {
             return min_max_timestamp.max();
         }
+
+        api::timestamp_type get_min_live_timestamp() const noexcept {
+            return min_live_timestamp.get();
+        }
+
+        api::timestamp_type get_min_live_row_marker_timestamp() const noexcept {
+            return min_live_row_marker_timestamp.get();
+        }
     } _stats_collector;
 
     void update(db::rp_handle&&);
@@ -164,7 +187,7 @@ private:
     friend class flush_memory_accounter;
     friend class partition_snapshot_read_accounter;
 private:
-    boost::iterator_range<partitions_type::const_iterator> slice(const dht::partition_range& r) const;
+    std::ranges::subrange<partitions_type::const_iterator> slice(const dht::partition_range& r) const;
     partition_entry& find_or_create_partition(const dht::decorated_key& key);
     partition_entry& find_or_create_partition_slow(partition_key_view key);
     void upgrade_entry(memtable_entry&);
@@ -217,6 +240,14 @@ public:
         return _stats_collector.get_max_timestamp();
     }
 
+    api::timestamp_type get_min_live_timestamp() const noexcept {
+        return _stats_collector.get_min_live_timestamp();
+    }
+
+    api::timestamp_type get_min_live_row_marker_timestamp() const noexcept {
+        return _stats_collector.get_min_live_row_marker_timestamp();
+    }
+
     mutation_cleaner& cleaner() noexcept {
         return _cleaner;
     }
@@ -252,7 +283,7 @@ public:
     }
     // Same as make_flat_reader, but returns an empty optional instead of a no-op reader when there is nothing to
     // read. This is an optimization.
-    mutation_reader_opt make_flat_reader_opt(schema_ptr,
+    mutation_reader_opt make_flat_reader_opt(schema_ptr query_schema,
                                           reader_permit permit,
                                           const dht::partition_range& range,
                                           const query::partition_slice& slice,

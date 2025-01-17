@@ -5,18 +5,18 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
+#include <functional>
 #include <unordered_set>
 #include <unordered_map>
 #include "gms/inet_address.hh"
 #include "dht/ring_position.hh"
 #include <optional>
 #include <memory>
-#include <boost/range/iterator_range.hpp>
 #include <boost/icl/interval.hpp>
 #include "interval.hh"
 #include <seastar/core/shared_future.hh>
@@ -30,9 +30,15 @@
 #include "locator/topology.hh"
 #include "locator/token_metadata_fwd.hh"
 
+struct sort_by_proximity_topology;
+
 // forward declaration since replica/database.hh includes this file
 namespace replica {
 class keyspace;
+}
+
+namespace gms {
+class gossiper;
 }
 
 namespace locator {
@@ -73,9 +79,15 @@ struct host_id_or_endpoint {
 
     // Map the host_id to endpoint or vice verse, using the token_metadata.
     // Throws runtime error if failed to resolve.
-    host_id resolve_id(const token_metadata&) const;
-    gms::inet_address resolve_endpoint(const token_metadata&) const;
+    host_id resolve_id(const gms::gossiper&) const;
+    gms::inet_address resolve_endpoint(const gms::gossiper&) const;
 };
+
+using host_id_or_endpoint_list = std::vector<host_id_or_endpoint>;
+
+[[nodiscard]] inline bool check_host_ids_contain_only_uuid(const auto& host_ids) {
+    return std::ranges::none_of(host_ids, [](const auto& node_str) { return locator::host_id_or_endpoint{node_str}.has_endpoint(); });
+}
 
 class token_metadata_impl;
 struct topology_change_info;
@@ -126,31 +138,38 @@ public:
     }
 };
 
+class tokens_iterator {
+public:
+    using iterator_category = std::input_iterator_tag;
+    using iterator_concept = std::input_iterator_tag;
+    using value_type = token;
+    using difference_type = std::ptrdiff_t;
+    using pointer = token*;
+    using reference = token&;
+public:
+    tokens_iterator() = default;
+    tokens_iterator(const token& start, const token_metadata_impl* token_metadata);
+    bool operator==(const tokens_iterator& it) const;
+    const token& operator*() const;
+    tokens_iterator& operator++();
+    tokens_iterator operator++(int) {
+        auto tmp = *this;
+        ++*this;
+        return tmp;
+    }
+private:
+    std::vector<token>::const_iterator _cur_it;
+    size_t _remaining = 0;
+    const token_metadata_impl* _token_metadata = nullptr;
+
+    friend class token_metadata_impl;
+};
+
 class token_metadata final {
     std::unique_ptr<token_metadata_impl> _impl;
 private:
     friend class token_metadata_ring_splitter;
-    class tokens_iterator {
-    public:
-        using iterator_category = std::input_iterator_tag;
-        using value_type = token;
-        using difference_type = std::ptrdiff_t;
-        using pointer = token*;
-        using reference = token&;
-    public:
-        tokens_iterator() = default;
-        tokens_iterator(const token& start, const token_metadata_impl* token_metadata);
-        bool operator==(const tokens_iterator& it) const;
-        const token& operator*() const;
-        tokens_iterator& operator++();
-    private:
-        std::vector<token>::const_iterator _cur_it;
-        size_t _remaining = 0;
-        const token_metadata_impl* _token_metadata = nullptr;
-
-        friend class token_metadata_impl;
-    };
-
+    using tokens_iterator = locator::tokens_iterator;
 public:
     struct config {
         topology::config topo_cfg;
@@ -197,40 +216,22 @@ public:
      *
      * @return The requested range (see the description above)
      */
-    boost::iterator_range<tokens_iterator> ring_range(const token& start) const;
+    std::ranges::subrange<tokens_iterator> ring_range(const token& start) const;
 
     /**
      * Returns a range of tokens such that the first token t satisfies dht::ring_position_view::ending_at(t) >= start.
      */
-    boost::iterator_range<tokens_iterator> ring_range(dht::ring_position_view start) const;
+    std::ranges::subrange<tokens_iterator> ring_range(dht::ring_position_view start) const;
 
     topology& get_topology();
     const topology& get_topology() const;
     void debug_show() const;
 
-    /**
-     * Store an end-point to host ID mapping.  Each ID must be unique, and
-     * cannot be changed after the fact.
-     *
-     * @param hostId
-     * @param endpoint
-     */
-    void update_host_id(const locator::host_id& host_id, inet_address endpoint);
-
     /** Return the unique host ID for an end-point. */
     host_id get_host_id(inet_address endpoint) const;
 
-    /// Return the unique host ID for an end-point or nullopt if not found.
-    std::optional<host_id> get_host_id_if_known(inet_address endpoint) const;
-
-    /** Return the end-point for a unique host ID or nullopt if not found. */
-    std::optional<inet_address> get_endpoint_for_host_id_if_known(locator::host_id host_id) const;
-
-    /** Return the end-point for a unique host ID */
-    inet_address get_endpoint_for_host_id(locator::host_id host_id) const;
-
     /** @return a copy of the endpoint-to-id map for read-only operations */
-    std::unordered_map<inet_address, host_id> get_endpoint_to_host_id_map_for_reading() const;
+    std::unordered_set<host_id> get_host_ids() const;
 
     /// Returns host_id of the local node.
     host_id get_my_id() const;
@@ -310,13 +311,31 @@ public:
 
     token get_predecessor(token t) const;
 
-    const std::unordered_set<host_id>& get_all_endpoints() const;
+    const std::unordered_set<host_id>& get_normal_token_owners() const;
 
-    std::unordered_set<gms::inet_address> get_all_ips() const;
+    void for_each_token_owner(std::function<void(const node&)> func) const;
 
     /* Returns the number of different endpoints that own tokens in the ring.
      * Bootstrapping tokens are not taken into account. */
     size_t count_normal_token_owners() const;
+
+    // Returns the map: DC -> host_id of token owners in that DC.
+    // If there are no token owners in a DC, it is not present in the result.
+    std::unordered_map<sstring, std::unordered_set<host_id>> get_datacenter_token_owners() const;
+
+    // Returns the map: DC -> (map: rack -> host_id of token owners in that rack).
+    // If there are no token owners in a DC/rack, it is not present in the result.
+    std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<host_id>>>
+    get_datacenter_racks_token_owners() const;
+
+    // Returns the map: DC -> token owners in that DC.
+    // If there are no token owners in a DC, it is not present in the result.
+    std::unordered_map<sstring, std::unordered_set<std::reference_wrapper<const node>>> get_datacenter_token_owners_nodes() const;
+
+    // Returns the map: DC -> (map: rack -> token owners in that rack).
+    // If there are no token owners in a DC/rack, it is not present in the result.
+    std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<std::reference_wrapper<const node>>>>
+    get_datacenter_racks_token_owners_nodes() const;
 
     // Updates the read_new flag, switching read requests from
     // the old endpoints to the new ones during topology changes:
@@ -446,6 +465,12 @@ public:
     //
     // Must be called on shard 0.
     static future<> mutate_on_all_shards(sharded<shared_token_metadata>& stm, seastar::noncopyable_function<future<> (token_metadata&)> func);
+
+private:
+    // for testing only, unsafe to be called without awaiting get_lock() first
+    void mutate_token_metadata_for_test(seastar::noncopyable_function<void (token_metadata&)> func);
+
+    friend struct ::sort_by_proximity_topology;
 };
 
 }

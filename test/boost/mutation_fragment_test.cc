@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
@@ -12,6 +12,7 @@
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/closeable.hh>
+#include <fmt/std.h>
 
 #include "test/lib/mutation_source_test.hh"
 #include "mutation/mutation_fragment.hh"
@@ -29,8 +30,9 @@
 #include "test/lib/fragment_scatterer.hh"
 #include "test/lib/test_utils.hh"
 
-#include <boost/range/algorithm/transform.hpp>
 #include "readers/from_mutations_v2.hh"
+
+#include <boost/range/join.hpp>
 
 SEASTAR_TEST_CASE(test_mutation_merger_conforms_to_mutation_source) {
     return seastar::async([] {
@@ -86,7 +88,7 @@ SEASTAR_TEST_CASE(test_range_tombstones_stream) {
         auto pk = partition_key::from_single_value(*s, int32_type->decompose(0));
         auto create_ck = [&] (std::vector<int> v) {
             std::vector<bytes> vs;
-            boost::transform(v, std::back_inserter(vs), [] (int x) { return int32_type->decompose(x); });
+            std::ranges::transform(v, std::back_inserter(vs), [] (int x) { return int32_type->decompose(x); });
             return clustering_key_prefix::from_exploded(*s, std::move(vs));
         };
 

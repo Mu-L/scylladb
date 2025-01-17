@@ -4,12 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "auth/authenticator.hh"
+#include <boost/regex_fwd.hpp>  // IWYU pragma: keep
 
 namespace cql3 {
 

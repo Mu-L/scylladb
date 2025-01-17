@@ -3,13 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/range/adaptors.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
+#include <seastar/testing/thread_test_case.hh>
 
 #include "cql3/cql_config.hh"
 #include "cql3/values.hh"
@@ -22,14 +23,15 @@
 #include "types/map.hh"
 #include "types/set.hh"
 
+BOOST_AUTO_TEST_SUITE(restrictions_test)
+
 namespace {
 
 using seastar::compat::source_location;
-using boost::adaptors::transformed;
 
 std::unique_ptr<cql3::query_options> to_options(
         const cql3::cql_config& cfg,
-        std::optional<std::vector<sstring_view>> names,
+        std::optional<std::vector<std::string_view>> names,
         std::vector<cql3::raw_value> values) {
     static auto& d = cql3::query_options::DEFAULT;
     return std::make_unique<cql3::query_options>(
@@ -41,12 +43,12 @@ std::unique_ptr<cql3::query_options> to_options(
 /// Asserts that e.execute_prepared(id, values) contains expected rows, in any order.
 void require_rows(cql_test_env& e,
                   cql3::prepared_cache_key_type id,
-                  std::optional<std::vector<sstring_view>> names,
+                  std::optional<std::vector<std::string_view>> names,
                   const std::vector<bytes_opt>& values,
                   const std::vector<std::vector<bytes_opt>>& expected,
                   const seastar::compat::source_location& loc = source_location::current()) {
     // This helps compiler pick the right overload for make_value:
-    const auto rvals = values | transformed([] (const bytes_opt& v) { return cql3::raw_value::make_value(v); });
+    const auto rvals = values | std::views::transform([] (const bytes_opt& v) { return cql3::raw_value::make_value(v); });
     cql3::cql_config cfg(cql3::cql_config::default_tag{});
     auto opts = to_options(cfg, std::move(names), std::vector(rvals.begin(), rvals.end()));
     try {
@@ -747,7 +749,7 @@ SEASTAR_THREAD_TEST_CASE(multi_col_in) {
         auto bound_tuples = [] (std::vector<std::tuple<int32_t, float>> tuples) {
             const auto tuple_type = tuple_type_impl::get_instance({int32_type, float_type});
             const auto list_type = list_type_impl::get_instance(tuple_type, true);
-            const auto tvals = tuples | transformed([&] (const std::tuple<int32_t, float>& t) {
+            const auto tvals = tuples | std::views::transform([&] (const std::tuple<int32_t, float>& t) {
                 return make_tuple_value(tuple_type, tuple_type_impl::native_type({std::get<0>(t), std::get<1>(t)}));
             });
             return list_type->decompose(
@@ -1048,3 +1050,5 @@ SEASTAR_THREAD_TEST_CASE(strict_is_not_null_in_views_default_value) {
     auto cfg = make_shared<db::config>();
     BOOST_REQUIRE(cfg->strict_is_not_null_in_views() == db::tri_mode_restriction_t::mode::WARN);
 }
+
+BOOST_AUTO_TEST_SUITE_END()

@@ -4,7 +4,7 @@ Release:        %{release}
 Summary:        Scylla is a highly scalable, eventually consistent, distributed, partitioned row DB.
 Group:          Applications/Databases
 
-License:        AGPLv3
+License:        ScyllaDB-Source-Available-1.0
 URL:            http://www.scylladb.com/
 Source0:        %{reloc_pkg}
 Requires:       %{product}-server = %{version}-%{release}
@@ -60,7 +60,7 @@ This package installs all required packages for ScyllaDB,  including
 %if 0%{housekeeping}
 install_arg="--housekeeping"
 %endif
-./install.sh --packaging --root "$RPM_BUILD_ROOT" $install_arg
+./install.sh --packaging --root "$RPM_BUILD_ROOT" --p11-trust-paths /etc/pki/ca-trust/source:/usr/share/pki/ca-trust-source $install_arg
 
 %clean
 rm -rf $RPM_BUILD_ROOT
@@ -111,6 +111,7 @@ ln -sfT /etc/scylla /var/lib/scylla/conf
 %config(noreplace) %{_sysconfdir}/sysconfig/scylla-housekeeping
 %attr(0755,root,root) %dir %{_sysconfdir}/scylla.d
 %config(noreplace) %{_sysconfdir}/scylla.d/*.conf
+/opt/scylladb/share/p11-kit/modules/*
 /opt/scylladb/share/doc/scylla/*
 %{_unitdir}/scylla-fstrim.service
 %{_unitdir}/scylla-housekeeping-daily.service
@@ -144,6 +145,7 @@ ln -sfT /etc/scylla /var/lib/scylla/conf
 %ghost /etc/systemd/system/scylla-helper.slice.d/memory.conf
 %ghost /etc/systemd/system/scylla-server.service.d/capabilities.conf
 %ghost /etc/systemd/system/scylla-server.service.d/mounts.conf
+%ghost /etc/systemd/system/scylla-server.service.d/limitnofile.conf
 /etc/systemd/system/scylla-server.service.d/dependencies.conf
 %ghost %config /etc/systemd/system/var-lib-systemd-coredump.mount
 %ghost /etc/systemd/system/scylla-cpupower.service
@@ -157,33 +159,6 @@ Obsoletes:      scylla-server < 1.1
 
 %description conf
 This package contains the main scylla configuration file.
-
-# we need to refuse upgrade if current scylla < 1.7.3 && commitlog remains
-%pretrans conf
-ver=$(rpm -qi scylla-server | grep Version | awk '{print $3}')
-if [ -n "$ver" ]; then
-    ver_fmt=$(echo $ver | awk -F. '{printf "%d%02d%02d", $1,$2,$3}')
-    if [ $ver_fmt -lt 10703 ]; then
-        # for <scylla-1.2
-        if [ ! -f /opt/scylladb/lib/scylla/scylla_config_get.py ]; then
-            echo
-            echo "Error: Upgrading from scylla-$ver to scylla-%{version} is not supported."
-            echo "Please upgrade to scylla-1.7.3 or later, before upgrade to %{version}."
-            echo
-            exit 1
-        fi
-        commitlog_directory=$(/opt/scylladb/lib/scylla/scylla_config_get.py -g commitlog_directory)
-        commitlog_files=$(ls $commitlog_directory | wc -l)
-        if [ $commitlog_files -ne 0 ]; then
-            echo
-            echo "Error: Upgrading from scylla-$ver to scylla-%{version} is not supported when commitlog is not clean."
-            echo "Please upgrade to scylla-1.7.3 or later, before upgrade to %{version}."
-            echo "Also make sure $commitlog_directory is empty."
-            echo
-            exit 1
-        fi
-    fi
-fi
 
 %files conf
 %defattr(-,root,root)

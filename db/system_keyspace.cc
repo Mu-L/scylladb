@@ -4,11 +4,10 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <boost/range/algorithm.hpp>
-#include <boost/range/adaptor/transformed.hpp>
 #include <boost/functional/hash.hpp>
 #include <boost/icl/interval_map.hpp>
 #include <fmt/ranges.h>
@@ -24,8 +23,9 @@
 #include "gms/feature_service.hh"
 #include "system_keyspace_view_types.hh"
 #include "schema/schema_builder.hh"
+#include "utils/assert.hh"
 #include "utils/hashers.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include <seastar/core/enum.hh>
 #include "gms/inet_address.hh"
 #include "message/messaging_service.hh"
@@ -46,6 +46,10 @@
 #include "replica/query.hh"
 #include "types/types.hh"
 #include "service/raft/raft_group0_client.hh"
+#include "utils/shared_dict.hh"
+#include "replica/database.hh"
+
+#include <unordered_map>
 
 using days = std::chrono::duration<int, std::ratio<24 * 3600>>;
 
@@ -86,16 +90,42 @@ namespace {
             system_keyspace::SCYLLA_LOCAL,
             system_keyspace::COMMITLOG_CLEANUPS,
             system_keyspace::SERVICE_LEVELS_V2,
+            system_keyspace::VIEW_BUILD_STATUS_V2,
             system_keyspace::ROLES,
             system_keyspace::ROLE_MEMBERS,
             system_keyspace::ROLE_ATTRIBUTES,
             system_keyspace::ROLE_PERMISSIONS,
-            system_keyspace::v3::CDC_LOCAL
+            system_keyspace::v3::CDC_LOCAL,
+            system_keyspace::DICTS
         };
         if (ks_name == system_keyspace::NAME && tables.contains(cf_name)) {
             props.enable_schema_commitlog();
         }
     });
+
+    const auto set_group0_table_options =
+        schema_builder::register_static_configurator([](const sstring& ks_name, const sstring& cf_name, schema_static_props& props) {
+            static const std::unordered_set<sstring> tables = {
+                // scylla_local may store a replicated tombstone related to schema
+                // (see `make_group0_schema_version_mutation`), so we include it in the group0 tables list.
+                system_keyspace::SCYLLA_LOCAL,
+                system_keyspace::TOPOLOGY,
+                system_keyspace::TOPOLOGY_REQUESTS,
+                system_keyspace::CDC_GENERATIONS_V3,
+                system_keyspace::TABLETS,
+                system_keyspace::SERVICE_LEVELS_V2,
+                system_keyspace::VIEW_BUILD_STATUS_V2,
+                // auth tables
+                system_keyspace::ROLES,
+                system_keyspace::ROLE_MEMBERS,
+                system_keyspace::ROLE_ATTRIBUTES,
+                system_keyspace::ROLE_PERMISSIONS,
+                system_keyspace::DICTS,
+            };
+            if (ks_name == system_keyspace::NAME && tables.contains(cf_name)) {
+                props.is_group0_table = true;
+            }
+        });
 }
 
 static logging::logger slogger("system_keyspace");
@@ -105,16 +135,6 @@ api::timestamp_type system_keyspace::schema_creation_timestamp() {
     return creation_timestamp;
 }
 
-// Increase whenever changing schema of any system table.
-// FIXME: Make automatic by calculating from schema structure.
-static const uint16_t version_sequence_number = 1;
-
-table_schema_version system_keyspace::generate_schema_version(::table_id table_id, uint16_t offset) {
-    md5_hasher h;
-    feed_hash(h, table_id);
-    feed_hash(h, version_sequence_number + offset);
-    return table_schema_version(utils::UUID_gen::get_name_UUID(h.finalize()));
-}
 
 // Currently, the type variables (uuid_type, etc.) are thread-local reference-
 // counted shared pointers. This forces us to also make the built in schemas
@@ -145,7 +165,7 @@ schema_ptr system_keyspace::hints() {
        );
        builder.set_gc_grace_seconds(0);
        builder.set_compaction_strategy_options({{ "enabled", "false" }});
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build(schema_builder::compact_storage::yes);
     }();
     return hints;
@@ -171,7 +191,7 @@ schema_ptr system_keyspace::batchlog() {
         //    .compactionStrategyOptions(Collections.singletonMap("min_threshold", "2"))
        );
        builder.set_gc_grace_seconds(0);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build(schema_builder::compact_storage::no);
     }();
     return batchlog;
@@ -204,7 +224,7 @@ schema_ptr system_keyspace::batchlog() {
         //    .compactionStrategyClass(LeveledCompactionStrategy.class);
        );
        builder.set_gc_grace_seconds(0);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build(schema_builder::compact_storage::no);
     }();
     return paxos;
@@ -249,7 +269,7 @@ schema_ptr system_keyspace::topology() {
             .with_column("tablet_balancing_enabled", boolean_type, column_kind::static_column)
             .with_column("upgrade_state", utf8_type, column_kind::static_column)
             .set_comment("Current state of topology change machine")
-            .with_version(generate_schema_version(id))
+            .with_hash_version()
             .build();
     }();
     return schema;
@@ -261,12 +281,14 @@ schema_ptr system_keyspace::topology_requests() {
         return schema_builder(NAME, TOPOLOGY_REQUESTS, std::optional(id))
             .with_column("id", timeuuid_type, column_kind::partition_key)
             .with_column("initiating_host", uuid_type)
+            .with_column("request_type", utf8_type)
             .with_column("start_time", timestamp_type)
             .with_column("done", boolean_type)
             .with_column("error", utf8_type)
             .with_column("end_time", timestamp_type)
+            .with_column("truncate_table_id", uuid_type)
             .set_comment("Topology request tracking")
-            .with_version(generate_schema_version(id))
+            .with_hash_version()
             .build();
     }();
     return schema;
@@ -304,7 +326,7 @@ schema_ptr system_keyspace::cdc_generations_v3() {
              * range when the generation was first created. Together with the set of streams above it fully
              * describes the mapping for this particular range. */
             .with_column("ignore_msb", byte_type)
-            .with_version(system_keyspace::generate_schema_version(id))
+            .with_hash_version()
             .build();
     }();
     return schema;
@@ -327,7 +349,7 @@ schema_ptr system_keyspace::raft() {
             .with_column("commit_idx", long_type, column_kind::static_column)
 
             .set_comment("Persisted RAFT log, votes and snapshot info")
-            .with_version(generate_schema_version(id))
+            .with_hash_version()
             .build();
     }();
     return schema;
@@ -347,7 +369,7 @@ schema_ptr system_keyspace::raft_snapshots() {
             .with_column("term", long_type)
 
             .set_comment("Persisted RAFT snapshot descriptors info")
-            .with_version(generate_schema_version(id))
+            .with_hash_version()
             .build();
     }();
     return schema;
@@ -363,7 +385,7 @@ schema_ptr system_keyspace::raft_snapshot_config() {
             .with_column("can_vote", boolean_type)
 
             .set_comment("RAFT configuration for the latest snapshot descriptor")
-            .with_version(generate_schema_version(id))
+            .with_hash_version()
             .build();
     }();
     return schema;
@@ -383,7 +405,7 @@ schema_ptr system_keyspace::repair_history() {
             .with_column("keyspace_name", utf8_type, column_kind::static_column)
             .with_column("table_name", utf8_type, column_kind::static_column)
             .set_comment("Record repair history")
-            .with_version(generate_schema_version(id))
+            .with_hash_version()
             .build();
     }();
     return schema;
@@ -406,7 +428,7 @@ schema_ptr system_keyspace::built_indexes() {
         "built column indexes"
        );
        builder.set_gc_grace_seconds(0);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build(schema_builder::compact_storage::yes);
     }();
     return built_indexes;
@@ -456,18 +478,18 @@ schema_ptr system_keyspace::built_indexes() {
         "information about the local node"
        );
        builder.set_gc_grace_seconds(0);
-       builder.with_version(generate_schema_version(builder.uuid()));
-       builder.remove_column("scylla_cpu_sharding_algorithm");
-       builder.remove_column("scylla_nr_shards");
-       builder.remove_column("scylla_msb_ignore");
-       builder.remove_column("thrift_version");
+       auto drop_timestamp = api::max_timestamp;
+       builder.remove_column("scylla_cpu_sharding_algorithm", drop_timestamp);
+       builder.remove_column("scylla_nr_shards", drop_timestamp);
+       builder.remove_column("scylla_msb_ignore", drop_timestamp);
+       builder.remove_column("thrift_version", drop_timestamp);
+       builder.with_hash_version();
        return builder.build(schema_builder::compact_storage::no);
     }();
     return local;
 }
 
 /*static*/ schema_ptr system_keyspace::peers() {
-    constexpr uint16_t schema_version_offset = 0;
     static thread_local auto peers = [] {
         schema_builder builder(generate_legacy_id(NAME, PEERS), NAME, PEERS,
         // partition key
@@ -494,7 +516,7 @@ schema_ptr system_keyspace::built_indexes() {
         "information about known peers in the cluster"
        );
        builder.set_gc_grace_seconds(0);
-       builder.with_version(generate_schema_version(builder.uuid(), schema_version_offset));
+       builder.with_hash_version();
        return builder.build(schema_builder::compact_storage::no);
     }();
     return peers;
@@ -519,7 +541,7 @@ schema_ptr system_keyspace::built_indexes() {
         "events related to peers"
        );
        builder.set_gc_grace_seconds(0);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build(schema_builder::compact_storage::no);
     }();
     return peer_events;
@@ -542,7 +564,7 @@ schema_ptr system_keyspace::built_indexes() {
         "ranges requested for transfer"
        );
        builder.set_gc_grace_seconds(0);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build(schema_builder::compact_storage::no);
     }();
     return range_xfers;
@@ -568,8 +590,8 @@ schema_ptr system_keyspace::built_indexes() {
         // comment
         "unfinished compactions"
         );
-       builder.with_version(generate_schema_version(builder.uuid()));
-       return builder.build(schema_builder::compact_storage::no);
+       builder.with_hash_version();
+        return builder.build(schema_builder::compact_storage::no);
     }();
     return compactions_in_progress;
 }
@@ -598,7 +620,7 @@ schema_ptr system_keyspace::built_indexes() {
         "week-long compaction history"
         );
         builder.set_default_time_to_live(std::chrono::duration_cast<std::chrono::seconds>(days(7)));
-        builder.with_version(generate_schema_version(builder.uuid()));
+        builder.with_hash_version();
         return builder.build(schema_builder::compact_storage::no);
     }();
     return compaction_history;
@@ -627,8 +649,8 @@ schema_ptr system_keyspace::built_indexes() {
         // comment
         "historic sstable read rates"
        );
-       builder.with_version(generate_schema_version(builder.uuid()));
-       return builder.build(schema_builder::compact_storage::no);
+       builder.with_hash_version();
+        return builder.build(schema_builder::compact_storage::no);
     }();
     return sstable_activity;
 }
@@ -653,7 +675,7 @@ schema_ptr system_keyspace::size_estimates() {
             "per-table primary range size estimates"
             );
         builder.set_gc_grace_seconds(0);
-        builder.with_version(generate_schema_version(builder.uuid()));
+        builder.with_hash_version();
         return builder.build(schema_builder::compact_storage::no);
     }();
     return size_estimates;
@@ -685,11 +707,11 @@ schema_ptr system_keyspace::size_estimates() {
         "partitions larger than specified threshold"
         );
         builder.set_gc_grace_seconds(0);
-        builder.with_version(generate_schema_version(builder.uuid()));
         // FIXME re-enable caching for this and the other two
         // system.large_* tables once
         // https://github.com/scylladb/scylla/issues/3288 is fixed
         builder.set_caching_options(caching_options::get_disabled_caching_options());
+        builder.with_hash_version();
         return builder.build(schema_builder::compact_storage::no);
     }();
     return large_partitions;
@@ -708,16 +730,15 @@ schema_ptr system_keyspace::large_rows() {
                 .with_column("clustering_key", utf8_type, column_kind::clustering_key)
                 .with_column("compaction_time", timestamp_type)
                 .set_comment("rows larger than specified threshold")
-                .with_version(generate_schema_version(id))
                 .set_gc_grace_seconds(0)
                 .set_caching_options(caching_options::get_disabled_caching_options())
+                .with_hash_version()
                 .build();
     }();
     return large_rows;
 }
 
 schema_ptr system_keyspace::large_cells() {
-    constexpr uint16_t schema_version_offset = 1; // collection_elements
     static thread_local auto large_cells = [] {
         auto id = generate_legacy_id(NAME, LARGE_CELLS);
         return schema_builder(NAME, LARGE_CELLS, id)
@@ -733,9 +754,9 @@ schema_ptr system_keyspace::large_cells() {
                 .with_column("collection_elements", long_type)
                 .with_column("compaction_time", timestamp_type)
                 .set_comment("cells larger than specified threshold")
-                .with_version(generate_schema_version(id, schema_version_offset))
                 .set_gc_grace_seconds(0)
                 .set_caching_options(caching_options::get_disabled_caching_options())
+                .with_hash_version()
                 .build();
     }();
     return large_cells;
@@ -761,11 +782,8 @@ static constexpr auto schema_gc_grace = std::chrono::duration_cast<std::chrono::
         // comment
         "Scylla specific information about the local node"
        );
-       // scylla_local may store a replicated tombstone related to schema
-       // (see `make_group0_schema_version_mutation`), so we use nonzero gc grace.
-       builder.set_gc_grace_seconds(schema_gc_grace);
-       builder.with_version(generate_schema_version(builder.uuid()));
-       return builder.build(schema_builder::compact_storage::no);
+       builder.with_hash_version();
+        return builder.build(schema_builder::compact_storage::no);
     }();
     return scylla_local;
 }
@@ -790,9 +808,9 @@ schema_ptr system_keyspace::v3::batches() {
        // FIXME: the original Java code also had:
        //.copy(new LocalPartitioner(TimeUUIDType.instance))
        builder.set_gc_grace_seconds(0);
-       builder.set_compaction_strategy(sstables::compaction_strategy_type::size_tiered);
+       builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
        builder.set_compaction_strategy_options({{"min_threshold", "2"}});
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build(schema_builder::compact_storage::no);
     }();
     return schema;
@@ -838,7 +856,7 @@ schema_ptr system_keyspace::v3::local() {
         "information about the local node"
        );
        builder.set_gc_grace_seconds(0);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build(schema_builder::compact_storage::no);
     }();
     return schema;
@@ -866,7 +884,7 @@ schema_ptr system_keyspace::v3::truncated() {
         "information about table truncation"
        );
        builder.set_gc_grace_seconds(0);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build(schema_builder::compact_storage::no);
     }();
     return local;
@@ -895,8 +913,8 @@ schema_ptr system_keyspace::v3::commitlog_cleanups() {
         // comment
         "information about cleanups, for filtering commitlog replay"
        );
-       builder.with_version(generate_schema_version(builder.uuid()));
-       return builder.build(schema_builder::compact_storage::no);
+        builder.with_hash_version();
+        return builder.build(schema_builder::compact_storage::no);
     }();
     return local;
 }
@@ -958,7 +976,7 @@ schema_ptr system_keyspace::v3::available_ranges() {
         "available keyspace/ranges during bootstrap/replace that are ready to be served"
        );
        builder.set_gc_grace_seconds(0);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build();
     }();
     return schema;
@@ -981,7 +999,7 @@ schema_ptr system_keyspace::v3::views_builds_in_progress() {
         "views builds current progress"
        );
        builder.set_gc_grace_seconds(0);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build();
     }();
     return schema;
@@ -1004,7 +1022,7 @@ schema_ptr system_keyspace::v3::built_views() {
         "built views"
        );
        builder.set_gc_grace_seconds(0);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build();
     }();
     return schema;
@@ -1020,7 +1038,7 @@ schema_ptr system_keyspace::v3::scylla_views_builds_in_progress() {
                 .with_column("next_token", utf8_type)
                 .with_column("generation_number", int32_type)
                 .with_column("first_token", utf8_type)
-                .with_version(generate_schema_version(id))
+                .with_hash_version()
                 .build();
     }();
     return schema;
@@ -1056,7 +1074,7 @@ schema_ptr system_keyspace::v3::scylla_views_builds_in_progress() {
         "CDC-specific information that the local node stores"
        );
        builder.set_gc_grace_seconds(0);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build(schema_builder::compact_storage::no);
     }();
     return cdc_local;
@@ -1074,7 +1092,7 @@ schema_ptr system_keyspace::group0_history() {
             .with_column("description", utf8_type)
 
             .set_comment("History of Raft group 0 state changes")
-            .with_version(generate_schema_version(id))
+            .with_hash_version()
             .build();
     }();
     return schema;
@@ -1092,7 +1110,7 @@ schema_ptr system_keyspace::discovery() {
             // May be unknown during discovery, then it's set to UUID 0.
             .with_column("raft_server_id", uuid_type)
             .set_comment("State of cluster discovery algorithm: the set of discovered peers")
-            .with_version(generate_schema_version(id))
+            .with_hash_version()
             .build();
     }();
     return schema;
@@ -1104,7 +1122,7 @@ schema_ptr system_keyspace::broadcast_kv_store() {
         return schema_builder(NAME, BROADCAST_KV_STORE, id)
             .with_column("key", utf8_type, column_kind::partition_key)
             .with_column("value", utf8_type)
-            .with_version(generate_schema_version(id))
+            .with_hash_version()
             .build();
     }();
     return schema;
@@ -1114,14 +1132,14 @@ schema_ptr system_keyspace::sstables_registry() {
     static thread_local auto schema = [] {
         auto id = generate_legacy_id(NAME, SSTABLES_REGISTRY);
         return schema_builder(NAME, SSTABLES_REGISTRY, id)
-            .with_column("location", utf8_type, column_kind::partition_key)
+            .with_column("owner", uuid_type, column_kind::partition_key)
             .with_column("generation", timeuuid_type, column_kind::clustering_key)
             .with_column("status", utf8_type)
             .with_column("state", utf8_type)
             .with_column("version", utf8_type)
             .with_column("format", utf8_type)
             .set_comment("SSTables ownership table")
-            .with_version(generate_schema_version(id))
+            .with_hash_version()
             .build();
     }();
     return schema;
@@ -1139,7 +1157,22 @@ schema_ptr system_keyspace::service_levels_v2() {
                 .with_column("service_level", utf8_type, column_kind::partition_key)
                 .with_column("timeout", duration_type)
                 .with_column("workload_type", utf8_type)
-                .with_version(db::system_keyspace::generate_schema_version(id))
+                .with_column("shares", int32_type)
+                .with_hash_version()
+                .build();
+    }();
+    return schema;
+}
+
+schema_ptr system_keyspace::view_build_status_v2() {
+    static thread_local auto schema = [] {
+        auto id = generate_legacy_id(NAME, VIEW_BUILD_STATUS_V2);
+        return schema_builder(NAME, VIEW_BUILD_STATUS_V2, id)
+                .with_column("keyspace_name", utf8_type, column_kind::partition_key)
+                .with_column("view_name", utf8_type, column_kind::partition_key)
+                .with_column("host_id", uuid_type, column_kind::clustering_key)
+                .with_column("status", utf8_type)
+                .with_hash_version()
                 .build();
     }();
     return schema;
@@ -1166,7 +1199,7 @@ schema_ptr system_keyspace::roles() {
         // comment
         "roles for authentication and RBAC"
         );
-        builder.with_version(system_keyspace::generate_schema_version(builder.uuid()));
+        builder.with_hash_version();
         return builder.build();
     }();
     return schema;
@@ -1188,7 +1221,7 @@ schema_ptr system_keyspace::role_members() {
         // comment
         "joins users and their granted roles in RBAC"
         );
-        builder.with_version(system_keyspace::generate_schema_version(builder.uuid()));
+        builder.with_hash_version();
         return builder.build();
     }();
     return schema;
@@ -1212,7 +1245,7 @@ schema_ptr system_keyspace::role_attributes() {
         // comment
         "role permissions in RBAC"
         );
-        builder.with_version(system_keyspace::generate_schema_version(builder.uuid()));
+        builder.with_hash_version();
         return builder.build();
     }();
     return schema;
@@ -1236,7 +1269,7 @@ schema_ptr system_keyspace::role_permissions() {
         // comment
         "role permissions for CassandraAuthorizer"
         );
-        builder.with_version(system_keyspace::generate_schema_version(builder.uuid()));
+        builder.with_hash_version();
         return builder.build();
     }();
     return schema;
@@ -1259,10 +1292,10 @@ schema_ptr system_keyspace::legacy::hints() {
         "*DEPRECATED* hints awaiting delivery"
        );
        builder.set_gc_grace_seconds(0);
-       builder.set_compaction_strategy(sstables::compaction_strategy_type::size_tiered);
+       builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
        builder.set_compaction_strategy_options({{"enabled", "false"}});
-       builder.with_version(generate_schema_version(builder.uuid()));
        builder.with(schema_builder::compact_storage::yes);
+       builder.with_hash_version();
        return builder.build();
     }();
     return schema;
@@ -1285,10 +1318,10 @@ schema_ptr system_keyspace::legacy::batchlog() {
         "*DEPRECATED* batchlog entries"
        );
        builder.set_gc_grace_seconds(0);
-       builder.set_compaction_strategy(sstables::compaction_strategy_type::size_tiered);
+       builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
        builder.set_compaction_strategy_options({{"min_threshold", "2"}});
        builder.with(schema_builder::compact_storage::no);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build();
     }();
     return schema;
@@ -1316,7 +1349,7 @@ schema_ptr system_keyspace::legacy::keyspaces() {
        );
        builder.set_gc_grace_seconds(schema_gc_grace);
        builder.with(schema_builder::compact_storage::yes);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build();
     }();
     return schema;
@@ -1367,7 +1400,7 @@ schema_ptr system_keyspace::legacy::column_families() {
        );
        builder.set_gc_grace_seconds(schema_gc_grace);
        builder.with(schema_builder::compact_storage::no);
-       builder.with_version(generate_schema_version(builder.uuid()));
+       builder.with_hash_version();
        return builder.build();
     }();
     return schema;
@@ -1398,7 +1431,7 @@ schema_ptr system_keyspace::legacy::columns() {
         );
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with(schema_builder::compact_storage::no);
-        builder.with_version(generate_schema_version(builder.uuid()));
+        builder.with_hash_version();
         return builder.build();
     }();
     return schema;
@@ -1424,7 +1457,7 @@ schema_ptr system_keyspace::legacy::triggers() {
         );
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with(schema_builder::compact_storage::no);
-        builder.with_version(generate_schema_version(builder.uuid()));
+        builder.with_hash_version();
         return builder.build();
     }();
     return schema;
@@ -1451,7 +1484,7 @@ schema_ptr system_keyspace::legacy::usertypes() {
         );
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with(schema_builder::compact_storage::no);
-        builder.with_version(generate_schema_version(builder.uuid()));
+        builder.with_hash_version();
         return builder.build();
     }();
     return schema;
@@ -1488,7 +1521,7 @@ schema_ptr system_keyspace::legacy::functions() {
         );
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with(schema_builder::compact_storage::no);
-        builder.with_version(generate_schema_version(builder.uuid()));
+        builder.with_hash_version();
         return builder.build();
     }();
     return schema;
@@ -1519,8 +1552,22 @@ schema_ptr system_keyspace::legacy::aggregates() {
         );
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with(schema_builder::compact_storage::no);
-        builder.with_version(generate_schema_version(builder.uuid()));
+        builder.with_hash_version();
         return builder.build();
+    }();
+    return schema;
+}
+
+schema_ptr system_keyspace::dicts() {
+    static thread_local auto schema = [] {
+        auto id = generate_legacy_id(NAME, DICTS);
+        return schema_builder(NAME, DICTS, std::make_optional(id))
+                .with_column("name", utf8_type, column_kind::partition_key)
+                .with_column("timestamp", timestamp_type)
+                .with_column("origin", uuid_type)
+                .with_column("data", bytes_type)
+                .with_hash_version()
+                .build();
     }();
     return schema;
 }
@@ -1577,7 +1624,7 @@ struct local_cache {
 };
 
 future<> system_keyspace::peers_table_read_fixup() {
-    assert(this_shard_id() == 0);
+    SCYLLA_ASSERT(this_shard_id() == 0);
     if (_peers_table_read_fixup_done) {
         co_return;
     }
@@ -1658,7 +1705,7 @@ future<> system_keyspace::drop_truncation_rp_records() {
     auto rs = co_await execute_cql(req);
 
     bool any = false;
-    co_await coroutine::parallel_for_each(rs->begin(), rs->end(), [&] (const cql3::untyped_result_set_row& row) -> future<> {
+    co_await coroutine::parallel_for_each(*rs, [&] (const cql3::untyped_result_set_row& row) -> future<> {
         auto table_uuid = table_id(row.get_as<utils::UUID>("table_uuid"));
         auto shard = row.get_as<int32_t>("shard");
         auto segment_id = row.get_as<int64_t>("segment_id");
@@ -1711,7 +1758,7 @@ future<> system_keyspace::drop_all_commitlog_cleanup_records() {
     sstring req = format("SELECT shard from system.{}", COMMITLOG_CLEANUPS);
     auto rs = co_await execute_cql(req);
 
-    co_await coroutine::parallel_for_each(rs->begin(), rs->end(), [&] (const cql3::untyped_result_set_row& row) -> future<> {
+    co_await coroutine::parallel_for_each(*rs, [&] (const cql3::untyped_result_set_row& row) -> future<> {
         auto shard = row.get_as<int32_t>("shard");
         co_await execute_cql(format("DELETE FROM system.{} WHERE shard = {}", COMMITLOG_CLEANUPS, shard));
     });
@@ -1836,7 +1883,7 @@ std::unordered_set<dht::token> decode_tokens(const set_type_impl::native_type& t
     std::unordered_set<dht::token> tset;
     for (auto& t: tokens) {
         auto str = value_cast<sstring>(t);
-        assert(str == dht::token::from_sstring(str).to_sstring());
+        SCYLLA_ASSERT(str == dht::token::from_sstring(str).to_sstring());
         tset.insert(dht::token::from_sstring(str));
     }
     return tset;
@@ -1910,12 +1957,6 @@ future<std::unordered_map<locator::host_id, gms::loaded_endpoint_state>> system_
         auto host_id = locator::host_id(row.get_as<utils::UUID>("host_id"));
         if (row.has("tokens")) {
             st.tokens = decode_tokens(deserialize_set_column(*peers(), row, "tokens"));
-            if (st.tokens.empty()) {
-                slogger.error("load_endpoint_state: node {}/{} has tokens column present but tokens are empty", host_id, ep);
-                continue;
-            }
-        } else {
-            slogger.warn("Endpoint {} has no tokens in system.{}", ep, PEERS);
         }
         if (row.has("data_center") && row.has("rack")) {
             st.opt_dc_rack.emplace(locator::endpoint_dc_rack {
@@ -1941,19 +1982,41 @@ future<std::unordered_map<locator::host_id, gms::loaded_endpoint_state>> system_
 future<std::vector<gms::inet_address>> system_keyspace::load_peers() {
     co_await peers_table_read_fixup();
 
-    const auto res = co_await execute_cql(format("SELECT peer, tokens FROM system.{}", PEERS));
-    assert(res);
+    const auto res = co_await execute_cql(format("SELECT peer, rpc_address FROM system.{}", PEERS));
+    SCYLLA_ASSERT(res);
 
     std::vector<gms::inet_address> ret;
     for (const auto& row: *res) {
-        if (!row.has("tokens")) {
-            // Ignore rows that don't have tokens. Such rows may
-            // be introduced by code that persists parts of peer
-            // information (such as RAFT_ID) which may potentially
-            // race with deleting a peer (during node removal).
+        if (!row.has("rpc_address")) {
+            // In the Raft-based topology, we store the Host ID -> IP mapping
+            // of joining nodes in PEERS. We want to ignore such rows. To achieve
+            // it, we check the presence of rpc_address, but we could choose any
+            // column other than host_id and tokens (rows with no tokens can
+            // correspond to zero-token nodes).
             continue;
         }
         ret.emplace_back(gms::inet_address(row.get_as<net::inet_address>("peer")));
+    }
+    co_return ret;
+}
+
+future<std::vector<locator::host_id>> system_keyspace::load_peers_ids() {
+    co_await peers_table_read_fixup();
+
+    const auto res = co_await execute_cql(format("SELECT rpc_address, host_id FROM system.{}", PEERS));
+    SCYLLA_ASSERT(res);
+
+    std::vector<locator::host_id> ret;
+    for (const auto& row: *res) {
+        if (!row.has("rpc_address")) {
+            // In the Raft-based topology, we store the Host ID -> IP mapping
+            // of joining nodes in PEERS. We want to ignore such rows. To achieve
+            // it, we check the presence of rpc_address, but we could choose any
+            // column other than host_id and tokens (rows with no tokens can
+            // correspond to zero-token nodes).
+            continue;
+        }
+        ret.emplace_back(locator::host_id(row.get_as<utils::UUID>("host_id")));
     }
     co_return ret;
 }
@@ -2017,7 +2080,7 @@ future<> system_keyspace::update_peer_info(gms::inet_address ep, locator::host_i
     if (!hid) {
         on_internal_error(slogger, format("update_peer_info called with empty host_id, ep {}", ep));
     }
-    if (_db.get_token_metadata().get_topology().is_me(ep)) {
+    if (_db.get_token_metadata().get_topology().is_me(hid)) {
         on_internal_error(slogger, format("update_peer_info called for this node: {}", ep));
     }
 
@@ -2094,10 +2157,6 @@ future<> system_keyspace::remove_endpoint(gms::inet_address ep) {
 }
 
 future<> system_keyspace::update_tokens(const std::unordered_set<dht::token>& tokens) {
-    if (tokens.empty()) {
-        throw std::invalid_argument("remove_endpoint should be used instead");
-    }
-
     sstring req = format("INSERT INTO system.{} (key, tokens) VALUES (?, ?)", LOCAL);
     auto set_type = set_type_impl::get_instance(utf8_type, true);
     co_await execute_cql(req, sstring(LOCAL), make_set_value(set_type, prepare_tokens(tokens)));
@@ -2254,16 +2313,15 @@ std::vector<schema_ptr> system_keyspace::all_tables(const db::config& cfg) {
                     v3::commitlog_cleanups(),
                     v3::cdc_local(),
                     raft(), raft_snapshots(), raft_snapshot_config(), group0_history(), discovery(),
-                    topology(), cdc_generations_v3(), topology_requests(), service_levels_v2(),
+                    topology(), cdc_generations_v3(), topology_requests(), service_levels_v2(), view_build_status_v2(),
+                    dicts(),
     });
 
     if (cfg.check_experimental(db::experimental_features_t::feature::BROADCAST_TABLES)) {
         r.insert(r.end(), {broadcast_kv_store()});
     }
 
-    if (cfg.enable_tablets()) {
-        r.insert(r.end(), {tablets()});
-    }
+    r.insert(r.end(), {tablets()});
 
     if (cfg.check_experimental(db::experimental_features_t::feature::KEYSPACE_STORAGE_OPTIONS)) {
         r.insert(r.end(), {sstables_registry()});
@@ -2291,6 +2349,7 @@ future<> system_keyspace::make(
         co_await db.create_local_system_table(table, maybe_write_in_user_memory(table), erm_factory);
         co_await db.find_column_family(table).init_storage();
     }
+    replica::tablet_add_repair_scheduler_user_types(NAME, db);
 }
 
 void system_keyspace::mark_writable() {
@@ -2411,7 +2470,7 @@ future<> system_keyspace::get_repair_history(::table_id table_id, repair_history
     });
 }
 
-future<int> system_keyspace::increment_and_get_generation() {
+future<gms::generation_type> system_keyspace::increment_and_get_generation() {
     auto req = format("SELECT gossip_generation FROM system.{} WHERE key='{}'", LOCAL, LOCAL);
     auto rs = co_await _qp.execute_internal(req, cql3::query_processor::cache_internal::yes);
     gms::generation_type generation;
@@ -2507,12 +2566,12 @@ future<> system_keyspace::remove_built_view(sstring ks_name, sstring view_name) 
 
 future<std::vector<system_keyspace::view_name>> system_keyspace::load_built_views() {
     return execute_cql(format("SELECT * FROM system.{}", v3::BUILT_VIEWS)).then([] (::shared_ptr<cql3::untyped_result_set> cql_result) {
-        return boost::copy_range<std::vector<view_name>>(*cql_result
-                | boost::adaptors::transformed([] (const cql3::untyped_result_set::row& row) {
+        return *cql_result
+                | std::views::transform([] (const cql3::untyped_result_set::row& row) {
             auto ks_name = row.get_as<sstring>("keyspace_name");
             auto cf_name = row.get_as<sstring>("view_name");
             return std::pair(std::move(ks_name), std::move(cf_name));
-        }));
+        }) | std::ranges::to<std::vector<view_name>>();
     });
 }
 
@@ -2589,7 +2648,7 @@ future<service::paxos::paxos_state> system_keyspace::load_paxos_state(partition_
         std::optional<service::paxos::proposal> accepted;
         if (row.has("proposal")) {
             accepted = service::paxos::proposal(row.get_as<utils::UUID>("proposal_ballot"),
-                    ser::deserialize_from_buffer<>(row.get_blob("proposal"),  boost::type<frozen_mutation>(), 0));
+                    ser::deserialize_from_buffer<>(row.get_blob("proposal"),  std::type_identity<frozen_mutation>(), 0));
         }
 
         std::optional<service::paxos::proposal> most_recent;
@@ -2597,7 +2656,7 @@ future<service::paxos::paxos_state> system_keyspace::load_paxos_state(partition_
             // the value can be missing if it was pruned, supply empty one since
             // it will not going to be used anyway
             auto fm = row.has("most_recent_commit") ?
-                     ser::deserialize_from_buffer<>(row.get_blob("most_recent_commit"), boost::type<frozen_mutation>(), 0) :
+                     ser::deserialize_from_buffer<>(row.get_blob("most_recent_commit"), std::type_identity<frozen_mutation>(), 0) :
                      freeze(mutation(s, key));
             most_recent = service::paxos::proposal(row.get_as<utils::UUID>("most_recent_commit_at"),
                     std::move(fm));
@@ -2706,7 +2765,7 @@ future<utils::UUID> system_keyspace::get_last_group0_state_id() {
         format(
             "SELECT state_id FROM system.{} WHERE key = '{}' LIMIT 1",
             GROUP0_HISTORY, GROUP0_HISTORY_KEY));
-    assert(rs);
+    SCYLLA_ASSERT(rs);
     if (rs->empty()) {
         co_return utils::UUID{};
     }
@@ -2719,7 +2778,7 @@ future<bool> system_keyspace::group0_history_contains(utils::UUID state_id) {
             "SELECT state_id FROM system.{} WHERE key = '{}' AND state_id = ?",
             GROUP0_HISTORY, GROUP0_HISTORY_KEY),
         state_id);
-    assert(rs);
+    SCYLLA_ASSERT(rs);
     co_return !rs->empty();
 }
 
@@ -2732,16 +2791,16 @@ mutation system_keyspace::make_group0_history_state_id_mutation(
     row.apply(row_marker(ts));
     if (!description.empty()) {
         auto cdef = s->get_column_definition("description");
-        assert(cdef);
+        SCYLLA_ASSERT(cdef);
         row.cells().apply(*cdef, atomic_cell::make_live(*cdef->type, ts, cdef->type->decompose(description)));
     }
     if (gc_older_than) {
         using namespace std::chrono;
-        assert(*gc_older_than >= gc_clock::duration{0});
+        SCYLLA_ASSERT(*gc_older_than >= gc_clock::duration{0});
 
         auto ts_micros = microseconds{ts};
         auto gc_older_than_micros = duration_cast<microseconds>(*gc_older_than);
-        assert(gc_older_than_micros < ts_micros);
+        SCYLLA_ASSERT(gc_older_than_micros < ts_micros);
 
         auto tomb_upper_bound = utils::UUID_gen::min_time_UUID(ts_micros - gc_older_than_micros);
         // We want to delete all entries with IDs smaller than `tomb_upper_bound`
@@ -2758,7 +2817,7 @@ mutation system_keyspace::make_group0_history_state_id_mutation(
 future<mutation> system_keyspace::get_group0_history(distributed<replica::database>& db) {
     auto s = group0_history();
     auto rs = co_await db::system_keyspace::query_mutations(db, db::system_keyspace::NAME, db::system_keyspace::GROUP0_HISTORY);
-    assert(rs);
+    SCYLLA_ASSERT(rs);
     auto& ps = rs->partitions();
     for (auto& p: ps) {
         auto mut = p.mut().unfreeze(s);
@@ -2780,7 +2839,7 @@ static future<std::optional<mutation>> get_scylla_local_mutation(replica::databa
     dht::partition_range pr = dht::partition_range::make_singular(dht::decorate_key(*s, pk));
 
     auto rs = co_await replica::query_mutations(db.container(), s, pr, s->full_slice(), db::no_timeout);
-    assert(rs);
+    SCYLLA_ASSERT(rs);
     auto& ps = rs->partitions();
     for (auto& p: ps) {
         auto mut = p.mut().unfreeze(s);
@@ -2829,6 +2888,39 @@ future<mutation> system_keyspace::make_auth_version_mutation(api::timestamp_type
     auto muts = co_await _qp.get_mutations_internal(query, internal_system_query_state(), ts, {AUTH_VERSION_KEY, std::to_string(int64_t(version))});
     if (muts.size() != 1) {
          on_internal_error(slogger, fmt::format("expected 1 auth_version mutation got {}", muts.size()));
+    }
+    co_return std::move(muts[0]);
+}
+
+static constexpr auto VIEW_BUILDER_VERSION_KEY = "view_builder_version";
+
+future<system_keyspace::view_builder_version_t> system_keyspace::get_view_builder_version() {
+    auto str_opt = co_await get_scylla_local_param(VIEW_BUILDER_VERSION_KEY);
+    if (!str_opt) {
+        co_return view_builder_version_t::v1;
+    }
+    auto& str = *str_opt;
+    if (str == "" || str == "10") {
+        co_return view_builder_version_t::v1;
+    }
+    if (str == "15") {
+        co_return view_builder_version_t::v1_5;
+    }
+    if (str == "20") {
+        co_return view_builder_version_t::v2;
+    }
+    on_internal_error(slogger, fmt::format("unexpected view_builder_version in scylla_local got {}", str));
+}
+
+future<std::optional<mutation>> system_keyspace::get_view_builder_version_mutation() {
+    return get_scylla_local_mutation(_db, VIEW_BUILDER_VERSION_KEY);
+}
+
+future<mutation> system_keyspace::make_view_builder_version_mutation(api::timestamp_type ts, db::system_keyspace::view_builder_version_t version) {
+    static sstring query = format("INSERT INTO {}.{} (key, value) VALUES (?, ?);", db::system_keyspace::NAME, db::system_keyspace::SCYLLA_LOCAL);
+    auto muts = co_await _qp.get_mutations_internal(query, internal_system_query_state(), ts, {VIEW_BUILDER_VERSION_KEY, std::to_string(int64_t(version))});
+    if (muts.size() != 1) {
+         on_internal_error(slogger, fmt::format("expected 1 view_builder_version mutation got {}", muts.size()));
     }
     co_return std::move(muts[0]);
 }
@@ -2903,7 +2995,7 @@ static bool must_have_tokens(service::node_state nst) {
 future<service::topology> system_keyspace::load_topology_state(const std::unordered_set<locator::host_id>& force_load_hosts) {
     auto rs = co_await execute_cql(
         format("SELECT * FROM system.{} WHERE key = '{}'", TOPOLOGY, TOPOLOGY));
-    assert(rs);
+    SCYLLA_ASSERT(rs);
 
     service::topology_state_machine::topology_type ret;
 
@@ -2935,18 +3027,33 @@ future<service::topology> system_keyspace::load_topology_state(const std::unorde
         if (row.has("tokens")) {
             auto tokens = decode_tokens(deserialize_set_column(*topology(), row, "tokens"));
 
-            if (tokens.empty()) {
-                on_fatal_internal_error(slogger, format(
-                    "load_topology_state: node {} has tokens column present but tokens are empty",
-                    host_id));
-            }
-
             ring_slice = service::ring_slice {
                 .tokens = std::move(tokens),
             };
-        } else if (must_have_tokens(nstate)) {
-            on_fatal_internal_error(slogger, format(
+        } else {
+            auto zero_token = num_tokens == 0 && tokens_string.empty();
+            if (zero_token) {
+                // We distinguish normal zero-token nodes from token-owning nodes without tokens at the moment
+                // in the following way:
+                // - for normal zero-token nodes, ring_slice is engaged with an empty set of tokens,
+                // - for token-owning nodes without tokens at the moment, ring_slice equals std::nullopt.
+                // ring_slice also equals std::nullopt for joining zero-token nodes. The reason is that the
+                // topology coordinator assigns tokens in the join_group0 state handler, and we want to simulate
+                // assigning zero tokens for zero-token nodes. It allows us to have the same assertions for all nodes.
+                // The code below is correct because the join_group0 state is the last transition state if a joining
+                // node is zero-token.
+                // Note that we need this workaround because we store tokens in a non-frozen set, which doesn't
+                // distinguish an empty set from no value.
+                if (nstate != service::node_state::none && nstate != service::node_state::bootstrapping
+                        && nstate != service::node_state::replacing) {
+                    ring_slice = service::ring_slice {
+                        .tokens = std::unordered_set<dht::token>(),
+                    };
+                }
+            } else if (must_have_tokens(nstate)) {
+                on_fatal_internal_error(slogger, format(
                         "load_topology_state: node {} in {} state but missing ring slice", host_id, nstate));
+            }
         }
 
         std::optional<raft::server_id> replaced_id;
@@ -3084,7 +3191,7 @@ future<service::topology> system_keyspace::load_topology_state(const std::unorde
                 format("SELECT count(range_end) as cnt FROM {}.{} WHERE key = '{}' AND id = ?",
                         NAME, CDC_GENERATIONS_V3, cdc::CDC_GENERATIONS_V3_KEY),
                 gen_id.id);
-            assert(gen_rows);
+            SCYLLA_ASSERT(gen_rows);
             if (gen_rows->empty()) {
                 on_internal_error(slogger, format(
                     "load_topology_state: last committed CDC generation time UUID ({}) present, but data missing", gen_id.id));
@@ -3143,7 +3250,7 @@ future<service::topology> system_keyspace::load_topology_state(const std::unorde
 future<std::optional<service::topology_features>> system_keyspace::load_topology_features_state() {
     auto rs = co_await execute_cql(
         format("SELECT host_id, node_state, supported_features, enabled_features FROM system.{} WHERE key = '{}'", TOPOLOGY, TOPOLOGY));
-    assert(rs);
+    SCYLLA_ASSERT(rs);
 
     co_return decode_topology_features_state(std::move(rs));
 }
@@ -3217,36 +3324,37 @@ system_keyspace::read_cdc_generation_opt(utils::UUID id) {
     co_return cdc::topology_description{std::move(entries)};
 }
 
-future<> system_keyspace::sstables_registry_create_entry(sstring location, sstring status, sstables::sstable_state state, sstables::entry_descriptor desc) {
-    static const auto req = format("INSERT INTO system.{} (location, generation, status, state, version, format) VALUES (?, ?, ?, ?, ?, ?)", SSTABLES_REGISTRY);
-    slogger.trace("Inserting {}.{} into {}", location, desc.generation, SSTABLES_REGISTRY);
-    co_await execute_cql(req, location, desc.generation, status, sstables::state_to_dir(state), fmt::to_string(desc.version), fmt::to_string(desc.format)).discard_result();
+future<> system_keyspace::sstables_registry_create_entry(table_id owner, sstring status, sstables::sstable_state state, sstables::entry_descriptor desc) {
+    static const auto req = format("INSERT INTO system.{} (owner, generation, status, state, version, format) VALUES (?, ?, ?, ?, ?, ?)", SSTABLES_REGISTRY);
+    slogger.trace("Inserting {}.{} into {}", owner, desc.generation, SSTABLES_REGISTRY);
+    co_await execute_cql(req, owner.id, desc.generation, status, sstables::state_to_dir(state), fmt::to_string(desc.version), fmt::to_string(desc.format)).discard_result();
 }
 
-future<> system_keyspace::sstables_registry_update_entry_status(sstring location, sstables::generation_type gen, sstring status) {
-    static const auto req = format("UPDATE system.{} SET status = ? WHERE location = ? AND generation = ?", SSTABLES_REGISTRY);
-    slogger.trace("Updating {}.{} -> status={} in {}", location, gen, status, SSTABLES_REGISTRY);
-    co_await execute_cql(req, status, location, gen).discard_result();
+future<> system_keyspace::sstables_registry_update_entry_status(table_id owner, sstables::generation_type gen, sstring status) {
+    static const auto req = format("UPDATE system.{} SET status = ? WHERE owner = ? AND generation = ?", SSTABLES_REGISTRY);
+    slogger.trace("Updating {}.{} -> status={} in {}", owner, gen, status, SSTABLES_REGISTRY);
+    co_await execute_cql(req, status, owner.id, gen).discard_result();
 }
 
-future<> system_keyspace::sstables_registry_update_entry_state(sstring location, sstables::generation_type gen, sstables::sstable_state state) {
-    static const auto req = format("UPDATE system.{} SET state = ? WHERE location = ? AND generation = ?", SSTABLES_REGISTRY);
+future<> system_keyspace::sstables_registry_update_entry_state(table_id owner, sstables::generation_type gen, sstables::sstable_state state) {
+    static const auto req = format("UPDATE system.{} SET state = ? WHERE owner = ? AND generation = ?", SSTABLES_REGISTRY);
     auto new_state = sstables::state_to_dir(state);
-    slogger.trace("Updating {}.{} -> state={} in {}", location, gen, new_state, SSTABLES_REGISTRY);
-    co_await execute_cql(req, new_state, location, gen).discard_result();
+    slogger.trace("Updating {}.{} -> state={} in {}", owner, gen, new_state, SSTABLES_REGISTRY);
+    co_await execute_cql(req, new_state, owner.id, gen).discard_result();
 }
 
-future<> system_keyspace::sstables_registry_delete_entry(sstring location, sstables::generation_type gen) {
-    static const auto req = format("DELETE FROM system.{} WHERE location = ? AND generation = ?", SSTABLES_REGISTRY);
-    slogger.trace("Removing {}.{} from {}", location, gen, SSTABLES_REGISTRY);
-    co_await execute_cql(req, location, gen).discard_result();
+future<> system_keyspace::sstables_registry_delete_entry(table_id owner, sstables::generation_type gen) {
+    static const auto req = format("DELETE FROM system.{} WHERE owner = ? AND generation = ?", SSTABLES_REGISTRY);
+    slogger.trace("Removing {}.{} from {}", owner, gen, SSTABLES_REGISTRY);
+    co_await execute_cql(req, owner.id, gen).discard_result();
+
 }
 
-future<> system_keyspace::sstables_registry_list(sstring location, sstable_registry_entry_consumer consumer) {
-    static const auto req = format("SELECT status, state, generation, version, format FROM system.{} WHERE location = ?", SSTABLES_REGISTRY);
-    slogger.trace("Listing {} entries from {}", location, SSTABLES_REGISTRY);
+future<> system_keyspace::sstables_registry_list(table_id owner, sstable_registry_entry_consumer consumer) {
+    static const auto req = format("SELECT status, state, generation, version, format FROM system.{} WHERE owner = ?", SSTABLES_REGISTRY);
+    slogger.trace("Listing {} entries from {}", owner, SSTABLES_REGISTRY);
 
-    co_await _qp.query_internal(req, db::consistency_level::ONE, { location }, 1000, [ consumer = std::move(consumer) ] (const cql3::untyped_result_set::row& row) -> future<stop_iteration> {
+    co_await _qp.query_internal(req, db::consistency_level::ONE, { owner.id }, 1000, [ consumer = std::move(consumer) ] (const cql3::untyped_result_set::row& row) -> future<stop_iteration> {
         auto status = row.get_as<sstring>("status");
         auto state = sstables::state_from_dir(row.get_as<sstring>("state"));
         auto gen = sstables::generation_type(row.get_as<utils::UUID>("generation"));
@@ -3258,11 +3366,15 @@ future<> system_keyspace::sstables_registry_list(sstring location, sstable_regis
     });
 }
 
-future<service::topology_request_state> system_keyspace::get_topology_request_state(utils::UUID id) {
+future<service::topology_request_state> system_keyspace::get_topology_request_state(utils::UUID id, bool require_entry) {
     auto rs = co_await execute_cql(
         format("SELECT done, error FROM system.{} WHERE id = {}", TOPOLOGY_REQUESTS, id));
     if (!rs || rs->empty()) {
-        on_internal_error(slogger, format("no entry for request id {}", id));
+        if (require_entry) {
+            on_internal_error(slogger, format("no entry for request id {}", id));
+        } else {
+            co_return service::topology_request_state{false, ""};
+        }
     }
 
     auto& row = rs->one();
@@ -3273,6 +3385,122 @@ future<service::topology_request_state> system_keyspace::get_topology_request_st
     }
 
     co_return service::topology_request_state{row.get_as<bool>("done"), std::move(error)};
+}
+
+system_keyspace::topology_requests_entry system_keyspace::topology_request_row_to_entry(utils::UUID id, const cql3::untyped_result_set_row& row) {
+    topology_requests_entry entry;
+    entry.id = id;
+    if (row.has("initiating_host")) {
+        entry.initiating_host = row.get_as<utils::UUID>("initiating_host");
+    }
+    if (row.has("request_type")) {
+        entry.request_type = service::topology_request_from_string(row.get_as<sstring>("request_type"));
+    }
+    if (row.has("start_time")) {
+        entry.start_time = row.get_as<db_clock::time_point>("start_time");
+    }
+    if (row.has("done")) {
+        entry.done = row.get_as<bool>("done");
+    }
+    if (row.has("error")) {
+        entry.error = row.get_as<sstring>("error");
+    }
+    if (row.has("end_time")) {
+        entry.end_time = row.get_as<db_clock::time_point>("end_time");
+    }
+    if (row.has("truncate_table_id")) {
+        entry.truncate_table_id = table_id(row.get_as<utils::UUID>("truncate_table_id"));
+    }
+    return entry;
+}
+
+future<system_keyspace::topology_requests_entry> system_keyspace::get_topology_request_entry(utils::UUID id, bool require_entry) {
+    auto rs = co_await execute_cql(
+        format("SELECT * FROM system.{} WHERE id = {}", TOPOLOGY_REQUESTS, id));
+
+    if (!rs || rs->empty()) {
+        if (require_entry) {
+            on_internal_error(slogger, format("no entry for request id {}", id));
+        } else {
+            co_return topology_requests_entry{
+                .id = utils::null_uuid()
+            };
+        }
+    }
+
+    const auto& row = rs->one();
+    co_return topology_request_row_to_entry(id, row);
+}
+
+future<system_keyspace::topology_requests_entries> system_keyspace::get_node_ops_request_entries(db_clock::time_point end_time_limit) {
+    // Running requests.
+    auto rs_running = co_await execute_cql(
+        format("SELECT * FROM system.{} WHERE done = false AND request_type IN ('{}', '{}', '{}', '{}', '{}') ALLOW FILTERING", TOPOLOGY_REQUESTS,
+            service::topology_request::join, service::topology_request::replace, service::topology_request::rebuild, service::topology_request::leave, service::topology_request::remove));
+
+
+    // Requests which finished after end_time_limit.
+    auto rs_done = co_await execute_cql(
+        format("SELECT * FROM system.{} WHERE end_time > {} AND request_type IN ('{}', '{}', '{}', '{}', '{}') ALLOW FILTERING", TOPOLOGY_REQUESTS, end_time_limit.time_since_epoch().count(),
+            service::topology_request::join, service::topology_request::replace, service::topology_request::rebuild, service::topology_request::leave, service::topology_request::remove));
+
+    topology_requests_entries m;
+    for (const auto& row: *rs_done) {
+        auto id = row.get_as<utils::UUID>("id");
+        m.emplace(id, topology_request_row_to_entry(id, row));
+    }
+
+    for (const auto& row: *rs_running) {
+        auto id = row.get_as<utils::UUID>("id");
+        // If a topology request finishes between the reads, it may be contained in both row sets.
+        // Keep the latest info.
+        m.emplace(id, topology_request_row_to_entry(id, row));
+    }
+
+    co_return m;
+}
+
+future<mutation> system_keyspace::get_insert_dict_mutation(
+    bytes data,
+    locator::host_id host_id,
+    db_clock::time_point dict_ts,
+    api::timestamp_type write_ts
+) const {
+    const char* dict_name = "general";
+    slogger.debug("Publishing new compression dictionary: {} {} {}", dict_name, dict_ts, host_id);
+
+    static sstring insert_new = format("INSERT INTO {}.{} (name, timestamp, origin, data) VALUES (?, ?, ?, ?);", NAME, DICTS);
+    auto muts = co_await _qp.get_mutations_internal(insert_new, internal_system_query_state(), write_ts, {
+        data_value(dict_name),
+        data_value(dict_ts),
+        data_value(host_id.uuid()),
+        data_value(std::move(data)),
+    });
+    if (muts.size() != 1) {
+        on_internal_error(slogger, "Expected to prepare a single mutation, but got multiple.");
+    }
+    co_return std::move(muts[0]);
+}
+
+future<utils::shared_dict> system_keyspace::query_dict() const {
+    static sstring query = format("SELECT * FROM {}.{} WHERE name = ?;", NAME, DICTS);
+    auto result_set = co_await _qp.execute_internal(
+        query, db::consistency_level::ONE, internal_system_query_state(), {"general"}, cql3::query_processor::cache_internal::yes);
+    if (!result_set->empty()) {
+        auto &&row = result_set->one();
+        auto content = row.get_as<bytes>("data");
+        auto timestamp = row.get_as<db_clock::time_point>("timestamp").time_since_epoch().count();
+        auto origin = row.get_as<utils::UUID>("origin");
+        const int zstd_compression_level = 1;
+        co_return utils::shared_dict(
+            std::as_bytes(std::span(content)),
+            timestamp,
+            origin,
+            zstd_compression_level
+        );
+    } else {
+        co_return utils::shared_dict();
+    }
 }
 
 sstring system_keyspace_name() {

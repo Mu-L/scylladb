@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/distributed.hh>
@@ -16,7 +16,7 @@
 #include "utils/logalloc.hh"
 #include "utils/UUID_gen.hh"
 #include "row_cache.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "schema/schema_builder.hh"
 #include "readers/combined.hh"
 #include "readers/mutation_fragment_v1_stream.hh"

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/coroutine.hh>
@@ -20,8 +20,18 @@ namespace cql3 {
 
 namespace statements {
 
+audit::statement_category
+drop_function_statement::category() const {
+    return audit::statement_category::DDL;
+}
+
+audit::audit_info_ptr
+drop_function_statement::audit_info() const {
+    return audit::audit::create_audit_info(category(), sstring(), sstring());
+}
+
 std::unique_ptr<prepared_statement> drop_function_statement::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<drop_function_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<drop_function_statement>(*this));
 }
 
 future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, cql3::cql_warnings_vec>> drop_function_statement::prepare_schema_mutations(query_processor& qp, service::query_state& state, const query_options& options, service::group0_batch& mc) const {
@@ -33,7 +43,7 @@ future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, cql3::cql_w
         if (!user_func) {
             throw exceptions::invalid_request_exception(format("'{}' is not a user defined function", func));
         }
-        if (auto aggregate = functions::functions::used_by_user_aggregate(user_func)) {
+        if (auto aggregate = functions::instance().used_by_user_aggregate(user_func)) {
             throw exceptions::invalid_request_exception(format("Cannot delete function {}, as it is used by user-defined aggregate {}", func, *aggregate));
         }
         auto muts = co_await service::prepare_function_drop_announcement(qp.proxy(), user_func, mc.write_timestamp());

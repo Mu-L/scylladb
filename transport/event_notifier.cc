@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "transport/server.hh"
@@ -155,7 +155,7 @@ void cql_server::event_notifier::on_update_aggregate(const sstring& ks_name, con
     elogger.warn("%s event ignored", __func__);
 }
 
-void cql_server::event_notifier::on_update_tablet_metadata() {}
+void cql_server::event_notifier::on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) {}
 
 void cql_server::event_notifier::on_drop_keyspace(const sstring& ks_name)
 {
@@ -214,6 +214,22 @@ void cql_server::event_notifier::on_drop_function(const sstring& ks_name, const 
 void cql_server::event_notifier::on_drop_aggregate(const sstring& ks_name, const sstring& aggregate_name)
 {
     elogger.warn("%s event ignored", __func__);
+}
+
+future<> cql_server::event_notifier::on_before_service_level_add(qos::service_level_options, qos::service_level_info sl_info) {
+    co_return;
+}
+
+future<> cql_server::event_notifier::on_after_service_level_remove(qos::service_level_info sl_info) {
+    co_return;
+}
+
+future<> cql_server::event_notifier::on_before_service_level_change(qos::service_level_options slo_before, qos::service_level_options slo_after, qos::service_level_info sl_info) {
+    co_return;
+}
+
+future<> cql_server::event_notifier::on_effective_service_levels_cache_reloaded() {
+    return _server.update_connections_service_level_params();
 }
 
 void cql_server::event_notifier::on_join_cluster(const gms::inet_address& endpoint)

@@ -3,16 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <exception>
 #include <seastar/core/coroutine.hh>
+#include "auth/authentication_options.hh"
+#include "auth/authorizer.hh"
 #include "auth/resource.hh"
 #include "auth/service.hh"
 
 #include <algorithm>
-#include <boost/algorithm/string/join.hpp>
 #include <chrono>
 
 #include <seastar/core/future-util.hh>
@@ -25,17 +26,22 @@
 #include "auth/role_or_anonymous.hh"
 #include "cql3/functions/functions.hh"
 #include "cql3/query_processor.hh"
+#include "cql3/description.hh"
 #include "cql3/untyped_result_set.hh"
+#include "cql3/util.hh"
 #include "db/config.hh"
 #include "db/consistency_level_type.hh"
 #include "db/functions/function_name.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "schema/schema_fwd.hh"
 #include <seastar/core/future.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
+#include <variant>
 #include "service/migration_manager.hh"
 #include "service/raft/raft_group0_client.hh"
 #include "timestamp.hh"
+#include "utils/assert.hh"
 #include "utils/class_registrator.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "data_dictionary/keyspace_metadata.hh"
@@ -77,7 +83,7 @@ private:
     void on_update_function(const sstring& ks_name, const sstring& function_name) override {}
     void on_update_aggregate(const sstring& ks_name, const sstring& aggregate_name) override {}
     void on_update_view(const sstring& ks_name, const sstring& view_name, bool columns_changed) override {}
-    void on_update_tablet_metadata() override {}
+    void on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) override {}
 
     void on_drop_keyspace(const sstring& ks_name) override {
         if (!legacy_mode(_qp)) {
@@ -194,7 +200,7 @@ service::service(
 }
 
 future<> service::create_legacy_keyspace_if_missing(::service::migration_manager& mm) const {
-    assert(this_shard_id() == 0); // once_among_shards makes sure a function is executed on shard 0 only
+    SCYLLA_ASSERT(this_shard_id() == 0); // once_among_shards makes sure a function is executed on shard 0 only
     auto db = _qp.db();
 
     while (!db.has_keyspace(meta::legacy::AUTH_KS)) {
@@ -212,7 +218,7 @@ future<> service::create_legacy_keyspace_if_missing(::service::migration_manager
 
             try {
                 co_return co_await mm.announce(::service::prepare_new_keyspace_announcement(db.real_database(), ksm, ts),
-                        std::move(group0_guard), format("auth_service: create {} keyspace", meta::legacy::AUTH_KS));
+                        std::move(group0_guard), seastar::format("auth_service: create {} keyspace", meta::legacy::AUTH_KS));
             } catch (::service::group0_concurrent_modification&) {
                 log.info("Concurrent operation is detected while creating {} keyspace, retrying.", meta::legacy::AUTH_KS);
             }
@@ -254,6 +260,10 @@ future<> service::stop() {
     }).then([this] {
         return when_all_succeed(_role_manager->stop(), _authorizer->stop(), _authenticator->stop()).discard_result();
     });
+}
+
+future<> service::ensure_superuser_is_created() {
+    return _role_manager->ensure_superuser_is_created();
 }
 
 void service::update_cache_config() {
@@ -321,8 +331,11 @@ static void validate_authentication_options_are_supported(
         }
     };
 
-    if (options.password) {
-        check(authentication_option::password);
+    if (options.credentials) {
+        std::visit(make_visitor(
+            [&] (const password_option&) { check(authentication_option::password); },
+            [&] (const hashed_password_option&) { check(authentication_option::hashed_password); }
+        ), *options.credentials);
     }
 
     if (options.options) {
@@ -410,11 +423,228 @@ future<bool> service::exists(const resource& r) const {
                 return make_ready_future<bool>(db.has_keyspace(sstring(*keyspace)));
             }
             auto [name, function_args] = auth::decode_signature(*function_signature);
-            return make_ready_future<bool>(cql3::functions::functions::find(db::functions::function_name{sstring(*keyspace), name}, function_args));
+            return make_ready_future<bool>(cql3::functions::instance().find(db::functions::function_name{sstring(*keyspace), name}, function_args));
         }
     }
 
     return make_ready_future<bool>(false);
+}
+
+future<std::vector<cql3::description>> service::describe_roles(bool with_hashed_passwords) {
+    std::vector<cql3::description> result{};
+
+    const auto roles = co_await _role_manager->query_all();
+    result.reserve(roles.size());
+
+    const bool authenticator_uses_password_hashes = _authenticator->uses_password_hashes();
+
+    auto produce_create_statement = [with_hashed_passwords] (const sstring& formatted_role_name,
+            const std::optional<sstring>& maybe_hashed_password, bool can_login, bool is_superuser) {
+        // Even after applying formatting to a role, `formatted_role_name` can only equal `meta::DEFAULT_SUPER_NAME`
+        // if the original identifier was equal to it.
+        const sstring role_part = formatted_role_name == meta::DEFAULT_SUPERUSER_NAME
+                ? seastar::format("IF NOT EXISTS {}", formatted_role_name)
+                : formatted_role_name;
+
+        const sstring with_hashed_password_part = with_hashed_passwords && maybe_hashed_password
+                // `K_PASSWORD` in Scylla's CQL grammar requires that passwords be quoted
+                // with single quotation marks.
+                ? seastar::format("WITH HASHED PASSWORD = {} AND", cql3::util::single_quote(*maybe_hashed_password))
+                : "WITH";
+
+        return seastar::format("CREATE ROLE {} {} LOGIN = {} AND SUPERUSER = {};",
+                role_part, with_hashed_password_part, can_login, is_superuser);
+    };
+
+    for (const auto& role : roles) {
+        const sstring formatted_role_name = cql3::util::maybe_quote(role);
+
+        std::optional<sstring> maybe_hashed_password;
+        if (authenticator_uses_password_hashes) {
+            maybe_hashed_password = co_await _authenticator->get_password_hash(role);
+        }
+
+        const bool can_login = co_await _role_manager->can_login(role);
+        const bool is_superuser = co_await _role_manager->is_superuser(role);
+
+        result.push_back(cql3::description {
+            // Roles do not belong to any keyspace.
+            .keyspace = std::nullopt,
+            .type = "role",
+            .name = role,
+            .create_statement = produce_create_statement(formatted_role_name, maybe_hashed_password, can_login, is_superuser)
+        });
+    }
+
+    std::ranges::sort(result, std::less<>{}, std::mem_fn(&cql3::description::name));
+
+    co_return result;
+}
+
+// The function doesn't assume anything about `role`.
+static sstring describe_data_resource(const permission& perm, const resource& r, std::string_view role) {
+    const auto permission = permissions::to_string(perm);
+    const auto formatted_role = cql3::util::maybe_quote(role);
+
+    const auto view = data_resource_view(r);
+    const auto maybe_ks = view.keyspace();
+    const auto maybe_cf = view.table();
+
+    // The documentation says:
+    //
+    //     Both keyspace and table names consist of only alphanumeric characters, cannot be empty,
+    //     and are limited in size to 48 characters (that limit exists mostly to avoid filenames,
+    //     which may include the keyspace and table name, to go over the limits of certain file systems).
+    //     By default, keyspace and table names are case insensitive (myTable is equivalent to mytable),
+    //     but case sensitivity can be forced by using double-quotes ("myTable" is different from mytable).
+    //
+    // That's why we wrap identifiers with quotation marks below.
+
+    if (!maybe_ks) {
+        return seastar::format("GRANT {} ON ALL KEYSPACES TO {};", permission, formatted_role);
+    }
+    const auto ks = cql3::util::maybe_quote(*maybe_ks);
+
+    if (!maybe_cf) {
+        return seastar::format("GRANT {} ON KEYSPACE {} TO {};", permission, ks, formatted_role);
+    }
+    const auto cf = cql3::util::maybe_quote(*maybe_cf);
+
+    return seastar::format("GRANT {} ON {}.{} TO {};", permission, ks, cf, formatted_role);
+}
+
+// The function doesn't assume anything about `role`.
+static sstring describe_role_resource(const permission& perm, const resource& r, std::string_view role) {
+    const auto permission = permissions::to_string(perm);
+    const auto formatted_role = cql3::util::maybe_quote(role);
+
+    const auto view = role_resource_view(r);
+    const auto maybe_target_role = view.role();
+
+    if (!maybe_target_role) {
+        return seastar::format("GRANT {} ON ALL ROLES TO {};", permission, formatted_role);
+    }
+    return seastar::format("GRANT {} ON ROLE {} TO {};", permission, cql3::util::maybe_quote(*maybe_target_role), formatted_role);
+}
+
+// The function doesn't assume anything about `role`.
+static sstring describe_udf_resource(const permission& perm, const resource& r, std::string_view role) {
+    const auto permission = permissions::to_string(perm);
+    const auto formatted_role = cql3::util::maybe_quote(role);
+
+    const auto view = functions_resource_view(r);
+    const auto maybe_ks = view.keyspace();
+    const auto maybe_fun_sig = view.function_signature();
+    const auto maybe_fun_name = view.function_name();
+    const auto maybe_fun_args = view.function_args();
+
+    // The documentation says:
+    //
+    //     Both keyspace and table names consist of only alphanumeric characters, cannot be empty,
+    //     and are limited in size to 48 characters (that limit exists mostly to avoid filenames,
+    //     which may include the keyspace and table name, to go over the limits of certain file systems).
+    //     By default, keyspace and table names are case insensitive (myTable is equivalent to mytable),
+    //     but case sensitivity can be forced by using double-quotes ("myTable" is different from mytable).
+    //
+    // That's why we wrap identifiers with quotation marks below.
+
+    if (!maybe_ks) {
+        return seastar::format("GRANT {} ON ALL FUNCTIONS TO {};", permission, formatted_role);
+    }
+    const auto ks = cql3::util::maybe_quote(*maybe_ks);
+
+    if (!maybe_fun_sig && !maybe_fun_name) {
+        return seastar::format("GRANT {} ON ALL FUNCTIONS IN KEYSPACE {} TO {};", permission, ks, formatted_role);
+    }
+
+    if (maybe_fun_name) {
+        SCYLLA_ASSERT(maybe_fun_args);
+
+        const auto fun_name = cql3::util::maybe_quote(*maybe_fun_name);
+        const auto fun_args_range = *maybe_fun_args | std::views::transform([] (const auto& fun_arg) {
+            return cql3::util::maybe_quote(fun_arg);
+        });
+
+        return seastar::format("GRANT {} ON FUNCTION {}.{}({}) TO {};",
+                permission, ks, fun_name, fmt::join(fun_args_range, ", "), formatted_role);
+    }
+
+    SCYLLA_ASSERT(maybe_fun_sig);
+
+    auto [fun_name, fun_args] = decode_signature(*maybe_fun_sig);
+    fun_name = cql3::util::maybe_quote(fun_name);
+
+    // We don't call `cql3::util::maybe_quote` later because `cql3_type_name_without_frozen` already guarantees
+    // that the type will be wrapped within double quotation marks if it's necessary.
+    auto parsed_fun_args = fun_args | std::views::transform([] (const data_type& dt) {
+        return dt->without_reversed().cql3_type_name_without_frozen();
+    });
+
+    return seastar::format("GRANT {} ON FUNCTION {}.{}({}) TO {};",
+            permission, ks, fun_name, fmt::join(parsed_fun_args, ", "), formatted_role);
+}
+
+// The function doesn't assume anything about `role`.
+static sstring describe_resource_kind(const permission& perm, const resource& r, std::string_view role) {
+    switch (r.kind()) {
+        case resource_kind::data:
+            return describe_data_resource(perm, r, role);
+        case resource_kind::role:
+            return describe_role_resource(perm, r, role);
+        case resource_kind::service_level:
+            on_internal_error(log, "Granting permissions for service levels is not supported");
+        case resource_kind::functions:
+            return describe_udf_resource(perm, r, role);
+    }
+}
+
+future<std::vector<cql3::description>> service::describe_permissions() const {
+    std::vector<cql3::description> result{};
+
+    const auto permission_list = co_await std::invoke([&] -> future<std::vector<permission_details>> {
+        try {
+            co_return co_await _authorizer->list_all();
+        } catch (const unsupported_authorization_operation&) {
+            // If Scylla uses AllowAllAuthorizer, permissions do not exist and the corresponding authorizer
+            // will throw an exception when trying to access them.
+            co_return std::vector<permission_details>{};
+        }
+    });
+
+    for (const auto& permissions : permission_list) {
+        for (const auto& permission : permissions.permissions) {
+            result.push_back(cql3::description {
+                // Permission grants do not belong to any keyspace.
+                .keyspace = std::nullopt,
+                .type = "grant_permission",
+                .name = permissions.role_name,
+                .create_statement = describe_resource_kind(permission, permissions.resource, permissions.role_name)
+            });
+        }
+
+        co_await coroutine::maybe_yield();
+    }
+
+    std::ranges::sort(result, std::less<>{}, [] (const cql3::description& desc) noexcept {
+        return std::make_tuple(std::ref(desc.name), std::ref(*desc.create_statement));
+    });
+
+    co_return result;
+}
+
+future<std::vector<cql3::description>> service::describe_auth(bool with_hashed_passwords) {
+    auto role_descs = co_await describe_roles(with_hashed_passwords);
+    auto role_grant_descs = co_await _role_manager->describe_role_grants();
+    auto permission_descs = co_await describe_permissions();
+
+    auto join_vectors = [] (std::vector<cql3::description>& v1, std::vector<cql3::description>&& v2) {
+        v1.insert(v1.end(), std::make_move_iterator(v2.begin()), std::make_move_iterator(v2.end()));
+    };
+
+    join_vectors(role_descs, std::move(role_grant_descs));
+    join_vectors(role_descs, std::move(permission_descs));
+
+    co_return role_descs;
 }
 
 //
@@ -632,7 +862,7 @@ future<> migrate_to_auth_v2(db::system_keyspace& sys_ks, ::service::raft_group0_
             ::service::query_state qs(cs, empty_service_permit());
 
             auto rows = co_await qp.execute_internal(
-                    format("SELECT * FROM {}.{}", meta::legacy::AUTH_KS, cf_name),
+                    seastar::format("SELECT * FROM {}.{}", meta::legacy::AUTH_KS, cf_name),
                     db::consistency_level::ALL,
                     qs,
                     {},
@@ -644,7 +874,6 @@ future<> migrate_to_auth_v2(db::system_keyspace& sys_ks, ::service::raft_group0_
             for (const auto& col : schema->all_columns()) {
                 col_names.push_back(col.name_as_cql_string());
             }
-            auto col_names_str = boost::algorithm::join(col_names, ", ");
             sstring val_binders_str = "?";
             for (size_t i = 1; i < col_names.size(); ++i) {
                 val_binders_str += ", ?";
@@ -660,10 +889,10 @@ future<> migrate_to_auth_v2(db::system_keyspace& sys_ks, ::service::raft_group0_
                     }
                 }
                 auto muts = co_await qp.get_mutations_internal(
-                        format("INSERT INTO {}.{} ({}) VALUES ({})",
+                        seastar::format("INSERT INTO {}.{} ({}) VALUES ({})",
                                 db::system_keyspace::NAME,
                                 cf_name,
-                                col_names_str,
+                                fmt::join(col_names, ", "),
                                 val_binders_str),
                         internal_distributed_query_state(),
                         ts,
@@ -681,7 +910,7 @@ future<> migrate_to_auth_v2(db::system_keyspace& sys_ks, ::service::raft_group0_
     co_await announce_mutations_with_batching(g0,
             start_operation_func,
             std::move(gen),
-            &as,
+            as,
             std::nullopt);
 }
 

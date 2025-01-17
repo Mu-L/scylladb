@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -97,7 +97,7 @@ public:
 
     sstring cql() const {
         return format("CREATE TABLE {}.{} (pk text, ck text, v text, s1 text{}{}, PRIMARY KEY (pk, ck))",
-                      _s->keypace_name(), _s->element_name(),
+                      _s->ks_name(), _s->cf_name(),
                       _ws ? " static" : "", _wc ? ", c1 map<text, text>" : "");
     }
 
@@ -271,9 +271,9 @@ public:
     }
 
     static std::vector<dht::ring_position> to_ring_positions(const std::vector<dht::decorated_key>& keys) {
-        return boost::copy_range<std::vector<dht::ring_position>>(keys | boost::adaptors::transformed([] (const dht::decorated_key& key) {
+        return keys | std::views::transform([] (const dht::decorated_key& key) {
             return dht::ring_position(key);
-        }));
+        }) | std::ranges::to<std::vector>();
     }
 
     // Returns n clustering keys in their natural order

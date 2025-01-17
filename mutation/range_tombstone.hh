@@ -3,20 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <boost/intrusive/set.hpp>
 #include <optional>
 #include "utils/hashing.hh"
 #include "keys.hh"
 #include "mutation/tombstone.hh"
 #include "clustering_bounds_comparator.hh"
 #include "mutation/position_in_partition.hh"
-
-namespace bi = boost::intrusive;
 
 /**
  * Represents a ranged deletion operation. Can be empty.

@@ -3,11 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "rjson.hh"
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/iostream.hh>
@@ -16,6 +16,7 @@
 #endif
 
 #include <rapidjson/stream.h>
+#include <rapidjson/error/en.h>
 
 namespace rjson {
 
@@ -74,10 +75,10 @@ public:
         return _count;
     }
     // Not used in input streams, but unfortunately we still need to implement
-    Ch* PutBegin() { RAPIDJSON_ASSERT(false); return 0; }
-    void Put(Ch) { RAPIDJSON_ASSERT(false); }
-    void Flush() { RAPIDJSON_ASSERT(false); }
-    size_t PutEnd(Ch*) { RAPIDJSON_ASSERT(false); return 0; }
+    Ch* PutBegin() { RAPIDJSON_ASSERT(false && "PutBegin"); return 0; }
+    void Put(Ch) { RAPIDJSON_ASSERT(false && "Put"); }
+    void Flush() { RAPIDJSON_ASSERT(false && "Flush"); }
+    size_t PutEnd(Ch*) { RAPIDJSON_ASSERT(false && "PutEnd"); return 0; }
 
 };
 
@@ -284,14 +285,14 @@ rjson::malformed_value::malformed_value(std::string_view name, const rjson::valu
 {}
 
 rjson::malformed_value::malformed_value(std::string_view name, std::string_view value)
-    : error(format("Malformed value {} : {}", name, value))
+    : error(seastar::format("Malformed value {} : {}", name, value))
 {}
 
 rjson::missing_value::missing_value(std::string_view name) 
     // TODO: using old message here, but as pointed out. 
     // "parameter" is not really a JSON concept. It is a value
     // missing according to (implicit) schema. 
-    : error(format("JSON parameter {} not found", name))
+    : error(seastar::format("JSON parameter {} not found", name))
 {}
 
 rjson::value copy(const rjson::value& value) {
@@ -554,6 +555,38 @@ sstring quote_json_string(const sstring& value) {
     }
     oss.put('"');
     return oss.str();
+}
+
+static future<> destroy_gently_nonleaf(rjson::value&& value_in) {
+    // We want the caller to move the value into this function, so 'value_in' is an rvalue reference.
+    // We want to hold the value while it's being destroyed, so we move it into the coroutine frame
+    // as the local 'value'.
+    auto value = std::move(value_in);
+
+    if (value.IsObject()) {
+        for (auto it = value.MemberBegin(); it != value.MemberEnd();) {
+            co_await destroy_gently(std::move(it->value));
+            it = value.EraseMember(it);
+        }
+    } else if (value.IsArray()) {
+        for (auto i = value.Size(); i > 0; --i) {
+            auto index = i - 1;
+            co_await destroy_gently(std::move(value[index]));
+            value.Erase(value.Begin() + index);
+        }
+    }
+}
+
+future<> destroy_gently(rjson::value&& value) {
+    // Most nodes will be leaves, so we use a non-coroutine destroy_gently() for them. The
+    // few non-leaves will be handled by the coroutine destroy_gently_nonleaf(). We could have
+    // coded the whole thing as a non-coroutine, but that's more difficult and not worth the
+    // marginal improvement.
+    if (rjson::is_leaf(value)) {
+        return make_ready_future<>();
+    } else {
+        return destroy_gently_nonleaf(std::move(value));
+    }
 }
 
 } // end namespace rjson

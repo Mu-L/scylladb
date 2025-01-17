@@ -3,15 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/type.hpp>
+#include <type_traits>
 #include <random>
 #include <unordered_set>
 #include <algorithm>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 
 #include "gms/endpoint_state.hh"
 #include "gms/versioned_value.hh"
@@ -26,6 +27,7 @@
 #include "gms/inet_address.hh"
 #include "gms/gossiper.hh"
 #include "gms/feature_service.hh"
+#include "utils/assert.hh"
 #include "utils/error_injection.hh"
 #include "utils/UUID_gen.hh"
 #include "utils/to_string.hh"
@@ -107,8 +109,8 @@ stream_id::stream_id(dht::token token, size_t vnode_index)
     copy_int_to_bytes(dht::token::to_int64(token), 0, _value);
     copy_int_to_bytes(low_qword, sizeof(int64_t), _value);
     // not a hot code path. make sure we did not mess up the shifts and masks.
-    assert(version() == version_1);
-    assert(index() == vnode_index);
+    SCYLLA_ASSERT(version() == version_1);
+    SCYLLA_ASSERT(index() == vnode_index);
 }
 
 stream_id::stream_id(bytes b)
@@ -126,7 +128,7 @@ bool stream_id::is_set() const {
 }
 
 static int64_t bytes_to_int64(bytes_view b, size_t offset) {
-    assert(b.size() >= offset + sizeof(int64_t));
+    SCYLLA_ASSERT(b.size() >= offset + sizeof(int64_t));
     int64_t res;
     std::copy_n(b.begin() + offset, sizeof(int64_t), reinterpret_cast<int8_t *>(&res));
     return net::ntoh(res);
@@ -400,7 +402,7 @@ future<cdc::generation_id> generation_service::legacy_make_new_generation(const 
                 throw std::runtime_error(
                         format("Can't find endpoint for token {}", end));
             }
-            const auto ep = tmptr->get_endpoint_for_host_id(*endpoint);
+            const auto ep = _gossiper.get_address_map().get(*endpoint);
             auto sc = get_shard_count(ep, _gossiper);
             return {sc > 0 ? sc : 1, get_sharding_ignore_msb(ep, _gossiper)};
         }
@@ -411,7 +413,7 @@ future<cdc::generation_id> generation_service::legacy_make_new_generation(const 
 
     // Our caller should ensure that there are normal tokens in the token ring.
     auto normal_token_owners = tmptr->count_normal_token_owners();
-    assert(normal_token_owners);
+    SCYLLA_ASSERT(normal_token_owners);
 
     if (_feature_service.cdc_generations_v2) {
         cdc_log.info("Inserting new generation data at UUID {}", uuid);
@@ -811,7 +813,7 @@ future<> generation_service::stop() {
 }
 
 generation_service::~generation_service() {
-    assert(_stopped);
+    SCYLLA_ASSERT(_stopped);
 }
 
 future<> generation_service::after_join(std::optional<cdc::generation_id>&& startup_gen_id) {
@@ -871,7 +873,7 @@ future<> generation_service::check_and_repair_cdc_streams() {
             return;
         }
         if (!_gossiper.is_normal(addr)) {
-            throw std::runtime_error(format("All nodes must be in NORMAL or LEFT state while performing check_and_repair_cdc_streams"
+            throw std::runtime_error(fmt::format("All nodes must be in NORMAL or LEFT state while performing check_and_repair_cdc_streams"
                     " ({} is in state {})", addr, _gossiper.get_gossip_status(state)));
         }
 
@@ -962,10 +964,10 @@ future<> generation_service::check_and_repair_cdc_streams() {
     // Update _gen_id first, so that legacy_do_handle_cdc_generation (which will get called due to the status update)
     // won't try to update the gossiper, which would result in a deadlock inside add_local_application_state
     _gen_id = new_gen_id;
-    co_await _gossiper.add_local_application_state({
-            { gms::application_state::CDC_GENERATION_ID, gms::versioned_value::cdc_generation_id(new_gen_id) },
-            { gms::application_state::STATUS, *status }
-    });
+    co_await _gossiper.add_local_application_state(
+            std::pair(gms::application_state::CDC_GENERATION_ID, gms::versioned_value::cdc_generation_id(new_gen_id)),
+            std::pair(gms::application_state::STATUS, *status)
+    );
     co_await _sys_ks.local().update_cdc_generation_id(new_gen_id);
 }
 
@@ -1110,7 +1112,7 @@ future<bool> generation_service::legacy_do_handle_cdc_generation(cdc::generation
     auto sys_dist_ks = get_sys_dist_ks();
     auto gen = co_await retrieve_generation_data(gen_id, _sys_ks.local(), *sys_dist_ks, { _token_metadata.get()->count_normal_token_owners() });
     if (!gen) {
-        throw std::runtime_error(format(
+        throw std::runtime_error(fmt::format(
             "Could not find CDC generation {} in distributed system tables (current time: {}),"
             " even though some node gossiped about it.",
             gen_id, db_clock::now()));

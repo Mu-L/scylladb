@@ -3,20 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "resource_manager.hh"
 #include "gms/inet_address.hh"
 #include "locator/token_metadata.hh"
 #include "manager.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include <boost/range/algorithm/for_each.hpp>
 #include <boost/range/adaptor/map.hpp>
+#include <boost/range/numeric.hpp>
 #include "utils/disk-error-handler.hh"
 #include "seastarx.hh"
 #include <seastar/core/sleep.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/when_all.hh>
 #include "utils/div_ceil.hh"
 #include "utils/lister.hh"
 
@@ -133,7 +135,7 @@ void space_watchdog::on_timer() {
     //    |  |- ...
     //
 
-    for (auto& per_device_limits : _per_device_limits_map | boost::adaptors::map_values) {
+    for (auto& per_device_limits : _per_device_limits_map | std::views::values) {
         _total_size = 0;
         for (manager& shard_manager : per_device_limits.managers) {
             shard_manager.clear_eps_with_pending_hints();
@@ -202,7 +204,7 @@ void space_watchdog::on_timer() {
     }
 }
 
-future<> resource_manager::start(shared_ptr<gms::gossiper> gossiper_ptr) {
+future<> resource_manager::start(shared_ptr<const gms::gossiper> gossiper_ptr) {
     _gossiper_ptr = std::move(gossiper_ptr);
 
     return with_semaphore(_operation_lock, 1, [this] () {

@@ -3,23 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "i_partitioner.hh"
 #include "sharder.hh"
+#include "auto_refreshing_sharder.hh"
+#include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include "dht/ring_position.hh"
 #include "dht/token-sharding.hh"
+#include "utils/assert.hh"
 #include "utils/class_registrator.hh"
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/irange.hpp>
-#include <boost/range/adaptor/transformed.hpp>
 #include "sstables/key.hh"
+#include "replica/database.hh"
 #include <seastar/core/thread.hh>
 #include <seastar/core/on_internal_error.hh>
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace dht {
 
@@ -67,7 +68,7 @@ static_sharder::next_shard(const token& t) const {
     auto shard = shard_for_reads(t);
     auto next_shard = shard + 1 == _shard_count ? 0 : shard + 1;
     auto next_token = token_for_next_shard_for_reads(t, next_shard);
-    if (next_token == dht::maximum_token()) {
+    if (next_token.is_maximum()) {
         return std::nullopt;
     }
     return shard_and_token{next_shard, next_token};
@@ -82,12 +83,13 @@ std::unique_ptr<dht::i_partitioner> make_partitioner(sstring partitioner_name) {
     try {
         return create_object<i_partitioner>(partitioner_name);
     } catch (std::exception& e) {
-        auto supported_partitioners = fmt::join(
-            class_registry<i_partitioner>::classes() |
-            boost::adaptors::map_keys,
-            ", ");
-        throw std::runtime_error(format("Partitioner {} is not supported, supported partitioners = {{ {} }} : {}",
-                partitioner_name, supported_partitioners, e.what()));
+        throw std::runtime_error(fmt::format("Partitioner {} is not supported, supported partitioners = {{ {} }} : {}",
+                partitioner_name,
+                fmt::join(
+                    class_registry<i_partitioner>::classes() |
+                    std::views::keys,
+                    ", "),
+                e.what()));
     }
 }
 
@@ -189,7 +191,7 @@ ring_position_range_sharder::next(const schema& s) {
     auto shard_boundary_token = next_shard_and_token->token;
     auto shard_boundary = ring_position::starting_at(shard_boundary_token);
     if ((!_range.end() || shard_boundary.less_compare(s, _range.end()->value()))
-            && shard_boundary_token != maximum_token()) {
+            && !shard_boundary_token.is_maximum()) {
         // split the range at end_of_shard
         auto start = _range.start();
         auto end = interval_bound<ring_position>(shard_boundary, false);
@@ -240,7 +242,7 @@ split_range_to_single_shard(const schema& s, const static_sharder& sharder, cons
             start_boundary,
             shard] () mutable {
         if (pr.overlaps(partition_range(start_boundary, {}), cmp)
-                && !(start_boundary && start_boundary->value().token() == maximum_token())) {
+                && !(start_boundary && start_boundary->value().token().is_maximum())) {
             dht::token end_token = maximum_token();
             auto s_a_t = sharder.next_shard(start_token);
             if (s_a_t) {
@@ -423,7 +425,7 @@ future<dht::partition_range_vector> subtract_ranges(const schema& schema, const 
             ++range_to_subtract;
             break;
         default:
-            assert(size <= 2);
+            SCYLLA_ASSERT(size <= 2);
         }
         co_await coroutine::maybe_yield();
     }
@@ -442,7 +444,7 @@ dht::token_range_vector split_token_range_msb(unsigned most_significant_bits) {
     }
     uint64_t number_of_ranges = 1 << most_significant_bits;
     ret.reserve(number_of_ranges);
-    assert(most_significant_bits < 64);
+    SCYLLA_ASSERT(most_significant_bits < 64);
     dht::token prev_last_token;
     for (uint64_t i = 0; i < number_of_ranges; i++) {
         std::optional<dht::token_range::bound> start_bound;
@@ -491,6 +493,46 @@ std::optional<shard_id> is_single_shard(const dht::sharder& sharder, const schem
         }
     }
     return shard;
+}
+
+auto_refreshing_sharder::auto_refreshing_sharder(lw_shared_ptr<replica::table> table, std::optional<write_replica_set_selector> sel)
+    : _table(std::move(table))
+    , _sel(sel)
+{
+    refresh();
+}
+
+auto_refreshing_sharder::~auto_refreshing_sharder() = default;
+
+void
+auto_refreshing_sharder::refresh() {
+    _erm = _table->get_effective_replication_map();
+    _sharder = &_erm->get_sharder(*_table->schema());
+    _callback = _erm->get_validity_abort_source().subscribe([this] () noexcept {
+        refresh();
+    });
+}
+
+unsigned auto_refreshing_sharder::shard_for_reads(const token& t) const {
+    return _sharder->shard_for_reads(t);
+}
+
+dht::shard_replica_set
+auto_refreshing_sharder::shard_for_writes(const token& t, std::optional<write_replica_set_selector> sel) const {
+    if (!sel) {
+        sel = _sel;
+    }
+    return _sharder->shard_for_writes(t, sel);
+}
+
+std::optional<dht::shard_and_token>
+auto_refreshing_sharder::next_shard_for_reads(const dht::token& t) const {
+    return _sharder->next_shard_for_reads(t);
+}
+
+dht::token
+auto_refreshing_sharder::token_for_next_shard_for_reads(const dht::token& t, shard_id shard, unsigned spans) const {
+    return _sharder->token_for_next_shard_for_reads(t, shard, spans);
 }
 
 }

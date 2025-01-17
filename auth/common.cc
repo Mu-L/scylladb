@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "auth/common.hh"
@@ -16,6 +16,7 @@
 #include "mutation/canonical_mutation.hh"
 #include "schema/schema_fwd.hh"
 #include "timestamp.hh"
+#include "utils/assert.hh"
 #include "utils/exponential_backoff_retry.hh"
 #include "cql3/query_processor.hh"
 #include "cql3/statements/create_table_statement.hh"
@@ -24,6 +25,7 @@
 #include "service/raft/group0_state_machine.hh"
 #include "timeout_config.hh"
 #include "utils/error_injection.hh"
+#include "db/system_keyspace.hh"
 
 namespace auth {
 
@@ -39,7 +41,7 @@ constinit const std::string_view AUTH_PACKAGE_NAME("org.apache.cassandra.auth.")
 static logging::logger auth_log("auth");
 
 bool legacy_mode(cql3::query_processor& qp) {
-    return qp.auth_version < db::system_keyspace::auth_version_t::v2;
+    return qp.auth_version < db::auth_version_t::v2;
 }
 
 std::string_view get_auth_ks_name(cql3::query_processor& qp) {
@@ -68,10 +70,10 @@ static future<> create_legacy_metadata_table_if_missing_impl(
         cql3::query_processor& qp,
         std::string_view cql,
         ::service::migration_manager& mm) {
-    assert(this_shard_id() == 0); // once_among_shards makes sure a function is executed on shard 0 only
+    SCYLLA_ASSERT(this_shard_id() == 0); // once_among_shards makes sure a function is executed on shard 0 only
 
     auto db = qp.db();
-    auto parsed_statement = cql3::query_processor::parse_statement(cql);
+    auto parsed_statement = cql3::query_processor::parse_statement(cql, cql3::dialect{});
     auto& parsed_cf_statement = static_cast<cql3::statements::raw::cf_statement&>(*parsed_statement);
 
     parsed_cf_statement.prepare_keyspace(meta::legacy::AUTH_KS);
@@ -121,7 +123,7 @@ static future<> announce_mutations_with_guard(
         ::service::raft_group0_client& group0_client,
         std::vector<canonical_mutation> muts,
         ::service::group0_guard group0_guard,
-        seastar::abort_source* as,
+        seastar::abort_source& as,
         std::optional<::service::raft_timeout> timeout) {
     auto group0_cmd = group0_client.prepare_command(
         ::service::write_mutations{
@@ -137,7 +139,7 @@ future<> announce_mutations_with_batching(
         ::service::raft_group0_client& group0_client,
         start_operation_func_t start_operation_func,
         std::function<::service::mutations_generator(api::timestamp_type t)> gen,
-        seastar::abort_source* as,
+        seastar::abort_source& as,
         std::optional<::service::raft_timeout> timeout) {
     // account for command's overhead, it's better to use smaller threshold than constantly bounce off the limit
     size_t memory_threshold = group0_client.max_command_size() * 0.75;
@@ -188,7 +190,7 @@ future<> announce_mutations(
         ::service::raft_group0_client& group0_client,
         const sstring query_string,
         std::vector<data_value_or_unset> values,
-        seastar::abort_source* as,
+        seastar::abort_source& as,
         std::optional<::service::raft_timeout> timeout) {
     auto group0_guard = co_await group0_client.start_operation(as, timeout);
     auto timestamp = group0_guard.write_timestamp();

@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 // The following is a redesigned subset of Java's DataOutput,
@@ -138,7 +138,7 @@ size_t serialize_string_size(const sstring& s) {;
 }
 
 template<typename T, typename CharOutputIterator>
-static inline
+inline
 void write(CharOutputIterator& out, const T& val) {
     auto v = net::ntoh(val);
     out = std::copy_n(reinterpret_cast<char*>(&v), sizeof(v), out);

@@ -13,7 +13,7 @@ function(add_perf_test name)
     PRIVATE
       perf-lib
       test-lib
-      seastar_perf_testing
+      Seastar::seastar_perf_testing
       Seastar::seastar
       xxHash::xxhash)
   if(parsed_args_LIBRARIES)
@@ -92,3 +92,4 @@ add_perf_test(perf_mutation_fragment)
 add_perf_test(perf_vint)
 add_perf_test(perf_row_cache_reads)
 add_perf_test(perf_s3_client)
+add_perf_test(perf_sort_by_proximity)

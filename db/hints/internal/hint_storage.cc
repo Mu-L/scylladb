@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "db/hints/internal/hint_storage.hh"
@@ -20,7 +20,7 @@
 #include <seastar/core/sstring.hh>
 
 // Boost features.
-#include <boost/range/adaptors.hpp>
+#include <boost/range/adaptor/map.hpp>
 
 // Scylla includes.
 #include "db/hints/internal/hint_logger.hh"
@@ -177,10 +177,10 @@ future<> rebalance_segments(const fs::path& hint_directory, hints_segments_map& 
     std::unordered_map<sstring, size_t> per_ep_hints;
 
     for (const auto& [ep, ep_hint_segments] : segments_map) {
-        per_ep_hints[ep] = boost::accumulate(ep_hint_segments
-                | boost::adaptors::map_values
-                | boost::adaptors::transformed(std::mem_fn(&segment_list::size)),
-                size_t(0));
+        per_ep_hints[ep] = std::ranges::fold_left(ep_hint_segments
+                | std::views::values
+                | std::views::transform(std::mem_fn(&segment_list::size)),
+                size_t(0), std::plus());
         manager_logger.trace("{}: total files: {}", ep, per_ep_hints[ep]);
     }
 

@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include "types/collection.hh"
 #include "types/user.hh"
 #include "concrete_types.hh"
@@ -14,6 +15,8 @@
 #include "combine.hh"
 
 #include "collection_mutation.hh"
+
+#include <boost/range/numeric.hpp>
 
 bytes_view collection_mutation_input_stream::read_linearized(size_t n) {
     managed_bytes_view mbv = ::read_simple_bytes(_src, n);
@@ -166,15 +169,18 @@ collection_mutation_view_description::materialize(const abstract_type& type) con
     return m;
 }
 
-bool collection_mutation_description::compact_and_expire(column_id id, row_tombstone base_tomb, gc_clock::time_point query_time,
+compact_and_expire_result collection_mutation_description::compact_and_expire(column_id id, row_tombstone base_tomb, gc_clock::time_point query_time,
     can_gc_fn& can_gc, gc_clock::time_point gc_before, compaction_garbage_collector* collector)
 {
-    bool any_live = false;
+    compact_and_expire_result res{};
+    if (tomb) {
+        res.collection_tombstones++;
+    }
     auto t = tomb;
     tombstone purged_tomb;
     if (tomb <= base_tomb.regular()) {
         tomb = tombstone();
-    } else if (tomb.deletion_time < gc_before && can_gc(tomb)) {
+    } else if (tomb.deletion_time < gc_before && can_gc(tomb, is_shadowable::no)) { // The collection tombstone is never shadowable
         purged_tomb = tomb;
         tomb = tombstone();
     }
@@ -184,10 +190,12 @@ bool collection_mutation_description::compact_and_expire(column_id id, row_tombs
     for (auto&& name_and_cell : cells) {
         atomic_cell& cell = name_and_cell.second;
         auto cannot_erase_cell = [&] {
-            return cell.deletion_time() >= gc_before || !can_gc(tombstone(cell.timestamp(), cell.deletion_time()));
+            // Only row tombstones can be shadowable, (collection) cell tombstones aren't
+            return cell.deletion_time() >= gc_before || !can_gc(tombstone(cell.timestamp(), cell.deletion_time()), is_shadowable::no);
         };
 
         if (cell.is_covered_by(t, false) || cell.is_covered_by(base_tomb.shadowable().tomb(), false)) {
+            res.dead_cells++;
             continue;
         }
         if (cell.has_expired(query_time)) {
@@ -198,33 +206,35 @@ bool collection_mutation_description::compact_and_expire(column_id id, row_tombs
                 losers.emplace_back(std::pair(
                         std::move(name_and_cell.first), atomic_cell::make_dead(cell.timestamp(), cell.deletion_time())));
             }
+            res.dead_cells++;
         } else if (!cell.is_live()) {
             if (cannot_erase_cell()) {
                 survivors.emplace_back(std::move(name_and_cell));
             } else if (collector) {
                 losers.emplace_back(std::move(name_and_cell));
             }
+            res.dead_cells++;
         } else {
-            any_live |= true;
             survivors.emplace_back(std::move(name_and_cell));
+            res.live_cells++;
         }
     }
     if (collector) {
         collector->collect(id, collection_mutation_description{purged_tomb, std::move(losers)});
     }
     cells = std::move(survivors);
-    return any_live;
+    return res;
 }
 
 template <typename Iterator>
 static collection_mutation serialize_collection_mutation(
         const abstract_type& type,
         const tombstone& tomb,
-        boost::iterator_range<Iterator> cells) {
+        std::ranges::subrange<Iterator> cells) {
     auto element_size = [] (size_t c, auto&& e) -> size_t {
         return c + 8 + e.first.size() + e.second.serialize().size();
     };
-    auto size = accumulate(cells, (size_t)4, element_size);
+    auto size = std::ranges::fold_left(cells, (size_t)4, element_size);
     size += 1;
     if (tomb) {
         size += sizeof(int64_t) + sizeof(int64_t);
@@ -245,7 +255,7 @@ static collection_mutation serialize_collection_mutation(
         write_fragmented(out, v);
     };
     // FIXME: overflow?
-    write<int32_t>(out, boost::distance(cells));
+    write<int32_t>(out, std::ranges::distance(cells));
     for (auto&& kv : cells) {
         auto&& k = kv.first;
         auto&& v = kv.second;
@@ -257,11 +267,11 @@ static collection_mutation serialize_collection_mutation(
 }
 
 collection_mutation collection_mutation_description::serialize(const abstract_type& type) const {
-    return serialize_collection_mutation(type, tomb, boost::make_iterator_range(cells.begin(), cells.end()));
+    return serialize_collection_mutation(type, tomb, std::ranges::subrange(cells.begin(), cells.end()));
 }
 
 collection_mutation collection_mutation_view_description::serialize(const abstract_type& type) const {
-    return serialize_collection_mutation(type, tomb, boost::make_iterator_range(cells.begin(), cells.end()));
+    return serialize_collection_mutation(type, tomb, std::ranges::subrange(cells.begin(), cells.end()));
 }
 
 template <typename C>
@@ -391,7 +401,7 @@ deserialize_collection_mutation(collection_mutation_input_stream& in, F&& read_k
         ret.cells.push_back(read_kv(in));
     }
 
-    assert(in.empty());
+    SCYLLA_ASSERT(in.empty());
     return ret;
 }
 

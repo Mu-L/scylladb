@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -27,6 +27,11 @@
 #include "locator/host_id.hh"
 #include "virtual_tables.hh"
 #include "types/types.hh"
+#include "auth_version.hh"
+
+namespace utils {
+    class shared_dict;
+};
 
 namespace sstables {
     struct entry_descriptor;
@@ -77,6 +82,10 @@ namespace gms {
 
 namespace cdc {
     class topology_description;
+}
+
+namespace cql3 {
+    class untyped_result_set_row;
 }
 
 bool is_system_keyspace(std::string_view ks_name);
@@ -178,6 +187,8 @@ public:
     static constexpr auto CDC_GENERATIONS_V3 = "cdc_generations_v3";
     static constexpr auto TABLETS = "tablets";
     static constexpr auto SERVICE_LEVELS_V2 = "service_levels_v2";
+    static constexpr auto VIEW_BUILD_STATUS_V2 = "view_build_status_v2";
+    static constexpr auto DICTS = "dicts";
 
     // auth
     static constexpr auto ROLES = "roles";
@@ -271,14 +282,14 @@ public:
     static schema_ptr cdc_generations_v3();
     static schema_ptr tablets();
     static schema_ptr service_levels_v2();
+    static schema_ptr view_build_status_v2();
+    static schema_ptr dicts();
 
     // auth
     static schema_ptr roles();
     static schema_ptr role_members();
     static schema_ptr role_attributes();
     static schema_ptr role_permissions();
-
-    static table_schema_version generate_schema_version(table_id table_id, uint16_t offset = 0);
 
     future<> build_bootstrap_info();
     future<std::unordered_map<table_id, db_clock::time_point>> load_truncation_times();
@@ -392,6 +403,19 @@ public:
         int64_t range_end;
     };
 
+    struct topology_requests_entry {
+        utils::UUID id;
+        utils::UUID initiating_host;
+        std::optional<service::topology_request> request_type;
+        db_clock::time_point start_time;
+        bool done;
+        sstring error;
+        db_clock::time_point end_time;
+        db_clock::time_point ts;
+        table_id truncate_table_id;
+    };
+    using topology_requests_entries = std::unordered_map<utils::UUID, system_keyspace::topology_requests_entry>;
+
     future<> update_repair_history(repair_history_entry);
     using repair_history_consumer = noncopyable_function<future<>(const repair_history_entry&)>;
     future<> get_repair_history(table_id, repair_history_consumer f);
@@ -458,6 +482,7 @@ public:
     future<std::unordered_map<gms::inet_address, locator::host_id>> load_host_ids();
 
     future<std::vector<gms::inet_address>> load_peers();
+    future<std::vector<locator::host_id>> load_peers_ids();
 
     /*
      * Read this node's tokens stored in the LOCAL table.
@@ -482,7 +507,7 @@ public:
     // may depend on it.
     future<> save_local_enabled_features(std::set<sstring> features, bool visible_before_cl_replay);
 
-    future<int> increment_and_get_generation();
+    future<gms::generation_type> increment_and_get_generation();
     bool bootstrap_needed() const;
     bool bootstrap_complete() const;
     bool bootstrap_in_progress() const;
@@ -590,10 +615,7 @@ public:
     // returns the corresponding mutation. Otherwise returns nullopt.
     future<std::optional<mutation>> get_group0_schema_version();
 
-    enum class auth_version_t: int64_t {
-        v1 = 1,
-        v2 = 2,
-    };
+    using auth_version_t = db::auth_version_t;
 
     // If the `auth_version` key in `system.scylla_local` is present (either live or tombstone),
     // returns the corresponding mutation. Otherwise returns nullopt.
@@ -601,12 +623,22 @@ public:
     future<mutation> make_auth_version_mutation(api::timestamp_type ts, auth_version_t version);
     future<auth_version_t> get_auth_version();
 
-    future<> sstables_registry_create_entry(sstring location, sstring status, sstables::sstable_state state, sstables::entry_descriptor desc);
-    future<> sstables_registry_update_entry_status(sstring location, sstables::generation_type gen, sstring status);
-    future<> sstables_registry_update_entry_state(sstring location, sstables::generation_type gen, sstables::sstable_state state);
-    future<> sstables_registry_delete_entry(sstring location, sstables::generation_type gen);
+    enum class view_builder_version_t: int64_t {
+        v1 = 10,
+        v1_5 = 15,
+        v2 = 20,
+    };
+
+    future<std::optional<mutation>> get_view_builder_version_mutation();
+    future<mutation> make_view_builder_version_mutation(api::timestamp_type ts, view_builder_version_t version);
+    future<view_builder_version_t> get_view_builder_version();
+
+    future<> sstables_registry_create_entry(table_id owner, sstring status, sstables::sstable_state state, sstables::entry_descriptor desc);
+    future<> sstables_registry_update_entry_status(table_id owner, sstables::generation_type gen, sstring status);
+    future<> sstables_registry_update_entry_state(table_id owner, sstables::generation_type gen, sstables::sstable_state state);
+    future<> sstables_registry_delete_entry(table_id owner, sstables::generation_type gen);
     using sstable_registry_entry_consumer = sstables::sstables_registry::entry_consumer;
-    future<> sstables_registry_list(sstring location, sstable_registry_entry_consumer consumer);
+    future<> sstables_registry_list(table_id owner, sstable_registry_entry_consumer consumer);
 
     future<std::optional<sstring>> load_group0_upgrade_state();
     future<> save_group0_upgrade_state(sstring);
@@ -614,13 +646,23 @@ public:
     future<bool> get_must_synchronize_topology();
     future<> set_must_synchronize_topology(bool);
 
-    future<service::topology_request_state> get_topology_request_state(utils::UUID id);
+    future<service::topology_request_state> get_topology_request_state(utils::UUID id, bool require_entry);
+    topology_requests_entry topology_request_row_to_entry(utils::UUID id, const cql3::untyped_result_set_row& row);
+    future<topology_requests_entry> get_topology_request_entry(utils::UUID id, bool require_entry);
+    future<topology_requests_entries> get_node_ops_request_entries(db_clock::time_point end_time_limit);
 
 public:
     future<std::optional<int8_t>> get_service_levels_version();
     
     future<mutation> make_service_levels_version_mutation(int8_t version, const service::group0_guard& guard);
     future<std::optional<mutation>> get_service_levels_version_mutation();
+
+    // Publishes a new compression dictionary to `dicts`,
+    // with the current timestamp.
+    future<mutation> get_insert_dict_mutation(
+            bytes dict, locator::host_id self, db_clock::time_point dict_ts, api::timestamp_type write_ts) const;
+    // Queries `dicts` for the most recent compression dictionary.
+    future<utils::shared_dict> query_dict() const;
 
 private:
     static std::optional<service::topology_features> decode_topology_features_state(::shared_ptr<cql3::untyped_result_set> rs);

@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 """Manager client.
    Communicates with Manager server via socket.
@@ -18,7 +18,7 @@ import logging
 from test.pylib.log_browsing import ScyllaLogFile
 from test.pylib.rest_client import UnixRESTClient, ScyllaRESTAPIClient, ScyllaMetricsClient
 from test.pylib.util import wait_for, wait_for_cql_and_get_hosts, Host
-from test.pylib.internal_types import ServerNum, IPAddress, HostID, ServerInfo
+from test.pylib.internal_types import ServerNum, IPAddress, HostID, ServerInfo, ServerUpState
 from test.pylib.scylla_cluster import ReplaceConfig, ScyllaServer
 from cassandra.cluster import Session as CassandraSession, \
     ExecutionProfile, EXEC_PROFILE_DEFAULT  # type: ignore # pylint: disable=no-name-in-module
@@ -153,9 +153,11 @@ class ManagerClient():
         logging.getLogger().removeHandler(self.test_log_fh)
         pathlib.Path(self.test_log_fh.baseFilename).unlink()
         logger.debug("after_test for %s (success: %s)", test_case_name, success)
-        cluster_str = await _client.put_json(f"/cluster/after-test/{success}",
+        cluster_status = await _client.put_json(f"/cluster/after-test/{success}",
                                                  response_type = "json")
-        logger.info("Cluster after test %s: %s", test_case_name, cluster_str)
+        logger.info("Cluster after test %s: %s", test_case_name, cluster_status)
+
+        return cluster_status
 
     async def gather_related_logs(self, failed_test_path_dir: Path, logs: Dict[str, Path]) -> None:
         for server in await self.all_servers():
@@ -187,7 +189,7 @@ class ManagerClient():
         except RuntimeError as exc:
             raise Exception("Failed to get list of running servers") from exc
         assert isinstance(server_info_list, list), "running_servers got unknown data type"
-        return [ServerInfo(ServerNum(int(info[0])), IPAddress(info[1]), IPAddress(info[2]))
+        return [ServerInfo(ServerNum(int(info[0])), IPAddress(info[1]), IPAddress(info[2]), info[3], info[4])
                 for info in server_info_list]
 
     async def all_servers(self) -> list[ServerInfo]:
@@ -197,7 +199,7 @@ class ManagerClient():
         except RuntimeError as exc:
             raise Exception("Failed to get list of servers") from exc
         assert isinstance(server_info_list, list), "all_servers got unknown data type"
-        return [ServerInfo(ServerNum(int(info[0])), IPAddress(info[1]), IPAddress(info[2]))
+        return [ServerInfo(ServerNum(int(info[0])), IPAddress(info[1]), IPAddress(info[2]), info[3], info[4])
                 for info in server_info_list]
 
     async def mark_dirty(self) -> None:
@@ -216,11 +218,11 @@ class ManagerClient():
         await self.client.put_json(f"/cluster/server/{server_id}/stop_gracefully", timeout=timeout)
 
     async def server_start(self, server_id: ServerNum, expected_error: Optional[str] = None,
-                           wait_others: int = 0, wait_interval: float = 45,
+                           wait_others: int = 0, wait_interval: float = 45, seeds: Optional[List[IPAddress]] = None,
                            timeout: Optional[float] = None) -> None:
         """Start specified server and optionally wait for it to learn of other servers"""
         logger.debug("ManagerClient starting %s", server_id)
-        data = {"expected_error": expected_error}
+        data = {"expected_error": expected_error, "seeds": seeds}
         await self.client.put_json(f"/cluster/server/{server_id}/start", data, timeout=timeout)
         await self.server_sees_others(server_id, wait_others, interval = wait_interval)
         if expected_error is None:
@@ -236,15 +238,18 @@ class ManagerClient():
         await self.server_start(server_id=server_id, wait_others=wait_others, wait_interval=wait_interval)
 
     async def rolling_restart(self, servers: List[ServerInfo], with_down: Optional[Callable[[ServerInfo], Awaitable[Any]]] = None):
-        for idx, s in enumerate(servers):
+        # `servers` might not include all the running servers, but we want to check against all of them
+        servers_running = await self.running_servers()
+
+        for s in servers:
             await self.server_stop_gracefully(s.server_id)
 
             # Wait for other servers to see the server to be stopped
             # so that the later server_sees_other_server() call will not
             # exit immediately, making it moot.
-            for idx2 in range(len(servers)):
-                if idx2 != idx:
-                    await self.server_not_sees_other_server(servers[idx2].ip_addr, s.ip_addr)
+            for s2 in servers_running:
+                if s2.server_id != s.server_id:
+                    await self.server_not_sees_other_server(s2.ip_addr, s.ip_addr)
 
             if with_down:
                 up_servers = [u for u in servers if u.server_id != s.server_id]
@@ -258,11 +263,11 @@ class ManagerClient():
             # and will not send graceful shutdown message to it. Server "s" may learn about the
             # restart from gossip later and close connections while we already sent CQL requests
             # to it, which will cause them to time out. Refs #14746.
-            for idx2 in range(len(servers)):
-                if idx2 != idx:
-                    await self.server_sees_other_server(servers[idx2].ip_addr, s.ip_addr)
+            for s2 in servers_running:
+                if s2.server_id != s.server_id:
+                    await self.server_sees_other_server(s2.ip_addr, s.ip_addr)
 
-        await wait_for_cql_and_get_hosts(self.cql, servers, time() + 60)
+        await wait_for_cql_and_get_hosts(self.cql, servers_running, time() + 60)
 
     async def server_pause(self, server_id: ServerNum) -> None:
         """Pause the specified server."""
@@ -283,13 +288,16 @@ class ManagerClient():
         """Get the total size of all sstable files for the given table"""
         return await self.client.get_json(f"/cluster/server/{server_id}/sstables_disk_usage", params={"keyspace": keyspace, "table": table})
 
-    def _create_server_add_data(self, replace_cfg: Optional[ReplaceConfig],
+    def _create_server_add_data(self,
+                                replace_cfg: Optional[ReplaceConfig],
                                 cmdline: Optional[List[str]],
                                 config: Optional[dict[str, Any]],
                                 property_file: Optional[dict[str, Any]],
                                 start: bool,
                                 seeds: Optional[List[IPAddress]],
-                                expected_error: Optional[str]) -> dict[str, Any]:
+                                expected_error: Optional[str],
+                                server_encryption: Optional[str],
+                                expected_server_up_state: Optional[ServerUpState]) -> dict[str, Any]:
         data: dict[str, Any] = {'start': start}
         if replace_cfg:
             data['replace_cfg'] = replace_cfg._asdict()
@@ -303,19 +311,36 @@ class ManagerClient():
             data['seeds'] = seeds
         if expected_error:
             data['expected_error'] = expected_error
+        if server_encryption:
+            data['server_encryption'] = server_encryption
+        if expected_server_up_state:
+            data['expected_server_up_state'] = expected_server_up_state.name
         return data
 
-    async def server_add(self, replace_cfg: Optional[ReplaceConfig] = None,
+    async def server_add(self,
+                         replace_cfg: Optional[ReplaceConfig] = None,
                          cmdline: Optional[List[str]] = None,
                          config: Optional[dict[str, Any]] = None,
                          property_file: Optional[dict[str, Any]] = None,
                          start: bool = True,
                          expected_error: Optional[str] = None,
                          seeds: Optional[List[IPAddress]] = None,
-                         timeout: Optional[float] = ScyllaServer.TOPOLOGY_TIMEOUT) -> ServerInfo:
+                         timeout: Optional[float] = ScyllaServer.TOPOLOGY_TIMEOUT,
+                         server_encryption: str = "none",
+                         expected_server_up_state: Optional[ServerUpState] = None) -> ServerInfo:
         """Add a new server"""
         try:
-            data = self._create_server_add_data(replace_cfg, cmdline, config, property_file, start, seeds, expected_error)
+            data = self._create_server_add_data(
+                replace_cfg,
+                cmdline,
+                config,
+                property_file,
+                start,
+                seeds,
+                expected_error,
+                server_encryption,
+                expected_server_up_state,
+            )
 
             # If we replace, we should wait until other nodes see the node being
             # replaced as dead because the replace operation can be rejected if
@@ -333,7 +358,9 @@ class ManagerClient():
         try:
             s_info = ServerInfo(ServerNum(int(server_info["server_id"])),
                                 IPAddress(server_info["ip_addr"]),
-                                IPAddress(server_info["rpc_address"]))
+                                IPAddress(server_info["rpc_address"]),
+                                server_info["datacenter"],
+                                server_info["rack"])
         except Exception as exc:
             raise RuntimeError(f"server_add got invalid server data {server_info}") from exc
         logger.debug("ManagerClient added %s", s_info)
@@ -350,7 +377,9 @@ class ManagerClient():
                           property_file: Optional[dict[str, Any]] = None,
                           start: bool = True,
                           seeds: Optional[List[IPAddress]] = None,
-                          expected_error: Optional[str] = None) -> List[ServerInfo]:
+                          driver_connect_opts: dict[str, Any] = {},
+                          expected_error: Optional[str] = None,
+                          server_encryption: str = "none") -> List[ServerInfo]:
         """Add new servers concurrently.
         This function can be called only if the cluster uses consistent topology changes, which support
         concurrent bootstraps. If your test does not fulfill this condition and you want to add multiple
@@ -358,7 +387,7 @@ class ManagerClient():
         assert servers_num > 0, f"servers_add: cannot add {servers_num} servers, servers_num must be positive"
 
         try:
-            data = self._create_server_add_data(None, cmdline, config, property_file, start, seeds, expected_error)
+            data = self._create_server_add_data(None, cmdline, config, property_file, start, seeds, expected_error, server_encryption, None)
             data['servers_num'] = servers_num
             server_infos = await self.client.put_json("/cluster/addservers", data, response_type="json",
                                                       timeout=ScyllaServer.TOPOLOGY_TIMEOUT * servers_num)
@@ -372,7 +401,9 @@ class ManagerClient():
             try:
                 s_info = ServerInfo(ServerNum(int(server_info["server_id"])),
                                     IPAddress(server_info["ip_addr"]),
-                                    IPAddress(server_info["rpc_address"]))
+                                    IPAddress(server_info["rpc_address"]),
+                                    server_info["datacenter"],
+                                    server_info["rack"])
                 s_infos.append(s_info)
             except Exception as exc:
                 raise RuntimeError(f"servers_add got invalid server data {server_info}") from exc
@@ -382,7 +413,7 @@ class ManagerClient():
             if self.cql:
                 self._driver_update()
             elif start:
-                await self.driver_connect()
+                await self.driver_connect(**driver_connect_opts)
         return s_infos
 
     async def remove_node(self, initiator_id: ServerNum, server_id: ServerNum,
@@ -470,6 +501,18 @@ class ManagerClient():
 
         return await wait_for(host_is_known, deadline or (time() + 30))
 
+    async def wait_for_scylla_process_status(self,
+                                             server_id: ServerNum,
+                                             expected_statuses: list[str],
+                                             deadline: Optional[float] = None) -> str:
+        """Wait for Scylla's process status for server_id will be as expected, with timeout."""
+        async def process_status_is_as_expected() -> str | None:
+            current_status = await self.client.get_json(f"/cluster/server/{server_id}/process_status")
+            if current_status in expected_statuses:
+                return current_status
+
+        return await wait_for(process_status_is_as_expected, deadline or (time() + 30))
+
     async def get_host_ip(self, server_id: ServerNum) -> IPAddress:
         """Get host IP Address"""
         try:
@@ -488,6 +531,10 @@ class ManagerClient():
 
     async def get_table_id(self, keyspace: str, table: str):
         rows = await self.cql.run_async(f"select id from system_schema.tables where keyspace_name = '{keyspace}' and table_name = '{table}'")
+        return rows[0].id
+
+    async def get_view_id(self, keyspace: str, view: str):
+        rows = await self.cql.run_async(f"select id from system_schema.views where keyspace_name = '{keyspace}' and view_name = '{view}'")
         return rows[0].id
 
     async def server_sees_others(self, server_id: ServerNum, count: int, interval: float = 45.):

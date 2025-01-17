@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "test/lib/sstable_utils.hh"
@@ -13,7 +13,6 @@
 #include "dht/i_partitioner.hh"
 #include "dht/murmur3_partitioner.hh"
 #include <boost/range/irange.hpp>
-#include <boost/range/adaptor/reversed.hpp>
 #include "sstables/version.hh"
 #include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
@@ -39,6 +38,14 @@ lw_shared_ptr<replica::memtable> make_memtable(schema_ptr s, const std::vector<m
     }
 
     return mt;
+}
+
+std::vector<replica::memtable*> active_memtables(replica::table& t) {
+    std::vector<replica::memtable*> active_memtables;
+    t.for_each_active_memtable([&] (replica::memtable& mt) {
+        active_memtables.push_back(&mt);
+    });
+    return active_memtables;
 }
 
 sstables::shared_sstable make_sstable_containing(std::function<sstables::shared_sstable()> sst_factory, lw_shared_ptr<replica::memtable> mt) {

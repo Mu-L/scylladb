@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -27,12 +27,14 @@
 #include "sstables/sstables_registry.hh"
 
 class compaction_manager;
+namespace s3 { class client; }
 
 namespace sstables {
 
 enum class sstable_state;
 class storage;
 class sstables_manager;
+class opened_directory;
 bool manifest_json_filter(const std::filesystem::path&, const directory_entry& entry);
 
 class directory_semaphore {
@@ -77,6 +79,11 @@ public:
 
     class components_lister {
     public:
+        /// process all SSTable components found by the lister
+        ///
+        /// @li process all the listed valid TOC components with the given @c directory
+        /// @li removes safe-to-remove stale components
+        /// @li reports abnomalities if encounter
         virtual future<> process(sstable_directory& directory, process_flags flags) = 0;
         virtual future<> commit() = 0;
         virtual future<> prepare(sstable_directory&, process_flags, storage&) = 0;
@@ -104,6 +111,8 @@ public:
 
         std::filesystem::path _directory;
         std::unique_ptr<scan_state> _state;
+        shared_ptr<s3::client> _client;
+        sstring _bucket;
 
         future<> garbage_collect(storage&);
         future<> cleanup_column_family_temp_sst_dirs();
@@ -113,6 +122,7 @@ public:
 
     public:
         filesystem_components_lister(std::filesystem::path dir);
+        filesystem_components_lister(std::filesystem::path dir, sstables_manager&, const data_dictionary::storage_options::s3&);
 
         virtual future<> process(sstable_directory& directory, process_flags flags) override;
         virtual future<> commit() override;
@@ -121,13 +131,22 @@ public:
 
     class sstables_registry_components_lister final : public components_lister {
         sstables_registry& _sstables_registry;
-        sstring _location;
+        table_id _owner;
 
         future<> garbage_collect(storage&);
 
     public:
-        sstables_registry_components_lister(sstables::sstables_registry& sstables_registry, sstring location);
+        sstables_registry_components_lister(sstables::sstables_registry& sstables_registry, table_id owner);
 
+        virtual future<> process(sstable_directory& directory, process_flags flags) override;
+        virtual future<> commit() override;
+        virtual future<> prepare(sstable_directory&, process_flags, storage&) override;
+    };
+
+    class restore_components_lister final : public components_lister {
+        std::vector<sstring> _toc_filenames;
+    public:
+        restore_components_lister(const data_dictionary::storage_options::value_type& options, std::vector<sstring> toc_filenames);
         virtual future<> process(sstable_directory& directory, process_flags flags) override;
         virtual future<> commit() override;
         virtual future<> prepare(sstable_directory&, process_flags, storage&) override;
@@ -142,7 +161,6 @@ private:
     sstables_manager& _manager;
     schema_ptr _schema;
     lw_shared_ptr<const data_dictionary::storage_options> _storage_opts;
-    sstring _table_dir;
     sstable_state _state;
     io_error_handler_gen _error_handler_gen;
     std::unique_ptr<storage> _storage;
@@ -174,39 +192,40 @@ private:
 private:
     std::unique_ptr<sstable_directory::components_lister> make_components_lister();
 
-    future<> process_descriptor(sstables::entry_descriptor desc, process_flags flags);
+    future<> process_descriptor(sstables::entry_descriptor desc,
+            process_flags flags,
+            noncopyable_function<data_dictionary::storage_options()>&& get_storage_options);
     void validate(sstables::shared_sstable sst, process_flags flags) const;
-    future<sstables::shared_sstable> load_sstable(sstables::entry_descriptor desc, sstables::sstable_open_config cfg = {}) const;
-    future<sstables::shared_sstable> load_sstable(sstables::entry_descriptor desc, process_flags flags) const;
+    future<sstables::shared_sstable> load_sstable(sstables::entry_descriptor desc,
+            const data_dictionary::storage_options& storage_opts, sstables::sstable_open_config cfg = {}) const;
 
     future<> load_foreign_sstables(sstable_entry_descriptor_vector info_vec);
 
-    // Sort the sstable according to owner
-    future<> sort_sstable(sstables::entry_descriptor desc, process_flags flags);
-
-    // Returns filename for a SSTable from its entry_descriptor.
-    sstring sstable_filename(const sstables::entry_descriptor& desc) const;
-
     // Compute owner of shards for a particular SSTable.
-    future<std::vector<shard_id>> get_shards_for_this_sstable(const sstables::entry_descriptor& desc, process_flags flags) const;
-    // Retrieves sstables::foreign_sstable_open_info for a particular SSTable.
-    future<foreign_sstable_open_info> get_open_info_for_this_sstable(const sstables::entry_descriptor& desc) const;
+    future<std::vector<shard_id>> get_shards_for_this_sstable(
+            const sstables::entry_descriptor& desc, const data_dictionary::storage_options& storage_opts, process_flags flags) const;
 
     sstable_directory(sstables_manager& manager,
           schema_ptr schema,
           std::variant<std::unique_ptr<dht::sharder>, const dht::sharder*> sharder,
           lw_shared_ptr<const data_dictionary::storage_options> storage_opts,
-          sstring table_dir,
           sstable_state state,
           io_error_handler_gen error_handler_gen);
 public:
     sstable_directory(replica::table& table,
             sstable_state state,
             io_error_handler_gen error_handler_gen);
+    sstable_directory(replica::table& table,
+            sstable_state state,
+            lw_shared_ptr<const data_dictionary::storage_options> storage_opts,
+            io_error_handler_gen error_handler_gen);
+    sstable_directory(replica::table& table,
+            lw_shared_ptr<const data_dictionary::storage_options> storage_opts,
+            std::vector<sstring> sstables,
+            io_error_handler_gen error_handler_gen);
     sstable_directory(sstables_manager& manager,
             schema_ptr schema,
             const dht::sharder& sharder,
-            lw_shared_ptr<const data_dictionary::storage_options> storage_opts,
             sstring table_dir,
             sstable_state state,
             io_error_handler_gen error_handler_gen);
@@ -272,6 +291,11 @@ public:
     using can_be_remote = bool_class<struct can_be_remote_tag>;
     future<> collect_output_unshared_sstables(std::vector<sstables::shared_sstable> resharded_sstables, can_be_remote);
 
+    struct pending_delete_result {
+        sstring pending_delete_log;
+        std::unordered_set<sstring> prefixes;
+    };
+
     // When we compact sstables, we have to atomically instantiate the new
     // sstable and delete the old ones.  Otherwise, if we compact A+B into C,
     // and if A contained some data that was tombstoned by B, and if B was
@@ -285,12 +309,13 @@ public:
     //
     // This function only solves the second problem for now.
 
-    // Creates the deletion log for atomic deletion of sstables (helper for the
+    // Creates the deletion log for atomic deletion of sstables at `base_dir` (helper for the
     // above function that's also used by tests)
-    // Returns a pair of "logilfe name" and "directory with sstables"
-    static future<std::pair<sstring, sstring>> create_pending_deletion_log(const std::vector<shared_sstable>& ssts);
+    // Returns the name of the pending_delete_log and an unordered_set of sstable prefixes.
+    static future<pending_delete_result> create_pending_deletion_log(opened_directory& base_dir, const std::vector<shared_sstable>& ssts);
 
     static bool compare_sstable_storage_prefix(const sstring& a, const sstring& b) noexcept;
+    sstable_state state() const noexcept { return _state; }
 };
 
 future<sstables::generation_type> highest_generation_seen(sharded<sstables::sstable_directory>& directory);

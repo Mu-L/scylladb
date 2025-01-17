@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 //
@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <boost/test/unit_test.hpp>
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
@@ -89,14 +90,14 @@ public:
     }
 
     bool leadership_transfer_active() const {
-        assert(is_leader());
+        SCYLLA_ASSERT(is_leader());
         return bool(leader_state().stepdown);
     }
 };
 
 // NOTE: it doesn't compare data contents, just the data type
 bool compare_log_entry(raft::log_entry_ptr le1, raft::log_entry_ptr le2);
-bool compare_log_entries(raft::log& log1, raft::log& log2, size_t from, size_t to);
+bool compare_log_entries(raft::log& log1, raft::log& log2, raft::index_t from, raft::index_t to);
 using raft_routing_map = std::unordered_map<raft::server_id, raft::fsm*>;
 
 bool deliver(raft_routing_map& routes, raft::server_id from,

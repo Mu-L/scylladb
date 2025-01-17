@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include "memtable.hh"
 #include "replica/database.hh"
 #include "mutation/frozen_mutation.hh"
@@ -30,30 +31,26 @@ static mutation_reader make_partition_snapshot_flat_reader_from_snp_schema(
         std::any pointer_to_container,
         streamed_mutation::forwarding fwd, memtable& memtable);
 
-void memtable::memtable_encoding_stats_collector::update_timestamp(api::timestamp_type ts) noexcept {
-    if (ts != api::missing_timestamp) {
-        encoding_stats_collector::update_timestamp(ts);
-        min_max_timestamp.update(ts);
-    }
-}
-
 memtable::memtable_encoding_stats_collector::memtable_encoding_stats_collector() noexcept
     : min_max_timestamp(0, 0)
+    , min_live_timestamp(api::max_timestamp)
+    , min_live_row_marker_timestamp(api::max_timestamp)
 {}
 
 void memtable::memtable_encoding_stats_collector::update(atomic_cell_view cell) noexcept {
-    update_timestamp(cell.timestamp());
+    is_live is_live = ::is_live(cell.is_live());
+    update_timestamp(cell.timestamp(), is_live);
     if (cell.is_live_and_has_ttl()) {
         update_ttl(cell.ttl());
         update_local_deletion_time(cell.expiry());
-    } else if (!cell.is_live()) {
+    } else if (!is_live) {
         update_local_deletion_time(cell.deletion_time());
     }
 }
 
 void memtable::memtable_encoding_stats_collector::update(tombstone tomb) noexcept {
     if (tomb) {
-        update_timestamp(tomb.timestamp);
+        update_timestamp(tomb.timestamp, is_live::no);
         update_local_deletion_time(tomb.deletion_time);
     }
 }
@@ -84,12 +81,18 @@ void memtable::memtable_encoding_stats_collector::update(const range_tombstone& 
 }
 
 void memtable::memtable_encoding_stats_collector::update(const row_marker& marker) noexcept {
-    update_timestamp(marker.timestamp());
-    if (!marker.is_missing()) {
-        if (!marker.is_live()) {
-            update_ttl(gc_clock::duration(sstables::expired_liveness_ttl));
-            update_local_deletion_time(marker.deletion_time());
-        } else if (marker.is_expiring()) {
+    if (marker.is_missing()) {
+        return;
+    }
+    auto timestamp = marker.timestamp();
+    if (!marker.is_live()) {
+        update_timestamp(timestamp, is_live::no);
+        update_ttl(gc_clock::duration(sstables::expired_liveness_ttl));
+        update_local_deletion_time(marker.deletion_time());
+    } else {
+        update_timestamp(timestamp, is_live::yes);
+        update_live_row_marker_timestamp(timestamp);
+        if (marker.is_expiring()) {
             update_ttl(marker.ttl());
             update_local_deletion_time(marker.expiry());
         }
@@ -205,7 +208,7 @@ future<> memtable::clear_gently() noexcept {
 
 partition_entry&
 memtable::find_or_create_partition_slow(partition_key_view key) {
-    assert(!reclaiming_enabled());
+    SCYLLA_ASSERT(!reclaiming_enabled());
 
     // FIXME: Perform lookup using std::pair<token, partition_key_view>
     // to avoid unconditional copy of the partition key.
@@ -223,7 +226,7 @@ memtable::find_or_create_partition_slow(partition_key_view key) {
 
 partition_entry&
 memtable::find_or_create_partition(const dht::decorated_key& key) {
-    assert(!reclaiming_enabled());
+    SCYLLA_ASSERT(!reclaiming_enabled());
 
     // call lower_bound so we have a hint for the insert, just in case.
     partitions_type::bound_hint hint;
@@ -250,15 +253,15 @@ memtable::contains_partition(const dht::decorated_key& key) const {
     return partitions.find(key, dht::ring_position_comparator(*_schema)) != partitions.end();
 }
 
-boost::iterator_range<memtable::partitions_type::const_iterator>
+std::ranges::subrange<memtable::partitions_type::const_iterator>
 memtable::slice(const dht::partition_range& range) const {
     if (query::is_single_partition(range)) {
         const query::ring_position& pos = range.start()->value();
         auto i = partitions.find(pos, dht::ring_position_comparator(*_schema));
         if (i != partitions.end()) {
-            return boost::make_iterator_range(i, std::next(i));
+            return {i, std::next(i)};
         } else {
-            return boost::make_iterator_range(i, i);
+            return {i, i};
         }
     } else {
         auto cmp = dht::ring_position_comparator(*_schema);
@@ -275,7 +278,7 @@ memtable::slice(const dht::partition_range& range) const {
                         : partitions.lower_bound(range.end()->value(), cmp))
                   : partitions.cend();
 
-        return boost::make_iterator_range(i1, i2);
+        return {i1, i2};
     }
 }
 
@@ -476,11 +479,7 @@ public:
                     if (key_and_snp) {
                         update_last(key_and_snp->first);
 
-                        const query::clustering_row_ranges& ranges = _slice.row_ranges(*schema(), key_and_snp->first.key());
-                        // TODO: when the slice passed from query finally changes format from half-reversed into native reversed, this line needs to change.
-                        auto cr = query::clustering_key_filter_ranges(ranges);
-
-                        auto snp_schema = key_and_snp->second->schema();
+                        auto cr = query::clustering_key_filter_ranges::get_ranges(*schema(), _slice, key_and_snp->first.key());
                         bool digest_requested = _slice.options.contains<query::partition_slice::option::with_digest>();
                         bool is_reversed = _slice.is_reversed();
                         _delegate = make_partition_snapshot_flat_reader_from_snp_schema(is_reversed, _permit, std::move(key_and_snp->first), std::move(cr), std::move(key_and_snp->second), digest_requested, region(), read_section(), mtbl(), streamed_mutation::forwarding::no, *mtbl());
@@ -555,7 +554,7 @@ public:
         : _mt(mt)
 	{}
     ~flush_memory_accounter() {
-        assert(_mt._flushed_memory <= _mt.occupancy().total_space());
+        SCYLLA_ASSERT(_mt._flushed_memory <= _mt.occupancy().total_space());
     }
     uint64_t compute_size(memtable_entry& e, partition_snapshot& snp) {
         return e.size_in_allocator_without_rows(_mt.allocator())
@@ -707,7 +706,7 @@ partition_snapshot_ptr memtable_entry::snapshot(memtable& mtbl) {
 }
 
 mutation_reader_opt
-memtable::make_flat_reader_opt(schema_ptr s,
+memtable::make_flat_reader_opt(schema_ptr query_schema,
                       reader_permit permit,
                       const dht::partition_range& range,
                       const query::partition_slice& slice,
@@ -730,17 +729,13 @@ memtable::make_flat_reader_opt(schema_ptr s,
             return {};
         }
         auto dk = pos.as_decorated_key();
-
-        const query::clustering_row_ranges& ranges = slice.row_ranges(*s, dk.key());
-        // TODO: when the slice passed from query finally changes format from half-reversed into native reversed, this line needs to change.
-        auto cr = query::clustering_key_filter_ranges(ranges);
-
+        auto cr = query::clustering_key_filter_ranges::get_ranges(*query_schema, slice, dk.key());
         bool digest_requested = slice.options.contains<query::partition_slice::option::with_digest>();
         auto rd = make_partition_snapshot_flat_reader_from_snp_schema(is_reversed, std::move(permit), std::move(dk), std::move(cr), std::move(snp), digest_requested, *this, _table_shared_data.read_section, shared_from_this(), fwd, *this);
-        rd.upgrade_schema(s);
+        rd.upgrade_schema(query_schema);
         return rd;
     } else {
-        auto res = make_mutation_reader<scanning_reader>(std::move(s), shared_from_this(), std::move(permit), range, slice, fwd_mr);
+        auto res = make_mutation_reader<scanning_reader>(std::move(query_schema), shared_from_this(), std::move(permit), range, slice, fwd_mr);
         if (fwd == streamed_mutation::forwarding::yes) {
             return make_forwardable(std::move(res));
         } else {
@@ -851,7 +846,7 @@ void memtable_entry::upgrade_schema(logalloc::region& r, const schema_ptr& s, mu
 
 void memtable::upgrade_entry(memtable_entry& e) {
     if (e.schema() != _schema) {
-        assert(!reclaiming_enabled());
+        SCYLLA_ASSERT(!reclaiming_enabled());
         e.upgrade_schema(region(), _schema, cleaner());
     }
 }

@@ -17,7 +17,7 @@ function(compile_idl input)
   add_custom_command(
     OUTPUT ${output}
     COMMAND ${Python3_EXECUTABLE} ${idl_compiler} --ns ser -f ${input} -o ${output}
-    DEPENDS ${idle_compiler} ${input})
+    DEPENDS ${idl_compiler} ${input})
   set(${parsed_args_SOURCES} ${output} PARENT_SCOPE)
 endfunction(compile_idl)
 
@@ -35,7 +35,7 @@ set(idl_headers
   streaming.idl.hh
   paging_state.idl.hh
   frozen_schema.idl.hh
-  partition_checksum.idl.hh
+  repair.idl.hh
   replay_position.idl.hh
   mutation.idl.hh
   query.idl.hh
@@ -62,6 +62,8 @@ set(idl_headers
   join_node.idl.hh
   utils.idl.hh
   gossip.idl.hh
+  migration_manager.idl.hh
+  node_ops.idl.hh
   )
 
 foreach(idl_header ${idl_headers})
@@ -75,9 +77,6 @@ add_custom_target(idl-sources
   DEPENDS ${idl_sources})
 add_library(idl INTERFACE)
 add_dependencies(idl idl-sources)
-target_link_directories(idl
-  INTERFACE
-    absl::headers)
 target_include_directories(idl
   INTERFACE
     ${scylla_gen_build_dir})

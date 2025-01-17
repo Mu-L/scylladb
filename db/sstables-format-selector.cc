@@ -4,12 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include <seastar/core/coroutine.hh>
 #include "sstables-format-selector.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "replica/database.hh"
 #include "gms/gossiper.hh"
 #include "gms/feature_service.hh"
@@ -82,7 +83,7 @@ future<> sstables_format_listener::maybe_select_format(sstables::sstable_version
 }
 
 future<> sstables_format_listener::start() {
-    assert(this_shard_id() == 0);
+    SCYLLA_ASSERT(this_shard_id() == 0);
     // The listener may fire immediately, create a thread for that case.
     co_await seastar::async([this] {
         _me_feature_listener.on_enabled();

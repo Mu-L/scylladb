@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -18,7 +18,6 @@
 #include <unordered_set>
 
 #include <fmt/core.h>
-#include <seastar/core/print.hh>
 #include <seastar/core/sstring.hh>
 
 #include "auth/permission.hh"
@@ -33,7 +32,7 @@ namespace auth {
 class invalid_resource_name : public std::invalid_argument {
 public:
     explicit invalid_resource_name(std::string_view name)
-            : std::invalid_argument(format("The resource name '{}' is invalid.", name)) {
+            : std::invalid_argument(fmt::format("The resource name '{}' is invalid.", name)) {
     }
 };
 
@@ -149,7 +148,7 @@ class resource_kind_mismatch : public std::invalid_argument {
 public:
     explicit resource_kind_mismatch(resource_kind expected, resource_kind actual)
         : std::invalid_argument(
-            format("This resource has kind '{}', but was expected to have kind '{}'.", actual, expected)) {
+            fmt::format("This resource has kind '{}', but was expected to have kind '{}'.", actual, expected)) {
     }
 };
 

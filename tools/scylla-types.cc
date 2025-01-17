@@ -3,11 +3,9 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/algorithm/string/join.hpp>
-#include <boost/range/adaptor/map.hpp>
 #include <seastar/core/coroutine.hh>
 
 #include <fmt/ranges.h>
@@ -96,7 +94,7 @@ sstring to_printable_string(const compound_type<AllowPrefixes>& type, bytes_view
     for (size_t i = 0; i != values.size(); ++i) {
         printable_values.emplace_back(types.at(i)->to_string(values.at(i)));
     }
-    return format("({})", boost::algorithm::join(printable_values, ", "));
+    return seastar::format("({})", fmt::join(printable_values, ", "));
 }
 
 struct printing_visitor {
@@ -141,7 +139,7 @@ void compare_handler(type_variant type, std::vector<bytes> values, const bpo::va
     } compare_visitor{values[0], values[1]};
 
     const auto res = std::visit(compare_visitor, type);
-    sstring_view res_str;
+    std::string_view res_str;
 
     if (res == 0) {
         res_str = "==";
@@ -358,7 +356,7 @@ $ scylla types shardof --full-compound -t UTF8Type -t SimpleDateType -t UUIDType
 namespace tools {
 
 int scylla_types_main(int argc, char** argv) {
-    auto description_template =
+    constexpr auto description_template =
 R"(scylla-{} - a command-line tool to examine values belonging to scylla types.
 
 Usage: scylla {} {{action}} [--option1] [--option2] ... {{hex_value1}} [{{hex_value2}}] ...
@@ -382,11 +380,11 @@ For more information about individual actions, see their specific help:
 $ scylla types {{action}} --help
 )";
 
-    const auto operations = boost::copy_range<std::vector<operation>>(operations_with_func | boost::adaptors::map_keys);
+    const auto operations = operations_with_func | std::views::keys | std::ranges::to<std::vector>();
     tool_app_template::config app_cfg{
         .name = app_name,
-        .description = format(description_template, app_name, app_name, boost::algorithm::join(operations | boost::adaptors::transformed(
-                [] (const operation& op) { return format("* {} - {}", op.name(), op.summary()); } ), "\n")),
+        .description = seastar::format(description_template, app_name, app_name, fmt::join(operations | std::views::transform(
+                [] (const operation& op) { return fmt::format("* {} - {}", op.name(), op.summary()); } ), "\n")),
         .operations = std::move(operations),
         .global_options = &global_options,
         .global_positional_options = &global_positional_options,
@@ -398,8 +396,9 @@ $ scylla types {{action}} --help
             throw std::invalid_argument("error: missing required option '--type'");
         }
         type_variant type = [&app_config] () -> type_variant {
-            auto types = boost::copy_range<std::vector<data_type>>(app_config["type"].as<std::vector<sstring>>()
-                    | boost::adaptors::transformed([] (const sstring_view type_name) { return db::marshal::type_parser::parse(type_name); }));
+            auto types = app_config["type"].as<std::vector<sstring>>()
+                    | std::views::transform([] (const std::string_view type_name) { return db::marshal::type_parser::parse(type_name); })
+                    | std::ranges::to<std::vector<data_type>>();
             if (app_config.contains("prefix-compound")) {
                 return compound_type<allow_prefixes::yes>(std::move(types));
             } else if (app_config.contains("full-compound")) {
@@ -420,9 +419,7 @@ $ scylla types {{action}} --help
         switch (handler.index()) {
             case 0:
                 {
-                    auto values = boost::copy_range<std::vector<bytes>>(
-                            app_config["value"].as<std::vector<sstring>>() | boost::adaptors::transformed(from_hex));
-
+                    auto values = app_config["value"].as<std::vector<sstring>>() | std::views::transform(from_hex) | std::ranges::to<std::vector>();
                     std::get<bytes_func>(handler)(std::move(type), std::move(values), app_config);
                 }
                 break;

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
@@ -121,7 +121,7 @@ public:
 class no_generation_data_exception : public std::runtime_error {
 public:
     no_generation_data_exception(cdc::generation_id generation_ts)
-        : std::runtime_error(format("could not find generation data for timestamp {}", generation_ts))
+        : std::runtime_error(fmt::format("could not find generation data for timestamp {}", generation_ts))
     {}
 };
 
@@ -185,13 +185,3 @@ future<utils::chunked_vector<mutation>> get_cdc_generation_mutations_v3(
     size_t mutation_size_threshold, api::timestamp_type mutation_timestamp);
 
 } // namespace cdc
-
-#if FMT_VERSION < 100000
-// fmt v10 introduced formatter for std::exception
-template <>
-struct fmt::formatter<cdc::no_generation_data_exception> : fmt::formatter<string_view> {
-    auto format(const cdc::no_generation_data_exception& e, fmt::format_context& ctx) const {
-        return fmt::format_to(ctx.out(), "{}", e.what());
-    }
-};
-#endif

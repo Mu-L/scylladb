@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/numeric.hpp>
+#include "utils/assert.hh"
 
 #include "query-result.hh"
 #include "full_position.hh"
@@ -186,7 +185,7 @@ public:
 
     full_position calculate_last_position() const {
         auto ps = _v.partitions();
-        assert(!ps.empty());
+        SCYLLA_ASSERT(!ps.empty());
         auto pit = ps.begin();
         auto pnext = pit;
         while (++pnext != ps.end()) {

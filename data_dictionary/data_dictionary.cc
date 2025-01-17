@@ -3,10 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <ranges>
 #include "data_dictionary.hh"
+#include "cql3/description.hh"
 #include "impl.hh"
 #include "user_types_metadata.hh"
 #include "keyspace_metadata.hh"
@@ -15,11 +17,9 @@
 #include "gms/feature_service.hh"
 #include <fmt/core.h>
 #include <fmt/ranges.h>
+#include <fmt/std.h>
 #include <ios>
 #include <ostream>
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/adaptor/filtered.hpp>
-#include <boost/algorithm/string/join.hpp>
 #include <array>
 #include "replica/database.hh"
 
@@ -169,7 +169,7 @@ database::existing_index_names(std::string_view ks_name, std::string_view cf_to_
 }
 
 schema_ptr
-database::get_cdc_base_table(sstring_view ks_name, std::string_view table_name) const {
+database::get_cdc_base_table(std::string_view ks_name, std::string_view table_name) const {
     return get_cdc_base_table(*find_table(ks_name, table_name).schema());
 }
 
@@ -237,9 +237,10 @@ keyspace_metadata::new_keyspace(std::string_view name,
                                 locator::replication_strategy_config_options options,
                                 std::optional<unsigned> initial_tablets,
                                 bool durables_writes,
-                                storage_options storage_opts)
+                                storage_options storage_opts,
+                                std::vector<schema_ptr> cf_defs)
 {
-    return ::make_lw_shared<keyspace_metadata>(name, strategy_name, options, initial_tablets, durables_writes, std::vector<schema_ptr>{}, user_types_metadata{}, storage_opts);
+    return ::make_lw_shared<keyspace_metadata>(name, strategy_name, options, initial_tablets, durables_writes, cf_defs, user_types_metadata{}, storage_opts);
 }
 
 lw_shared_ptr<keyspace_metadata>
@@ -256,16 +257,18 @@ void keyspace_metadata::remove_user_type(const user_type ut) {
 }
 
 std::vector<schema_ptr> keyspace_metadata::tables() const {
-    return boost::copy_range<std::vector<schema_ptr>>(_cf_meta_data
-            | boost::adaptors::map_values
-            | boost::adaptors::filtered([] (auto&& s) { return !s->is_view(); }));
+    return _cf_meta_data
+            | std::views::values
+            | std::views::filter([] (const auto& s) { return !s->is_view(); })
+            | std::ranges::to<std::vector<schema_ptr>>();
 }
 
 std::vector<view_ptr> keyspace_metadata::views() const {
-    return boost::copy_range<std::vector<view_ptr>>(_cf_meta_data
-            | boost::adaptors::map_values
-            | boost::adaptors::filtered(std::mem_fn(&schema::is_view))
-            | boost::adaptors::transformed([] (auto&& s) { return view_ptr(s); }));
+    return _cf_meta_data
+            | std::views::values
+            | std::views::filter([] (const auto& s) { return s->is_view(); })
+            | std::views::transform([] (auto& s) { return view_ptr(s); })
+            | std::ranges::to<std::vector<view_ptr>>();
 }
 
 storage_options::local storage_options::local::from_map(const std::map<sstring, sstring>& values) {
@@ -294,8 +297,8 @@ storage_options::s3 storage_options::s3::from_map(const std::map<sstring, sstrin
     }
     if (values.size() > allowed_options.size()) {
         throw std::runtime_error(fmt::format("Extraneous options for S3: {}; allowed: {}",
-            boost::algorithm::join(values | boost::adaptors::map_keys, ","),
-            boost::algorithm::join(allowed_options | boost::adaptors::map_keys, ",")));
+            fmt::join(values | std::views::keys, ","),
+            fmt::join(allowed_options | std::views::keys, ",")));
     }
     return options;
 }
@@ -331,6 +334,49 @@ bool storage_options::can_update_to(const storage_options& new_options) {
     return value == new_options.value;
 }
 
+storage_options storage_options::append_to_s3_prefix(const sstring& s) const {
+    // when restoring from object storage, the API of /storage_service/restore
+    // provides:
+    // 1. a shared prefix
+    // 2. a list of sstables, each of which has its own partial path
+    //
+    // for example, assuming we have following API call:
+    // - shared prefix: /bucket/ks/cf
+    // - sstables
+    //   - 3123/me-3gdq_0bki_2cvk01yl83nj0tp5gh-big-TOC.txt
+    //   - 3123/me-3gdq_0bki_2edkg2vx4xtksugjj5-big-TOC.txt
+    //   - 3245/me-3gdq_0bki_2cvk02wubgncy8qd41-big-TOC.txt
+    //
+    // note, this example shows three sstables from two different snapshot backups.
+    //
+    // we assume all sstables' locations share the same base prefix (storage_options::s3::prefix).
+    // however, sstable in different backups have different prefixes. to handle this, we compose
+    // a per-sstable prefix by concatenating the shared prefix and the "parent directory" of the
+    // sstable's location. the resulting structure looks like:
+    //
+    // sstables:
+    //   - prefix: /bucket/ks/cf/3123
+    //     desc: me-3gdq_0bki_2cvk01yl83nj0tp5gh-big
+    //   - prefix: /bucket/ks/cf/3123
+    //     desc: me-3gdq_0bki_2edkg2vx4xtksugjj5-big
+    //   - prefix: /bucket/ks/cf/3145
+    //     desc: me-3gdq_0bki_2cvk02wubgncy8qd41-big
+    SCYLLA_ASSERT(!is_local_type());
+    storage_options ret = *this;
+    if (s.empty()) {
+        // scylla-manager should always pass sstables with non-empty dirname,
+        // but still..
+        return ret;
+    }
+
+    s3 s3_options = std::get<s3>(value);
+    SCYLLA_ASSERT(std::holds_alternative<sstring>(s3_options.location));
+    sstring prefix = std::get<sstring>(s3_options.location);
+    s3_options.location = seastar::format("{}/{}", prefix, s);
+    ret.value = std::move(s3_options);
+    return ret;
+}
+
 no_such_keyspace::no_such_keyspace(std::string_view ks_name)
     : runtime_error{fmt::format("Can't find a keyspace {}", ks_name)}
 {
@@ -351,32 +397,49 @@ no_such_column_family::no_such_column_family(std::string_view ks_name, const tab
 {
 }
 
-std::ostream& keyspace_metadata::describe(replica::database& db, std::ostream& os, bool with_internals) const {
-    os << "CREATE KEYSPACE " << cql3::util::maybe_quote(_name)
-       << " WITH replication = {'class': " << cql3::util::single_quote(_strategy_name);
-    for (const auto& opt: _strategy_options) {
-        os << ", " << cql3::util::single_quote(opt.first) << ": " << cql3::util::single_quote(opt.second);
-    }
-    if (!_storage_options->is_local_type()) {
-        os << "} AND storage = {'type': " << cql3::util::single_quote(sstring(_storage_options->type_string()));
-        for (const auto& e : _storage_options->to_map()) {
-            os << ", " << cql3::util::single_quote(e.first) << ": " << cql3::util::single_quote(e.second);
+cql3::description keyspace_metadata::describe(const replica::database& db, cql3::with_create_statement with_create_statement) const {
+    auto maybe_create_statement = std::invoke([&] -> std::optional<sstring> {
+        if (!with_create_statement) {
+            return std::nullopt;
         }
-    }
-    os << "} AND durable_writes = " << std::boolalpha << _durable_writes << std::noboolalpha;
-    if (db.features().tablets) {
-        if (!_initial_tablets.has_value()) {
-            os << " AND tablets = {'enabled': false}";
-        } else if (_initial_tablets.value() > 0) {
-            os << " AND tablets = {'initial': " << _initial_tablets.value() << "}";
-        }
-    }
-    os << ";";
 
-    return os;
+        std::ostringstream os;
+
+        os << "CREATE KEYSPACE " << cql3::util::maybe_quote(_name)
+           << " WITH replication = {'class': " << cql3::util::single_quote(_strategy_name);
+        for (const auto& opt: _strategy_options) {
+            os << ", " << cql3::util::single_quote(opt.first) << ": " << cql3::util::single_quote(opt.second);
+        }
+        if (!_storage_options->is_local_type()) {
+            os << "} AND storage = {'type': " << cql3::util::single_quote(sstring(_storage_options->type_string()));
+            for (const auto& e : _storage_options->to_map()) {
+                os << ", " << cql3::util::single_quote(e.first) << ": " << cql3::util::single_quote(e.second);
+            }
+        }
+        os << "} AND durable_writes = " << std::boolalpha << _durable_writes << std::noboolalpha;
+        if (db.features().tablets) {
+            if (!_initial_tablets.has_value()) {
+                os << " AND tablets = {'enabled': false}";
+            } else if (_initial_tablets.value() > 0) {
+                os << " AND tablets = {'initial': " << _initial_tablets.value() << "}";
+            } else {
+                os << " AND tablets = {'enabled': true}";
+            }
+        }
+        os << ";";
+
+        return std::move(os).str();
+    });
+
+    return cql3::description {
+        .keyspace = name(),
+        .type = "keyspace",
+        .name = name(),
+        .create_statement = std::move(maybe_create_statement)
+    };
 }
 
-}
+} // namespace data_dictionary
 
 template <>
 struct fmt::formatter<data_dictionary::user_types_metadata> {
@@ -398,4 +461,22 @@ auto fmt::formatter<data_dictionary::keyspace_metadata>::format(const data_dicti
         fmt::format_to(ctx.out(), "{{\"enabled\":false}}");
     }
     return fmt::format_to(ctx.out(), ", userTypes={}}}", m.user_types());
+}
+
+auto fmt::formatter<data_dictionary::storage_options>::format(const data_dictionary::storage_options& so, fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    return std::visit(overloaded_functor {
+        [&ctx] (const data_dictionary::storage_options::local& so) -> decltype(ctx.out()) {
+            return fmt::format_to(ctx.out(), "{}", so.dir);
+        },
+        [&ctx] (const data_dictionary::storage_options::s3& so) -> decltype(ctx.out()) {
+            return std::visit(overloaded_functor {
+                [&ctx, &so] (const sstring& prefix) -> decltype(ctx.out()) {
+                    return fmt::format_to(ctx.out(), "s3://{}/{}", so.bucket, prefix);
+                },
+                [&ctx, &so] (const table_id& owner) -> decltype(ctx.out()) {
+                    return fmt::format_to(ctx.out(), "s3://{} (owner {})", so.bucket, owner);
+                }
+            }, so.location);
+        }
+    }, so.value);
 }

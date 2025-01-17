@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -15,8 +15,10 @@
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/shared_future.hh>
 #include <seastar/core/sstring.hh>
 
+#include "cql3/description.hh"
 #include "seastarx.hh"
 #include "service/raft/raft_group0_client.hh"
 
@@ -37,6 +39,7 @@ class standard_role_manager final : public role_manager {
     future<> _stopped;
     abort_source _as;
     std::string _superuser;
+    shared_promise<> _superuser_created_promise;
 
 public:
     standard_role_manager(cql3::query_processor&, ::service::raft_group0_client&, ::service::migration_manager&);
@@ -49,6 +52,8 @@ public:
 
     virtual future<> stop() override;
 
+    virtual future<> ensure_superuser_is_created() override;
+
     virtual future<> create(std::string_view role_name, const role_config&, ::service::group0_batch&) override;
 
     virtual future<> drop(std::string_view role_name, ::service::group0_batch& mc) override;
@@ -60,6 +65,8 @@ public:
     virtual future<> revoke(std::string_view revokee_name, std::string_view role_name, ::service::group0_batch& mc) override;
 
     virtual future<role_set> query_granted(std::string_view grantee_name, recursive_role_query) override;
+
+    virtual future<role_to_directly_granted_map> query_all_directly_granted() override;
 
     virtual future<role_set> query_all() override;
 
@@ -76,6 +83,8 @@ public:
     virtual future<> set_attribute(std::string_view role_name, std::string_view attribute_name, std::string_view attribute_value, ::service::group0_batch& mc) override;
 
     virtual future<> remove_attribute(std::string_view role_name, std::string_view attribute_name, ::service::group0_batch& mc) override;
+
+    virtual future<std::vector<cql3::description>> describe_role_grants() override;
 
 private:
     enum class membership_change { add, remove };
@@ -95,4 +104,4 @@ private:
     future<> modify_membership(std::string_view role_name, std::string_view grantee_name, membership_change, ::service::group0_batch& mc);
 };
 
-}
+} // namespace auth

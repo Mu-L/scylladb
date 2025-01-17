@@ -3,12 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <fmt/ranges.h>
 #include <seastar/core/thread.hh>
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/bool_class.hh>
 #include <seastar/util/closeable.hh>
@@ -35,6 +36,8 @@
 #include "readers/empty_v2.hh"
 #include "readers/generating_v2.hh"
 #include "readers/combined.hh"
+
+BOOST_AUTO_TEST_SUITE(mutation_writer_test)
 
 using namespace mutation_writer;
 
@@ -386,14 +389,15 @@ SEASTAR_THREAD_TEST_CASE(test_timestamp_based_splitting_mutation_writer) {
 
     segregate_by_timestamp(make_mutation_reader_from_mutations_v2(random_schema.schema(), semaphore.make_permit(), muts), classify_fn, std::move(consumer)).get();
 
-    testlog.debug("Data split into {} buckets: {}", buckets.size(), boost::copy_range<std::vector<int64_t>>(buckets | boost::adaptors::map_keys));
+    testlog.debug("Data split into {} buckets: {}", buckets.size(), buckets | std::views::keys | std::ranges::to<std::vector>());
 
     assert_that_segregator_produces_correct_data(buckets, muts, semaphore.make_permit(), random_schema);
 }
 
 static void assert_that_segregator_produces_correct_data(const bucket_map_t& buckets, std::vector<mutation>& muts, reader_permit permit, tests::random_schema& random_schema) {
-    auto bucket_readers = boost::copy_range<std::vector<mutation_reader>>(buckets | boost::adaptors::map_values |
-            boost::adaptors::transformed([&random_schema, &permit] (std::vector<mutation> muts) { return make_mutation_reader_from_mutations_v2(random_schema.schema(), permit, std::move(muts)); }));
+    auto bucket_readers = buckets | std::views::values |
+            std::views::transform([&random_schema, &permit] (std::vector<mutation> muts) { return make_mutation_reader_from_mutations_v2(random_schema.schema(), permit, std::move(muts)); }) |
+            std::ranges::to<std::vector>();
     auto reader = make_combined_reader(random_schema.schema(), permit, std::move(bucket_readers), streamed_mutation::forwarding::no,
             mutation_reader::forwarding::no);
     auto close_reader = deferred_close(reader);
@@ -585,7 +589,9 @@ SEASTAR_THREAD_TEST_CASE(test_token_group_based_splitting_mutation_writer) {
 
     segregate_by_token_group(make_mutation_reader_from_mutations_v2(random_schema.schema(), semaphore.make_permit(), muts), classify_fn, std::move(consumer)).get();
 
-    testlog.info("Data split into {} buckets: {}", buckets.size(), boost::copy_range<std::vector<int64_t>>(buckets | boost::adaptors::map_keys));
+    testlog.info("Data split into {} buckets: {}", buckets.size(), buckets | std::views::keys | std::ranges::to<std::vector>());
 
     assert_that_segregator_produces_correct_data(buckets, muts, semaphore.make_permit(), random_schema);
 }
+
+BOOST_AUTO_TEST_SUITE_END()

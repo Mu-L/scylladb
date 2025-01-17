@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -23,8 +23,6 @@ void set_column_family(http_context& ctx, httpd::routes& r, sharded<db::system_k
 void unset_column_family(http_context& ctx, httpd::routes& r);
 
 table_id get_uuid(const sstring& name, const replica::database& db);
-future<> foreach_column_family(http_context& ctx, const sstring& name, std::function<void(replica::column_family&)> f);
-
 
 template<class Mapper, class I, class Reducer>
 future<I> map_reduce_cf_raw(http_context& ctx, const sstring& name, I init,

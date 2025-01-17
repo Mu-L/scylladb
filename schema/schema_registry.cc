@@ -3,15 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include <seastar/core/sharded.hh>
 
 #include "schema_registry.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "db/schema_tables.hh"
 #include "view_info.hh"
+#include "replica/database.hh"
 
 static logging::logger slogger("schema_registry");
 
@@ -39,7 +41,7 @@ schema_registry_entry::schema_registry_entry(table_schema_version v, schema_regi
 {
     _erase_timer.set_callback([this] {
         slogger.debug("Dropping {}", _version);
-        assert(!_schema);
+        SCYLLA_ASSERT(!_schema);
         try {
             _registry._entries.erase(_version);
         } catch (...) {
@@ -246,7 +248,7 @@ void schema_registry_entry::detach_schema() noexcept {
 }
 
 frozen_schema schema_registry_entry::frozen() const {
-    assert(_state >= state::LOADED);
+    SCYLLA_ASSERT(_state >= state::LOADED);
     return *_frozen_schema;
 }
 
@@ -313,7 +315,7 @@ global_schema_ptr::global_schema_ptr(const global_schema_ptr& o)
 
 global_schema_ptr::global_schema_ptr(global_schema_ptr&& o) noexcept {
     auto current = this_shard_id();
-    assert(o._cpu_of_origin == current);
+    SCYLLA_ASSERT(o._cpu_of_origin == current);
     _ptr = std::move(o._ptr);
     _cpu_of_origin = current;
     _base_schema = std::move(o._base_schema);

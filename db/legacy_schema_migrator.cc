@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 // Since Scylla 2.0, we use system tables whose schemas were introduced in
@@ -32,7 +32,6 @@
 #include "schema/schema_builder.hh"
 #include "service/storage_proxy.hh"
 #include "utils/rjson.hh"
-#include "utils/fmt-compat.hh"
 #include "cql3/query_processor.hh"
 #include "cql3/untyped_result_set.hh"
 #include "cql3/util.hh"
@@ -386,9 +385,9 @@ public:
                 try {
                     builder.set_compaction_strategy(sstables::compaction_strategy::type(strategy));
                 } catch (const exceptions::configuration_exception& e) {
-                    // If compaction strategy class isn't supported, fallback to size tiered.
-                    mlogger.warn("Falling back to size-tiered compaction strategy after the problem: {}", e.what());
-                    builder.set_compaction_strategy(sstables::compaction_strategy_type::size_tiered);
+                    // If compaction strategy class isn't supported, fallback to incremental.
+                    mlogger.warn("Falling back to incremental compaction strategy after the problem: {}", e.what());
+                    builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
                 }
             }
             if (td.has("compaction_strategy_options")) {

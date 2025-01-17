@@ -3,18 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/thread.hh>
 #include <fmt/ranges.h>
-#include <boost/algorithm/string/join.hpp>
 #include <boost/make_shared.hpp>
-#include <boost/range/adaptor/transformed.hpp>
 
 #include "db/config.hh"
 #include "db/extensions.hh"
 #include "tools/utils.hh"
+#include "utils/assert.hh"
 #include "utils/logalloc.hh"
 #include "init.hh"
 
@@ -23,10 +22,25 @@ namespace bpo = boost::program_options;
 namespace tools::utils {
 
 bool operation::matches(std::string_view name) const {
-    return _name == name || std::ranges::find(_aliases, name) != _aliases.end();
+    return _name[0] == name || std::ranges::find(_aliases, name) != _aliases.end();
 }
 
 namespace {
+
+bool is_help(const sstring& op) {
+    return op == "--help" || op == "-h";
+}
+
+std::vector<std::string_view> get_all_operation_names(const std::vector<operation>& operations) {
+    std::vector<std::string_view> all_operation_names;
+    for (const auto& op : operations) {
+        all_operation_names.push_back(op.name());
+        for (const auto& alias : op.aliases()) {
+            all_operation_names.push_back(alias);
+        }
+    }
+    return all_operation_names;
+}
 
 // Extract the operation from the argv.
 //
@@ -93,21 +107,31 @@ const operation* get_selected_operation(int& ac, char**& av, const std::vector<o
             if (op_name == av[i]) {
                 std::shift_left(av + i, av + ac, 1);
                 --ac;
+                while (!found->suboperations().empty()) {
+                    sstring subop = i < ac ? av[i] : "";
+                    if (is_help(subop)) {
+                        break;
+                    }
+                    auto& suboperations = found->suboperations();
+                    found = std::ranges::find_if(suboperations, [&subop] (auto& op) {
+                        return op.matches(subop);
+                    });
+                    if (found != suboperations.end()) {
+                        op_name += format(" {}", subop);
+                        std::shift_left(av + i, av + ac, 1);
+                        --ac;
+                        continue;
+                    }
+                    fmt::print(std::cerr, "error: unrecognized suboperation of {}: expected one of ({}), got {}\n", op_name, get_all_operation_names(suboperations), subop);
+                    exit(100);
+                }
                 break;
             }
         }
         return &*found;
     }
 
-    std::vector<std::string_view> all_operation_names;
-    for (const auto& op : operations) {
-        all_operation_names.push_back(op.name());
-        for (const auto& alias : op.aliases()) {
-            all_operation_names.push_back(alias);
-        }
-    }
-
-    fmt::print(std::cerr, "error: unrecognized operation argument: expected one of ({}), got {}\n", all_operation_names, op_name);
+    fmt::print(std::cerr, "error: unrecognized operation argument: expected one of ({}), got {}\n", get_all_operation_names(operations), op_name);
     exit(100);
 }
 
@@ -123,7 +147,13 @@ void configure_tool_mode(app_template::seastar_options& opts, const sstring& log
     opts.reactor_opts.relaxed_dma.set_value();
     opts.reactor_opts.unsafe_bypass_fsync.set_value(true);
     opts.reactor_opts.kernel_page_cache.set_value(true);
-    opts.reactor_opts.reactor_backend.select_candidate("epoll");
+    if (std::ranges::contains(opts.reactor_opts.reactor_backend.get_candidate_names(), "io_uring")) {
+        opts.reactor_opts.reactor_backend.select_candidate("io_uring");
+    } else {
+        // On some systems (e.g. docker), io_uring is not available.
+        // In this case fall back to epoll.
+        opts.reactor_opts.reactor_backend.select_candidate("epoll");
+    }
     opts.smp_opts.thread_affinity.set_value(false);
     opts.smp_opts.mbind.set_value(false);
     opts.smp_opts.smp.set_value(1);
@@ -170,7 +200,7 @@ int tool_app_template::run_async(int argc, char** argv, noncopyable_function<int
     app_cfg.name = format("scylla-{}", _cfg.name);
 
     if (found_op) {
-        app_cfg.description = format("{}\n\n{}\n", found_op->summary(), found_op->description());
+        app_cfg.description = seastar::format("{}\n\n{}\n", found_op->summary(), found_op->description());
     } else {
         app_cfg.description = _cfg.description;
     }
@@ -220,7 +250,7 @@ int tool_app_template::run_async(int argc, char** argv, noncopyable_function<int
             ns.notify_all(configurable::system_state::started).get();
 
             logalloc::use_standard_allocator_segment_pool_backend(_cfg.lsa_segment_pool_backend_size_mb * 1024 * 1024).get();
-            assert(found_op);
+            SCYLLA_ASSERT(found_op);
             auto res = main_func(*found_op, app.configuration());
 
             ns.notify_all(configurable::system_state::stopped).get();

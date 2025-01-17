@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <fmt/ranges.h>
@@ -15,6 +15,7 @@
 #include <seastar/http/exception.hh>
 #include "sstables/sstables.hh"
 #include "sstables/metadata_collector.hh"
+#include "utils/assert.hh"
 #include "utils/estimated_histogram.hh"
 #include <algorithm>
 #include "db/system_keyspace.hh"
@@ -22,6 +23,9 @@
 #include "storage_service.hh"
 #include "compaction/compaction_manager.hh"
 #include "unimplemented.hh"
+
+#include <boost/range/algorithm/copy.hpp>
+#include <boost/range/numeric.hpp>
 
 extern logging::logger apilog;
 
@@ -60,14 +64,6 @@ table_id get_uuid(const sstring& name, const replica::database& db) {
     return get_uuid(ks, cf, db);
 }
 
-future<> foreach_column_family(http_context& ctx, const sstring& name, std::function<void(replica::column_family&)> f) {
-    auto uuid = get_uuid(name, ctx.db.local());
-
-    return ctx.db.invoke_on_all([f, uuid](replica::database& db) {
-        f(db.find_column_family(uuid));
-    });
-}
-
 future<json::json_return_type>  get_cf_stats(http_context& ctx, const sstring& name,
         int64_t replica::column_family_stats::*f) {
     return map_reduce_cf(ctx, name, int64_t(0), [f](const replica::column_family& cf) {
@@ -82,7 +78,7 @@ future<json::json_return_type>  get_cf_stats(http_context& ctx,
     }, std::plus<int64_t>());
 }
 
-static future<json::json_return_type> set_tables(http_context& ctx, const sstring& keyspace, std::vector<sstring> tables, std::function<future<>(replica::table&)> set) {
+static future<json::json_return_type> for_tables_on_all_shards(http_context& ctx, const sstring& keyspace, std::vector<sstring> tables, std::function<future<>(replica::table&)> set) {
     if (tables.empty()) {
         tables = map_keys(ctx.db.local().find_keyspace(keyspace).metadata().get()->cf_meta_data());
     }
@@ -103,7 +99,7 @@ class autocompaction_toggle_guard {
     replica::database& _db;
 public:
     autocompaction_toggle_guard(replica::database& db) : _db(db) {
-        assert(this_shard_id() == 0);
+        SCYLLA_ASSERT(this_shard_id() == 0);
         if (!_db._enable_autocompaction_toggle) {
             throw std::runtime_error("Autocompaction toggle is busy");
         }
@@ -112,7 +108,7 @@ public:
     autocompaction_toggle_guard(const autocompaction_toggle_guard&) = delete;
     autocompaction_toggle_guard(autocompaction_toggle_guard&&) = default;
     ~autocompaction_toggle_guard() {
-        assert(this_shard_id() == 0);
+        SCYLLA_ASSERT(this_shard_id() == 0);
         _db._enable_autocompaction_toggle = true;
     }
 };
@@ -122,7 +118,7 @@ static future<json::json_return_type> set_tables_autocompaction(http_context& ct
 
     return ctx.db.invoke_on(0, [&ctx, keyspace, tables = std::move(tables), enabled] (replica::database& db) {
         auto g = autocompaction_toggle_guard(db);
-        return set_tables(ctx, keyspace, tables, [enabled] (replica::table& cf) {
+        return for_tables_on_all_shards(ctx, keyspace, tables, [enabled] (replica::table& cf) {
             if (enabled) {
                 cf.enable_auto_compaction();
             } else {
@@ -135,7 +131,7 @@ static future<json::json_return_type> set_tables_autocompaction(http_context& ct
 
 static future<json::json_return_type> set_tables_tombstone_gc(http_context& ctx, const sstring &keyspace, std::vector<sstring> tables, bool enabled) {
     apilog.info("set_tables_tombstone_gc: enabled={} keyspace={} tables={}", enabled, keyspace, tables);
-    return set_tables(ctx, keyspace, std::move(tables), [enabled] (replica::table& t) {
+    return for_tables_on_all_shards(ctx, keyspace, std::move(tables), [enabled] (replica::table& t) {
         t.set_tombstone_gc_enabled(enabled);
         return make_ready_future<>();
     });
@@ -205,8 +201,8 @@ static future<json::json_return_type> get_cf_histogram(http_context& ctx, utils:
     };
     return ctx.db.map(fun).then([](const std::vector<utils::ihistogram> &res) {
         std::vector<httpd::utils_json::histogram> r;
-        boost::copy(res | boost::adaptors::transformed(to_json), std::back_inserter(r));
-        return make_ready_future<json::json_return_type>(r);
+        std::ranges::copy(res | std::views::transform(to_json), std::back_inserter(r));
+        return make_ready_future<json::json_return_type>(std::move(r));
     });
 }
 
@@ -232,7 +228,7 @@ static future<json::json_return_type> get_cf_rate_and_histogram(http_context& ct
     };
     return ctx.db.map(fun).then([](const std::vector<utils::rate_moving_average_and_histogram> &res) {
         std::vector<httpd::utils_json::rate_moving_average_and_histogram> r;
-        boost::copy(res | boost::adaptors::transformed(timer_to_json), std::back_inserter(r));
+        std::ranges::copy(res | std::views::transform(timer_to_json), std::back_inserter(r));
         return make_ready_future<json::json_return_type>(r);
     });
 }
@@ -366,6 +362,14 @@ ratio_holder filter_recent_false_positive_as_ratio_holder(const sstables::shared
     return ratio_holder(f + sst->filter_get_recent_true_positive(), f);
 }
 
+uint64_t accumulate_on_active_memtables(replica::table& t, noncopyable_function<uint64_t(replica::memtable& mt)> action) {
+    uint64_t ret = 0;
+    t.for_each_active_memtable([&] (replica::memtable& mt) {
+        ret += action(mt);
+    });
+    return ret;
+}
+
 void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace>& sys_ks) {
     cf::get_column_family_name.set(r, [&ctx] (const_req req){
         std::vector<sstring> res;
@@ -401,13 +405,13 @@ void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace
 
     cf::get_memtable_columns_count.set(r, [&ctx] (std::unique_ptr<http::request> req) {
         return map_reduce_cf(ctx, req->get_path_param("name"), uint64_t{0}, [](replica::column_family& cf) {
-            return boost::accumulate(cf.active_memtables() | boost::adaptors::transformed(std::mem_fn(&replica::memtable::partition_count)), uint64_t(0));
+            return accumulate_on_active_memtables(cf, std::mem_fn(&replica::memtable::partition_count));
         }, std::plus<>());
     });
 
     cf::get_all_memtable_columns_count.set(r, [&ctx] (std::unique_ptr<http::request> req) {
         return map_reduce_cf(ctx, uint64_t{0}, [](replica::column_family& cf) {
-            return boost::accumulate(cf.active_memtables() | boost::adaptors::transformed(std::mem_fn(&replica::memtable::partition_count)), uint64_t(0));
+            return accumulate_on_active_memtables(cf, std::mem_fn(&replica::memtable::partition_count));
         }, std::plus<>());
     });
 
@@ -421,33 +425,33 @@ void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace
 
     cf::get_memtable_off_heap_size.set(r, [&ctx] (std::unique_ptr<http::request> req) {
         return map_reduce_cf(ctx, req->get_path_param("name"), int64_t(0), [](replica::column_family& cf) {
-            return boost::accumulate(cf.active_memtables() | boost::adaptors::transformed([] (replica::memtable* active_memtable) {
-                return active_memtable->region().occupancy().total_space();
-            }), uint64_t(0));
+            return accumulate_on_active_memtables(cf, [] (replica::memtable& active_memtable) {
+                return active_memtable.region().occupancy().total_space();
+            });
         }, std::plus<int64_t>());
     });
 
     cf::get_all_memtable_off_heap_size.set(r, [&ctx] (std::unique_ptr<http::request> req) {
         return map_reduce_cf(ctx, int64_t(0), [](replica::column_family& cf) {
-            return boost::accumulate(cf.active_memtables() | boost::adaptors::transformed([] (replica::memtable* active_memtable) {
-                return active_memtable->region().occupancy().total_space();
-            }), uint64_t(0));
+            return accumulate_on_active_memtables(cf, [] (replica::memtable& active_memtable) {
+                return active_memtable.region().occupancy().total_space();
+            });
         }, std::plus<int64_t>());
     });
 
     cf::get_memtable_live_data_size.set(r, [&ctx] (std::unique_ptr<http::request> req) {
         return map_reduce_cf(ctx, req->get_path_param("name"), int64_t(0), [](replica::column_family& cf) {
-            return boost::accumulate(cf.active_memtables() | boost::adaptors::transformed([] (replica::memtable* active_memtable) {
-                return active_memtable->region().occupancy().used_space();
-            }), uint64_t(0));
+            return accumulate_on_active_memtables(cf, [] (replica::memtable& active_memtable) {
+                return active_memtable.region().occupancy().used_space();
+            });
         }, std::plus<int64_t>());
     });
 
     cf::get_all_memtable_live_data_size.set(r, [&ctx] (std::unique_ptr<http::request> req) {
         return map_reduce_cf(ctx, int64_t(0), [](replica::column_family& cf) {
-            return boost::accumulate(cf.active_memtables() | boost::adaptors::transformed([] (replica::memtable* active_memtable) {
-                return active_memtable->region().occupancy().used_space();
-            }), uint64_t(0));
+            return accumulate_on_active_memtables(cf, [] (replica::memtable& active_memtable) {
+                return active_memtable.region().occupancy().used_space();
+            });
         }, std::plus<int64_t>());
     });
 
@@ -485,9 +489,9 @@ void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace
     cf::get_all_cf_all_memtables_live_data_size.set(r, [&ctx] (std::unique_ptr<http::request> req) {
         warn(unimplemented::cause::INDEXES);
         return map_reduce_cf(ctx, int64_t(0), [](replica::column_family& cf) {
-            return boost::accumulate(cf.active_memtables() | boost::adaptors::transformed([] (replica::memtable* active_memtable) {
-                return active_memtable->region().occupancy().used_space();
-            }), uint64_t(0));
+            return accumulate_on_active_memtables(cf, [] (replica::memtable& active_memtable) {
+                return active_memtable.region().occupancy().used_space();
+            });
         }, std::plus<int64_t>());
     });
 
@@ -714,25 +718,25 @@ void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace
 
     cf::get_bloom_filter_false_ratio.set(r, [&ctx] (std::unique_ptr<http::request> req) {
         return map_reduce_cf(ctx, req->get_path_param("name"), ratio_holder(), [] (replica::column_family& cf) {
-            return boost::accumulate(*cf.get_sstables() | boost::adaptors::transformed(filter_false_positive_as_ratio_holder), ratio_holder());
+            return std::ranges::fold_left(*cf.get_sstables() | std::views::transform(filter_false_positive_as_ratio_holder), ratio_holder(), std::plus{});
         }, std::plus<>());
     });
 
     cf::get_all_bloom_filter_false_ratio.set(r, [&ctx] (std::unique_ptr<http::request> req) {
         return map_reduce_cf(ctx, ratio_holder(), [] (replica::column_family& cf) {
-            return boost::accumulate(*cf.get_sstables() | boost::adaptors::transformed(filter_false_positive_as_ratio_holder), ratio_holder());
+            return std::ranges::fold_left(*cf.get_sstables() | std::views::transform(filter_false_positive_as_ratio_holder), ratio_holder(), std::plus{});
         }, std::plus<>());
     });
 
     cf::get_recent_bloom_filter_false_ratio.set(r, [&ctx] (std::unique_ptr<http::request> req) {
         return map_reduce_cf(ctx, req->get_path_param("name"), ratio_holder(), [] (replica::column_family& cf) {
-            return boost::accumulate(*cf.get_sstables() | boost::adaptors::transformed(filter_recent_false_positive_as_ratio_holder), ratio_holder());
+            return std::ranges::fold_left(*cf.get_sstables() | std::views::transform(filter_recent_false_positive_as_ratio_holder), ratio_holder(), std::plus{});
         }, std::plus<>());
     });
 
     cf::get_all_recent_bloom_filter_false_ratio.set(r, [&ctx] (std::unique_ptr<http::request> req) {
         return map_reduce_cf(ctx, ratio_holder(), [] (replica::column_family& cf) {
-            return boost::accumulate(*cf.get_sstables() | boost::adaptors::transformed(filter_recent_false_positive_as_ratio_holder), ratio_holder());
+            return std::ranges::fold_left(*cf.get_sstables() | std::views::transform(filter_recent_false_positive_as_ratio_holder), ratio_holder(), std::plus{});
         }, std::plus<>());
     });
 
@@ -989,11 +993,13 @@ void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace
         auto ks_cf = parse_fully_qualified_cf_name(req->get_path_param("name"));
         auto&& ks = std::get<0>(ks_cf);
         auto&& cf_name = std::get<1>(ks_cf);
-        return sys_ks.local().load_view_build_progress().then([ks, cf_name, &ctx](const std::vector<db::system_keyspace_view_build_progress>& vb) mutable {
+        // Use of load_built_views() as filtering table should be in sync with
+        // built_indexes_virtual_reader filtering with BUILT_VIEWS table
+        return sys_ks.local().load_built_views().then([ks, cf_name, &ctx](const std::vector<db::system_keyspace::view_name>& vb) mutable {
             std::set<sstring> vp;
             for (auto b : vb) {
-                if (b.view.first == ks) {
-                    vp.insert(b.view.second);
+                if (b.first == ks) {
+                    vp.insert(b.second);
                 }
             }
             std::vector<sstring> res;
@@ -1001,7 +1007,7 @@ void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace
             replica::column_family& cf = ctx.db.local().find_column_family(uuid);
             res.reserve(cf.get_index_manager().list_indexes().size());
             for (auto&& i : cf.get_index_manager().list_indexes()) {
-                if (!vp.contains(secondary_index::index_table_name(i.metadata().name()))) {
+                if (vp.contains(secondary_index::index_table_name(i.metadata().name()))) {
                     res.emplace_back(i.metadata().name());
                 }
             }
@@ -1047,12 +1053,12 @@ void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace
     });
 
     cf::set_compaction_strategy_class.set(r, [&ctx](std::unique_ptr<http::request> req) {
+        auto [ks, cf] = parse_fully_qualified_cf_name(req->get_path_param("name"));
         sstring strategy = req->get_query_param("class_name");
         apilog.info("column_family/set_compaction_strategy_class: name={} strategy={}", req->get_path_param("name"), strategy);
-        return foreach_column_family(ctx, req->get_path_param("name"), [strategy](replica::column_family& cf) {
+        return for_tables_on_all_shards(ctx, ks, {std::move(cf)}, [strategy] (replica::table& cf) {
             cf.set_compaction_strategy(sstables::compaction_strategy::type(strategy));
-        }).then([] {
-                return make_ready_future<json::json_return_type>(json_void());
+            return make_ready_future<>();
         });
     });
 
@@ -1086,7 +1092,7 @@ void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace
 
         return ctx.db.map_reduce0([key, uuid] (replica::database& db) -> future<std::unordered_set<sstring>> {
             auto sstables = co_await db.find_column_family(uuid).get_sstables_by_partition_key(key);
-            co_return boost::copy_range<std::unordered_set<sstring>>(sstables | boost::adaptors::transformed([] (auto s) { return s->get_filename(); }));
+            co_return sstables | std::views::transform([] (auto s) { return s->get_filename(); }) | std::ranges::to<std::unordered_set>();
         }, std::unordered_set<sstring>(),
         [](std::unordered_set<sstring> a, std::unordered_set<sstring>&& b) mutable {
             a.merge(b);
@@ -1106,7 +1112,7 @@ void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace
         api::req_param<unsigned> list_size(*req, "list_size", 10);
 
         apilog.info("toppartitions query: name={} duration={} list_size={} capacity={}",
-            name, duration.param, list_size.param, capacity.param);
+            name, duration.value, list_size.value, capacity.value);
 
         return seastar::do_with(db::toppartitions_query(ctx.db, {{ks, cf}}, {}, duration.value, list_size, capacity), [&ctx] (db::toppartitions_query& q) {
             return run_toppartitions_query(q, ctx, true);
@@ -1117,6 +1123,7 @@ void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace
         auto params = req_params({
             std::pair("name", mandatory::yes),
             std::pair("flush_memtables", mandatory::no),
+            std::pair("consider_only_existing_data", mandatory::no),
             std::pair("split_output", mandatory::no),
         });
         params.process(*req);
@@ -1125,7 +1132,8 @@ void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace
         }
         auto [ks, cf] = parse_fully_qualified_cf_name(*params.get("name"));
         auto flush = params.get_as<bool>("flush_memtables").value_or(true);
-        apilog.info("column_family/force_major_compaction: name={} flush={}", req->get_path_param("name"), flush);
+        auto consider_only_existing_data = params.get_as<bool>("consider_only_existing_data").value_or(false);
+        apilog.info("column_family/force_major_compaction: name={} flush={} consider_only_existing_data={}", req->get_path_param("name"), flush, consider_only_existing_data);
 
         auto keyspace = validate_keyspace(ctx, ks);
         std::vector<table_info> table_infos = {table_info{
@@ -1135,10 +1143,10 @@ void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace
 
         auto& compaction_module = ctx.db.local().get_compaction_manager().get_task_manager_module();
         std::optional<flush_mode> fmopt;
-        if (!flush) {
+        if (!flush && !consider_only_existing_data) {
             fmopt = flush_mode::skip;
         }
-        auto task = co_await compaction_module.make_and_start_task<major_keyspace_compaction_task_impl>({}, std::move(keyspace), tasks::task_id::create_null_id(), ctx.db, std::move(table_infos), fmopt);
+        auto task = co_await compaction_module.make_and_start_task<major_keyspace_compaction_task_impl>({}, std::move(keyspace), tasks::task_id::create_null_id(), ctx.db, std::move(table_infos), fmopt, consider_only_existing_data);
         co_await task->done();
         co_return json_void();
     });

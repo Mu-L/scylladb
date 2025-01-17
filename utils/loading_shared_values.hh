@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <vector>
-#include <memory>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/future.hh>
@@ -200,7 +200,7 @@ public:
     loading_shared_values(loading_shared_values&&) = default;
     loading_shared_values(const loading_shared_values&) = delete;
     ~loading_shared_values() {
-         assert(!_set.size());
+         SCYLLA_ASSERT(!_set.size());
     }
 
     /// \brief

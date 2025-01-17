@@ -1,6 +1,6 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Various utility functions which are useful for multiple tests
 
@@ -117,6 +117,8 @@ def freeze(item):
         return frozenset((key, freeze(value)) for key, value in item.items())
     elif isinstance(item, list):
         return tuple(freeze(value) for value in item)
+    elif isinstance(item, bytearray):
+        return bytes(item)
     return item
 
 def multiset(items):
@@ -136,9 +138,14 @@ unique_table_name.last_ms = 0
 
 def create_test_table(dynamodb, **kwargs):
     name = unique_table_name()
+    BillingMode = 'PAY_PER_REQUEST'
+    if 'BillingMode' in kwargs:
+        BillingMode = kwargs['BillingMode']
+        del kwargs['BillingMode']
+
     print("fixture creating new table {}".format(name))
     table = dynamodb.create_table(TableName=name,
-        BillingMode='PAY_PER_REQUEST', **kwargs)
+        BillingMode=BillingMode, **kwargs)
     waiter = table.meta.client.get_waiter('table_exists')
     # recheck every second instead of the default, lower, frequency. This can
     # save a few seconds on AWS with its very slow table creation, but can

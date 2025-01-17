@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -24,6 +24,7 @@ namespace db::view {
  * to its maximum size.
  */
 class update_backlog {
+    static constexpr float admission_control_threshold = 0.8;
     size_t _current;
     size_t _max;
 
@@ -39,8 +40,14 @@ public:
     }
     update_backlog() = delete;
 
+    // Returns the number of bytes in the backlog divided by the maximum number of bytes
+    // that the backlog can hold before employing admission control. While the backlog
+    // is below the threshold, the coordinator will slow down the view updates up to
+    // calculate_view_update_throttling_delay()::delay_limit_us. Above the threshold,
+    // the coordinator will reject the writes that would increase the backlog. On the
+    // replica, the writes will start failing only after reaching the hard limit '_max'.
     float relative_size() const {
-        return float(_current) / float(_max);
+        return float(_current) / float(_max) / admission_control_threshold;
     }
 
     const size_t& get_current_bytes() const {
@@ -75,5 +82,6 @@ public:
 // See: https://www.scylladb.com/2018/12/04/worry-free-ingestion-flow-control/
 std::chrono::microseconds calculate_view_update_throttling_delay(
     update_backlog backlog,
-    db::timeout_clock::time_point timeout);
+    db::timeout_clock::time_point timeout,
+    uint32_t view_flow_control_delay_limit_in_ms);
 }

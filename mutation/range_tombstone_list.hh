@@ -3,14 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <seastar/util/defer.hh>
+#include <boost/intrusive/set.hpp>
 #include "range_tombstone.hh"
 #include "query-request.hh"
+#include "utils/assert.hh"
 #include "utils/preempt.hh"
 #include "utils/chunked_vector.hh"
 #include <variant>
@@ -221,7 +223,7 @@ public:
 public:
     tombstone search_tombstone_covering(const schema& s, const clustering_key_prefix& key) const;
 
-    using iterator_range = boost::iterator_range<const_iterator>;
+    using iterator_range = std::ranges::subrange<const_iterator>;
     // Returns range tombstones which overlap with given range
     iterator_range slice(const schema& s, const query::clustering_range&) const;
     // Returns range tombstones which overlap with [start, end)
@@ -238,7 +240,7 @@ public:
     // The list is assumed not to be empty
     range_tombstone pop_front_and_lock() {
         range_tombstone_entry* rt = _tombstones.unlink_leftmost_without_rebalance();
-        assert(rt != nullptr);
+        SCYLLA_ASSERT(rt != nullptr);
         auto _ = seastar::defer([rt] () noexcept { current_deleter<range_tombstone_entry>()(rt); });
         return std::move(rt->tombstone());
     }

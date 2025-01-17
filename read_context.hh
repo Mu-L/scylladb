@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include "schema/schema_fwd.hh"
 #include "query-request.hh"
 #include "mutation/mutation_fragment.hh"
@@ -73,7 +74,7 @@ public:
         }
         auto mfopt = co_await (*_reader)();
         if (mfopt) {
-            assert(mfopt->is_partition_start());
+            SCYLLA_ASSERT(mfopt->is_partition_start());
             _new_last_key = mfopt->as_partition_start().key();
         }
         co_return std::move(mfopt);
@@ -121,7 +122,6 @@ class read_context final : public enable_lw_shared_from_this<read_context> {
     reader_permit _permit;
     const dht::partition_range& _range;
     const query::partition_slice& _slice;
-    std::optional<query::partition_slice> _native_slice;
     tracing::trace_state_ptr _trace_state;
     mutation_reader::forwarding _fwd_mr;
     bool _range_query;
@@ -162,9 +162,6 @@ public:
         , _tombstone_gc_state(gc_state)
         , _underlying(_cache, *this)
     {
-        if (_slice.is_reversed()) {
-            _native_slice = query::legacy_reverse_slice_to_native_reverse_slice(*_schema, _slice);
-        }
         ++_cache._tracker._stats.reads;
         if (!_range_query) {
             _key = range.start()->value().as_decorated_key();
@@ -187,7 +184,7 @@ public:
     const query::partition_slice& slice() const { return _slice; }
     bool is_reversed() const { return _slice.is_reversed(); }
     // Returns a slice in the native format (for reversed reads, in native-reversed format).
-    const query::partition_slice& native_slice() const { return is_reversed() ? *_native_slice : _slice; }
+    const query::partition_slice& native_slice() const { return _slice; }
     tracing::trace_state_ptr trace_state() const { return _trace_state; }
     mutation_reader::forwarding fwd_mr() const { return _fwd_mr; }
     bool is_range_query() const { return _range_query; }

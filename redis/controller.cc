@@ -3,17 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/coroutine/switch_to.hh>
+#include <seastar/core/with_scheduling_group.hh>
+
 #include "timeout_config.hh"
 #include "redis/controller.hh"
 #include "redis/keyspace_utils.hh"
 #include "redis/server.hh"
 #include "service/storage_proxy.hh"
 #include "db/config.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "auth/common.hh"
 
 static logging::logger slogger("controller");

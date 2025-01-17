@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -13,7 +13,6 @@
 #include "sstables/sstables.hh"
 #include "sstables/shared_sstable.hh"
 #include "sstables/index_reader.hh"
-#include "sstables/binary_search.hh"
 #include "sstables/writer.hh"
 #include "compaction/compaction_manager.hh"
 #include "replica/memtable-sstable.hh"
@@ -45,10 +44,6 @@ public:
 
     summary& _summary() {
         return _sst->_components->summary;
-    }
-
-    future<temporary_buffer<char>> data_read(reader_permit permit, uint64_t pos, size_t len) {
-        return _sst->data_read(pos, len, std::move(permit));
     }
 
     std::unique_ptr<index_reader> make_index_reader(reader_permit permit) {
@@ -92,10 +87,6 @@ public:
         return _sst->read_statistics();
     }
 
-    statistics& get_statistics() {
-        return _sst->_components->statistics;
-    }
-
     future<> read_summary() noexcept {
         return _sst->read_summary();
     }
@@ -104,33 +95,8 @@ public:
         return _sst->read_summary_entry(i);
     }
 
-    summary& get_summary() {
-        return _sst->_components->summary;
-    }
-
-    summary move_summary() {
-        return std::move(_sst->_components->summary);
-    }
-
-    future<> read_toc() noexcept {
-        return _sst->read_toc();
-    }
-
     auto& get_components() {
         return _sst->_recognized_components;
-    }
-
-    template <typename T>
-    int binary_search(const dht::i_partitioner& p, const T& entries, const key& sk) {
-        return sstables::binary_search(p, entries, sk);
-    }
-
-    void change_generation_number(sstables::generation_type generation) {
-        _sst->_generation = generation;
-    }
-
-    void change_dir(sstring dir) {
-        _sst->_storage->change_dir_for_test(dir);
     }
 
     void set_data_file_size(uint64_t size) {
@@ -145,11 +111,13 @@ public:
         _sst->_run_identifier = identifier;
     }
 
-    future<> store() {
+    future<> store(sstring dir, sstables::generation_type generation) {
+        _sst->_generation = generation;
+        co_await _sst->_storage->change_dir_for_test(dir);
         _sst->_recognized_components.erase(component_type::Index);
         _sst->_recognized_components.erase(component_type::Data);
-        return seastar::async([sst = _sst] {
-            sst->open_sstable();
+        co_await seastar::async([sst = _sst] {
+            sst->open_sstable("test");
             sst->write_statistics();
             sst->write_compression();
             sst->write_filter();
@@ -184,8 +152,9 @@ public:
         _sst->_shards.push_back(this_shard_id());
     }
 
-    void rewrite_toc_without_scylla_component() {
-        _sst->_recognized_components.erase(component_type::Scylla);
+    void rewrite_toc_without_component(component_type component) {
+        SCYLLA_ASSERT(component != component_type::TOC);
+        _sst->_recognized_components.erase(component);
         remove_file(_sst->filename(component_type::TOC)).get();
         _sst->_storage->open(*_sst);
         _sst->seal_sstable(false).get();
@@ -237,6 +206,10 @@ public:
     const utils::filter_ptr& get_filter() const {
         return _sst->_components->filter;
     }
+
+    void set_digest(std::optional<uint32_t> digest) {
+        _sst->_components->digest = digest;
+    }
 };
 
 inline auto replacer_fn_no_op() {
@@ -274,3 +247,4 @@ inline shared_sstable make_sstable_easy(test_env& env, lw_shared_ptr<replica::me
 }
 
 lw_shared_ptr<replica::memtable> make_memtable(schema_ptr s, const std::vector<mutation>& muts);
+std::vector<replica::memtable*> active_memtables(replica::table& t);

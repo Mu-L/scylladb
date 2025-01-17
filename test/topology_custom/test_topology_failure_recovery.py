@@ -1,10 +1,9 @@
 #
 # Copyright (C) 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 from test.pylib.manager_client import ManagerClient
-from test.pylib.internal_types import ServerInfo
 from test.pylib.scylla_cluster import ReplaceConfig
 from test.topology.conftest import skip_mode
 import pytest

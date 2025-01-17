@@ -3,11 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/future.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 
 #include "tracing/traced_file.hh"
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 /*
@@ -124,6 +124,8 @@ public:
         uint64_t sstables_read = 0;
         // Permits waiting on something: admission, memory or execution
         uint64_t waiters = 0;
+
+        friend auto operator<=>(const stats&, const stats&) = default;
     };
 
     using permit_list_type = bi::list<
@@ -231,6 +233,8 @@ private:
 
     void maybe_admit_waiters() noexcept;
 
+    void maybe_wake_execution_loop() noexcept;
+
     // Request more memory for the permit.
     // Request is instantly granted while memory consumption of all reads is
     // below _kill_limit_multiplier.
@@ -316,7 +320,7 @@ public:
             utils::updateable_value<uint32_t> cpu_concurrency = utils::updateable_value<uint32_t>(1),
             register_metrics metrics = register_metrics::no)
         : reader_concurrency_semaphore(utils::updateable_value(count), memory, std::move(name), max_queue_length, std::move(serialize_limit_multipler),
-                std::move(kill_limit_multipler), std::move(cpu_concurrency), register_metrics::no)
+                std::move(kill_limit_multipler), std::move(cpu_concurrency), metrics)
     {}
 
     virtual ~reader_concurrency_semaphore();

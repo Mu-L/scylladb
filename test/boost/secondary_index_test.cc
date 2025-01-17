@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/coroutine.hh>
@@ -11,7 +11,8 @@
 #include "test/lib/cql_assertions.hh"
 #include "test/lib/eventually.hh"
 #include "test/lib/exception_utils.hh"
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include "test/lib/select_statement_utils.hh"
 #include "transport/messages/result_message.hh"
 #include "service/pager/paging_state.hh"
@@ -19,7 +20,10 @@
 #include "types/list.hh"
 #include "types/set.hh"
 #include "cql3/statements/select_statement.hh"
+#include "utils/assert.hh"
 #include "utils/error_injection.hh"
+
+BOOST_AUTO_TEST_SUITE(secondary_index_test)
 
 using namespace std::chrono_literals;
 
@@ -39,6 +43,23 @@ SEASTAR_TEST_CASE(test_secondary_index_regular_column_query) {
             { utf8_type->decompose(sstring("beassebyv@house.gov")) },
         });
     });
+}
+// Reproduces scylladb/scylladb#20722
+// Because group0_service was initialized after (and destroyed before) view_builder
+// and view_builder depends on group0, there was a possible use after free.
+// The test injects sleep in read barrier, increasing reproducibility of the bug.
+SEASTAR_TEST_CASE(test_view_builder_use_after_free) {
+#ifndef DEBUG
+    fmt::print("Skipping test as it depends on error injection and ASAN. Please run in mode where they're enabled (debug).\n");
+    return make_ready_future<>();
+#else
+    return do_with_cql_env([] (cql_test_env& e) -> future<> {
+        utils::get_local_injector().enable("sleep_in_read_barrier");
+
+        co_await e.execute_cql("CREATE TABLE users (userid int, name text, email text, country text, PRIMARY KEY (userid));");
+        co_await e.execute_cql("CREATE INDEX ON users (email);");
+    });
+#endif
 }
 
 SEASTAR_TEST_CASE(test_secondary_index_clustering_key_query) {
@@ -445,7 +466,7 @@ SEASTAR_TEST_CASE(test_simple_index_paging) {
         auto extract_paging_state = [] (::shared_ptr<cql_transport::messages::result_message> res) {
             auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(res);
             auto paging_state = rows->rs().get_metadata().paging_state();
-            assert(paging_state);
+            SCYLLA_ASSERT(paging_state);
             return make_lw_shared<service::pager::paging_state>(*paging_state);
         };
 
@@ -829,7 +850,7 @@ SEASTAR_TEST_CASE(test_local_index_paging) {
         auto extract_paging_state = [] (::shared_ptr<cql_transport::messages::result_message> res) {
             auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(res);
             auto paging_state = rows->rs().get_metadata().paging_state();
-            assert(paging_state);
+            SCYLLA_ASSERT(paging_state);
             return make_lw_shared<service::pager::paging_state>(*paging_state);
         };
 
@@ -1727,8 +1748,8 @@ SEASTAR_TEST_CASE(test_select_with_token_range_filtering) {
         }
 
         auto do_test = [&](sstring token_restriction, sstring column_restrictions, std::function<bool(const testset_row&)> matches_row) {
-            auto expected_rows = boost::copy_range<std::vector<std::vector<bytes_opt>>>(rows |
-                boost::adaptors::filtered(std::move(matches_row)) | boost::adaptors::transformed([] (const testset_row& row) {
+            auto expected_rows = std::ranges::to<std::vector<std::vector<bytes_opt>>>(rows |
+                std::views::filter(std::move(matches_row)) | std::views::transform([] (const testset_row& row) {
                 return std::vector<bytes_opt> { 
                     int32_type->decompose(row.pk1), int32_type->decompose(row.pk2), 
                     int32_type->decompose(row.ck1), int32_type->decompose(row.ck2), 
@@ -1984,3 +2005,5 @@ SEASTAR_TEST_CASE(test_returning_failure_from_ghost_rows_deletion) {
         }
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

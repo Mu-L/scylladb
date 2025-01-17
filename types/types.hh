@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -51,7 +51,7 @@ class cql3_type;
 
 }
 
-int64_t timestamp_from_string(sstring_view s);
+int64_t timestamp_from_string(std::string_view s);
 
 struct runtime_exception : public std::exception {
     sstring _why;
@@ -435,7 +435,7 @@ public:
         return to_string(bytes_view(b));
     }
     sstring to_string_impl(const data_value& v) const;
-    bytes from_string(sstring_view text) const;
+    bytes from_string(std::string_view text) const;
     bool is_counter() const;
     bool is_string() const;
     bool is_collection() const;
@@ -453,6 +453,9 @@ public:
     bool is_native() const;
     cql3::cql3_type as_cql3_type() const;
     const sstring& cql3_type_name() const;
+    // The type is guaranteed to be wrapped within double quotation marks
+    // if it couldn't be used as a type identifier in CQL otherwise.
+    sstring cql3_type_name_without_frozen() const;
     virtual shared_ptr<const abstract_type> freeze() const { return shared_from_this(); }
 
     const abstract_type& without_reversed() const {
@@ -567,34 +570,7 @@ bool operator==(const data_value& x, const data_value& y);
 using bytes_view_opt = std::optional<bytes_view>;
 using managed_bytes_view_opt = std::optional<managed_bytes_view>;
 
-static inline
-bool optional_less_compare(data_type t, bytes_view_opt e1, bytes_view_opt e2) {
-    if (bool(e1) != bool(e2)) {
-        return bool(e2);
-    }
-    if (!e1) {
-        return false;
-    }
-    return t->less(*e1, *e2);
-}
-
-static inline
-bool optional_equal(data_type t, bytes_view_opt e1, bytes_view_opt e2) {
-    if (bool(e1) != bool(e2)) {
-        return false;
-    }
-    if (!e1) {
-        return true;
-    }
-    return t->equal(*e1, *e2);
-}
-
-static inline
-bool less_compare(data_type t, bytes_view e1, bytes_view e2) {
-    return t->less(e1, e2);
-}
-
-static inline
+inline
 std::strong_ordering tri_compare(data_type t, managed_bytes_view e1, managed_bytes_view e2) {
     return t->compare(e1, e2);
 }
@@ -609,7 +585,7 @@ tri_compare_opt(data_type t, managed_bytes_view_opt v1, managed_bytes_view_opt v
     }
 }
 
-static inline
+inline
 bool equal(data_type t, managed_bytes_view e1, managed_bytes_view e2) {
     return t->equal(e1, e2);
 }
@@ -900,7 +876,7 @@ less_unsigned(bytes_view v1, bytes_view v2) {
 }
 
 template<typename Type>
-static inline
+inline
 typename Type::value_type deserialize_value(Type& t, bytes_view v) {
     return t.deserialize_value(v);
 }

@@ -3,15 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "api/api_init.hh"
 #include "api/api-doc/system.json.hh"
 #include "api/api-doc/metrics.json.hh"
 #include "replica/database.hh"
+#include "db/sstables-format-selector.hh"
 
 #include <rapidjson/document.h>
+#include <boost/lexical_cast.hpp>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/metrics_api.hh>
 #include <seastar/core/relabel_config.hh>
@@ -19,7 +21,7 @@
 #include <seastar/util/short_streams.hh>
 #include <seastar/http/short_streams.hh>
 
-#include "log.hh"
+#include "utils/log.hh"
 
 extern logging::logger apilog;
 
@@ -182,6 +184,18 @@ void set_system(http_context& ctx, routes& r) {
         apilog.info("Profile dumped to {}", profile_dest);
         return make_ready_future<json::json_return_type>(json::json_return_type(json::json_void()));
     }) ;
+}
+
+void set_format_selector(http_context& ctx, routes& r, db::sstables_format_selector& sel) {
+    hs::get_highest_supported_sstable_version.set(r, [&sel] (std::unique_ptr<request> req) {
+        return smp::submit_to(0, [&sel] {
+            return make_ready_future<json::json_return_type>(seastar::to_sstring(sel.selected_format()));
+        });
+    });
+}
+
+void unset_format_selector(http_context& ctx, routes& r) {
+    hs::get_highest_supported_sstable_version.unset(r);
 }
 
 }

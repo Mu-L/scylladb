@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 
-#include <boost/range/adaptor/reversed.hpp>
 #include "mutation_partition_v2.hh"
 #include "clustering_interval_set.hh"
 #include "converting_mutation_partition_applier.hh"
@@ -20,6 +19,7 @@
 #include <seastar/core/execution_stage.hh>
 #include "compaction/compaction_garbage_collector.hh"
 #include "mutation_partition_view.hh"
+#include "utils/assert.hh"
 #include "utils/unconst.hh"
 
 extern logging::logger mplog;
@@ -34,7 +34,7 @@ mutation_partition_v2::mutation_partition_v2(const schema& s, const mutation_par
 #endif
 {
 #ifdef SEASTAR_DEBUG
-    assert(x._schema_version == _schema_version);
+    SCYLLA_ASSERT(x._schema_version == _schema_version);
 #endif
     auto cloner = [&s] (const rows_entry* x) -> rows_entry* {
         return current_allocator().construct<rows_entry>(s, *x);
@@ -117,8 +117,8 @@ void mutation_partition_v2::apply(const schema& s, mutation_partition_v2&& p, ca
 stop_iteration mutation_partition_v2::apply_monotonically(const schema& s, const schema& p_s, mutation_partition_v2&& p, cache_tracker* tracker,
         mutation_application_stats& app_stats, preemption_check need_preempt, apply_resume& res, is_evictable evictable) {
 #ifdef SEASTAR_DEBUG
-    assert(_schema_version == s.version());
-    assert(p._schema_version == p_s.version());
+    SCYLLA_ASSERT(_schema_version == s.version());
+    SCYLLA_ASSERT(p._schema_version == p_s.version());
 #endif
     bool same_schema = s.version() == p_s.version();
     _tombstone.apply(p._tombstone);
@@ -210,8 +210,14 @@ stop_iteration mutation_partition_v2::apply_monotonically(const schema& s, const
     alloc_strategy_unique_ptr<rows_entry> p_sentinel;
     alloc_strategy_unique_ptr<rows_entry> this_sentinel;
     auto insert_sentinel_back = defer([&] {
+        // Note: this lambda will be run by a destructor (of the `defer` guard),
+        // so it mustn't throw, or else it will crash the node.
+        //
+        // To prevent a `bad_alloc` during the tree insertion, we have to preallocate
+        // some memory for the new tree nodes. This is done by the `hold_reserve`
+        // constructed after the lambda.
         if (this_sentinel) {
-            assert(p_i != p._rows.end());
+            SCYLLA_ASSERT(p_i != p._rows.end());
             auto rt = this_sentinel->range_tombstone();
             auto insert_result = _rows.insert_before_hint(i, std::move(this_sentinel), cmp);
             auto i2 = insert_result.first;
@@ -227,10 +233,10 @@ stop_iteration mutation_partition_v2::apply_monotonically(const schema& s, const
             }
         }
         if (p_sentinel) {
-            assert(p_i != p._rows.end());
+            SCYLLA_ASSERT(p_i != p._rows.end());
             if (cmp(p_i->position(), p_sentinel->position()) == 0) {
                 mplog.trace("{}: clearing attributes on {}", fmt::ptr(&p), p_i->position());
-                assert(p_i->dummy());
+                SCYLLA_ASSERT(p_i->dummy());
                 p_i->set_continuous(false);
                 p_i->set_range_tombstone({});
             } else {
@@ -242,6 +248,15 @@ stop_iteration mutation_partition_v2::apply_monotonically(const schema& s, const
             }
         }
     });
+
+    // This guard will ensure that LSA reserves one free segment more than it
+    // needs for internal reasons.
+    //
+    // It will be destroyed immediately before the sentinel-inserting `defer`
+    // happens, ensuring that the sentinel insertion has at least one free LSA segment
+    // to work with. This should be enough, since we only need to allocate a few
+    // B-tree nodes.
+    auto memory_reserve_for_sentinel_inserts = hold_reserve(logalloc::segment_size);
 
     while (p_i != p._rows.end()) {
         rows_entry& src_e = *p_i;
@@ -394,7 +409,7 @@ stop_iteration mutation_partition_v2::apply_monotonically(const schema& s, const
                 lb_i->set_continuous(true);
             }
         } else {
-            assert(i->dummy() == src_e.dummy());
+            SCYLLA_ASSERT(i->dummy() == src_e.dummy());
             alloc_strategy_unique_ptr<rows_entry> s1;
             alloc_strategy_unique_ptr<rows_entry> s2;
 
@@ -506,7 +521,7 @@ stop_iteration mutation_partition_v2::apply_monotonically(const schema& s, const
 void
 mutation_partition_v2::apply_row_tombstone(const schema& schema, clustering_key_prefix prefix, tombstone t) {
     check_schema(schema);
-    assert(!prefix.is_full(schema));
+    SCYLLA_ASSERT(!prefix.is_full(schema));
     auto start = prefix;
     apply_row_tombstone(schema, range_tombstone{std::move(start), std::move(prefix), std::move(t)});
 }
@@ -699,13 +714,13 @@ mutation_partition_v2::upper_bound(const schema& schema, const query::clustering
     return _rows.lower_bound(position_in_partition_view::for_range_end(r), rows_entry::tri_compare(schema));
 }
 
-boost::iterator_range<mutation_partition_v2::rows_type::const_iterator>
+std::ranges::subrange<mutation_partition_v2::rows_type::const_iterator>
 mutation_partition_v2::range(const schema& schema, const query::clustering_range& r) const {
     check_schema(schema);
-    return boost::make_iterator_range(lower_bound(schema, r), upper_bound(schema, r));
+    return std::ranges::subrange(lower_bound(schema, r), upper_bound(schema, r));
 }
 
-boost::iterator_range<mutation_partition_v2::rows_type::iterator>
+std::ranges::subrange<mutation_partition_v2::rows_type::iterator>
 mutation_partition_v2::range(const schema& schema, const query::clustering_range& r) {
     return unconst(_rows, static_cast<const mutation_partition_v2*>(this)->range(schema, r));
 }
@@ -732,19 +747,12 @@ void mutation_partition_v2::for_each_row(const schema& schema, const query::clus
             }
         }
     } else {
-        for (const auto& e : r | boost::adaptors::reversed) {
+        for (const auto& e : r | std::views::reverse) {
             if (func(e) == stop_iteration::yes) {
                 break;
             }
         }
     }
-}
-
-// Transforms given range of printable into a range of strings where each element
-// in the original range is prefxied with given string.
-template<typename RangeOfPrintable>
-static auto prefixed(const sstring& prefix, const RangeOfPrintable& r) {
-    return r | boost::adaptors::transformed([&] (auto&& e) { return format("{}{}", prefix, e); });
 }
 
 auto fmt::formatter<mutation_partition_v2::printer>::format(const mutation_partition_v2::printer& p, fmt::format_context& ctx) const
@@ -827,14 +835,14 @@ bool mutation_partition_v2::equal(const schema& s, const mutation_partition_v2& 
 
 bool mutation_partition_v2::equal(const schema& this_schema, const mutation_partition_v2& p, const schema& p_schema) const {
 #ifdef SEASTAR_DEBUG
-    assert(_schema_version == this_schema.version());
-    assert(p._schema_version == p_schema.version());
+    SCYLLA_ASSERT(_schema_version == this_schema.version());
+    SCYLLA_ASSERT(p._schema_version == p_schema.version());
 #endif
     if (_tombstone != p._tombstone) {
         return false;
     }
 
-    if (!boost::equal(non_dummy_rows(), p.non_dummy_rows(),
+    if (!std::ranges::equal(non_dummy_rows(), p.non_dummy_rows(),
         [&] (const rows_entry& e1, const rows_entry& e2) {
             return e1.equal(this_schema, e2, p_schema);
         }
@@ -995,7 +1003,7 @@ void mutation_partition_v2::set_continuity(const schema& s, const position_range
         i = _rows.insert_before(i, std::move(e));
     }
 
-    assert(i != end);
+    SCYLLA_ASSERT(i != end);
     ++i;
 
     while (1) {

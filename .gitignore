@@ -3,6 +3,7 @@
 .settings
 build
 build.ninja
+cmake-build-*
 build.ninja.new
 cscope.*
 /debian/
@@ -13,13 +14,14 @@ dist/ami/scylla_deploy.sh
 Cql.tokens
 .kdev4
 *.kdev4
+.idea
 CMakeLists.txt.user
 .cache
 .tox
 *.egg-info
 __pycache__CMakeLists.txt.user
 .gdbinit
-resources
+/resources
 .pytest_cache
 /expressions.tokens
 tags
@@ -32,3 +34,4 @@ compile_commands.json
 .mypy_cache
 .envrc
 clang_build
+.idea/

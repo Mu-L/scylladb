@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -175,11 +175,13 @@ public:
     using after_key = bool_class<after_key_tag>;
 
     static ring_position_view min() noexcept {
-        return { minimum_token(), nullptr, -1 };
+        static auto min_token = minimum_token();
+        return { min_token, nullptr, -1 };
     }
 
     static ring_position_view max() noexcept {
-        return { maximum_token(), nullptr, 1 };
+        static auto max_token = maximum_token();
+        return { max_token, nullptr, 1 };
     }
 
     bool is_min() const noexcept {

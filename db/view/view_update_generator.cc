@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "db/view/view_update_backlog.hh"
@@ -11,6 +11,7 @@
 #include "gms/inet_address.hh"
 #include <seastar/util/defer.hh>
 #include <boost/range/adaptor/map.hpp>
+#include <boost/range/numeric.hpp>
 #include "replica/database.hh"
 #include "view_update_generator.hh"
 #include "utils/error_injection.hh"
@@ -22,6 +23,7 @@
 #include "utils/pretty_printers.hh"
 #include "readers/from_mutations_v2.hh"
 #include "service/storage_proxy.hh"
+#include "db/config.hh"
 
 static logging::logger vug_logger("view_update_generator");
 
@@ -91,7 +93,7 @@ public:
 
     uint64_t sstables_pending_work() const noexcept {
         return _inactive_pending_work +
-            boost::accumulate(_monitors | boost::adaptors::map_values | boost::adaptors::transformed(std::mem_fn(&read_monitor::pending_work)), uint64_t(0));
+            std::ranges::fold_left(_monitors | std::views::values | std::views::transform(std::mem_fn(&read_monitor::pending_work)), uint64_t(0), std::plus());
     }
 };
 
@@ -312,9 +314,9 @@ void view_update_generator::discover_staging_sstables() {
 }
 
 static size_t memory_usage_of(const utils::chunked_vector<frozen_mutation_and_schema>& ms) {
-    return boost::accumulate(ms | boost::adaptors::transformed([] (const frozen_mutation_and_schema& m) {
+    return std::ranges::fold_left(ms | std::views::transform([] (const frozen_mutation_and_schema& m) {
         return memory_usage_of(m);
-    }), 0);
+    }), 0, std::plus{});
 }
 
 /**
@@ -450,7 +452,7 @@ future<> view_update_generator::generate_and_propagate_view_updates(const replic
         // the one which limits the number of incoming client requests by delaying the response to the client.
         if (batch_num > 0) {
             update_backlog local_backlog = _db.get_view_update_backlog();
-            std::chrono::microseconds throttle_delay =  calculate_view_update_throttling_delay(local_backlog, timeout);
+            std::chrono::microseconds throttle_delay =  calculate_view_update_throttling_delay(local_backlog, timeout, _db.get_config().view_flow_control_delay_limit_in_ms());
 
             co_await seastar::sleep(throttle_delay);
 

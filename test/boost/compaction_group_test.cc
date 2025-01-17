@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/sstring.hh>
@@ -102,6 +102,7 @@ public:
     virtual bool compaction_enforce_min_threshold() const noexcept override { return false; }
     virtual const sstables::sstable_set& main_sstable_set() const override { return _main_set; }
     virtual const sstables::sstable_set& maintenance_sstable_set() const override { return _maintenance_set; }
+    virtual lw_shared_ptr<const sstables::sstable_set> sstable_set_for_tombstone_gc() const override { return make_lw_shared<const sstables::sstable_set>(main_sstable_set()); }
     virtual std::unordered_set<sstables::shared_sstable> fully_expired_sstables(const std::vector<sstables::shared_sstable>& sstables, gc_clock::time_point compaction_time) const override { return {}; }
     virtual const std::vector<sstables::shared_sstable>& compacted_undeleted_sstables() const noexcept override { return _compacted_undeleted_sstables; }
     virtual sstables::compaction_strategy& get_compaction_strategy() const noexcept override { return _compaction_strategy; }
@@ -111,6 +112,8 @@ public:
     virtual sstables::shared_sstable make_sstable() const override { return _sstable_factory(); }
     virtual sstables::sstable_writer_config configure_writer(sstring origin) const override { return _sst_man.configure_writer(std::move(origin)); }
     virtual api::timestamp_type min_memtable_timestamp() const override { return api::min_timestamp; }
+    virtual api::timestamp_type min_memtable_live_timestamp() const override { return api::min_timestamp; }
+    virtual api::timestamp_type min_memtable_live_row_marker_timestamp() const override { return api::min_timestamp; }
     virtual bool memtable_has_key(const dht::decorated_key& key) const override { return false; }
     virtual future<> on_compaction_completion(sstables::compaction_completion_desc desc, sstables::offstrategy offstrategy) override {
         testlog.info("Adding {} sstable(s), removing {} sstables", desc.new_sstables.size(), desc.old_sstables.size());
@@ -123,6 +126,7 @@ public:
     virtual compaction_backlog_tracker& get_backlog_tracker() override { return _backlog_tracker; }
     virtual const std::string get_group_id() const noexcept override { return "0"; }
     virtual seastar::condition_variable& get_staging_done_condition() noexcept override { return _staging_done_condition; }
+    dht::token_range get_token_range_after_split(const dht::token& t) const noexcept override { return dht::token_range(); }
 };
 
 SEASTAR_TEST_CASE(basic_compaction_group_splitting_test) {
@@ -151,12 +155,12 @@ SEASTAR_TEST_CASE(basic_compaction_group_splitting_test) {
             compaction_group->rebuild_main_set(ssts, {});
 
             auto& cm = t->get_compaction_manager();
-            auto expected_compaction_size = boost::accumulate(ssts | boost::adaptors::transformed([&] (auto& sst) {
+            auto expected_compaction_size = std::ranges::fold_left(ssts | std::views::transform([&] (auto& sst) {
                 // sstables that doesn't need split will have compaction bypassed.
                 return sstable_needs_split(sst) ? sst->bytes_on_disk() : size_t(0);
-            }), int64_t(0));
+            }), int64_t(0), std::plus{});
 
-            auto ret = cm.perform_split_compaction(*compaction_group, sstables::compaction_type_options::split{classifier}).get();
+            auto ret = cm.perform_split_compaction(*compaction_group, sstables::compaction_type_options::split{classifier}, tasks::task_info{}).get();
             BOOST_REQUIRE_EQUAL(ret->start_size, expected_compaction_size);
 
             BOOST_REQUIRE(compaction_group->main_sstable_set().size() == expected_output);

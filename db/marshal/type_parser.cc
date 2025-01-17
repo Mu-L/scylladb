@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "db/marshal/type_parser.hh"
@@ -31,20 +31,20 @@ namespace db {
 
 namespace marshal {
 
-type_parser::type_parser(sstring_view str, size_t idx)
+type_parser::type_parser(std::string_view str, size_t idx)
     : _str{str.begin(), str.end()}
     , _idx{idx}
 { }
 
-type_parser::type_parser(sstring_view str)
+type_parser::type_parser(std::string_view str)
     : type_parser{str, 0}
 { }
 
 data_type type_parser::parse(const sstring& str) {
-    return type_parser(sstring_view(str)).parse();
+    return type_parser(std::string_view(str)).parse();
 }
 
-data_type type_parser::parse(sstring_view str) {
+data_type type_parser::parse(std::string_view str) {
     return type_parser(str).parse();
 }
 

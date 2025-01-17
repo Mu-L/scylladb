@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -71,6 +71,10 @@ public:
     virtual future<> drop(std::string_view role_name, ::service::group0_batch&) override;
 
     virtual future<custom_options> query_custom_options(std::string_view role_name) const override;
+
+    virtual bool uses_password_hashes() const override;
+
+    virtual future<std::optional<sstring>> get_password_hash(std::string_view role_name) const override;
 
     virtual const resource_set& protected_resources() const override;
 

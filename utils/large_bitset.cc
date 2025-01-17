@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include "large_bitset.hh"
 #include "stall_free.hh"
 
@@ -15,7 +16,7 @@
 using namespace seastar;
 
 large_bitset::large_bitset(size_t nr_bits) : _nr_bits(nr_bits) {
-    assert(thread::running_in_thread());
+    SCYLLA_ASSERT(thread::running_in_thread());
 
     size_t nr_ints = align_up(nr_bits, bits_per_int()) / bits_per_int();
     utils::reserve_gently(_storage, nr_ints).get();
@@ -28,7 +29,7 @@ large_bitset::large_bitset(size_t nr_bits) : _nr_bits(nr_bits) {
 
 void
 large_bitset::clear() {
-    assert(thread::running_in_thread());
+    SCYLLA_ASSERT(thread::running_in_thread());
     for (auto&& pos: _storage) {
         pos = 0;
         thread::maybe_yield();

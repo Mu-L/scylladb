@@ -5,14 +5,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/range/adaptor/indirected.hpp>
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/algorithm/find_if.hpp>
-#include <boost/range/algorithm/sort.hpp>
+#include <algorithm>
+
+#include "utils/assert.hh"
 
 #include "clustering_bounds_comparator.hh"
 #include "replica/database_fwd.hh"
@@ -62,19 +60,20 @@ public:
     using pointer = const virtual_row*;
     using reference = const virtual_row&;
 private:
-    std::reference_wrapper<const std::vector<bytes>> _cf_names;
-    std::reference_wrapper<const std::vector<token_range>> _ranges;
+    const std::vector<bytes>* _cf_names = nullptr;
+    const std::vector<token_range>* _ranges = nullptr;
     size_t _cf_names_idx = 0;
     size_t _ranges_idx = 0;
 public:
     struct end_iterator_tag {};
+    virtual_row_iterator() = default;
     virtual_row_iterator(const std::vector<bytes>& cf_names, const std::vector<token_range>& ranges)
-            : _cf_names(std::ref(cf_names))
-            , _ranges(std::ref(ranges))
+            : _cf_names(&cf_names)
+            , _ranges(&ranges)
     { }
     virtual_row_iterator(const std::vector<bytes>& cf_names, const std::vector<token_range>& ranges, end_iterator_tag)
-            : _cf_names(std::ref(cf_names))
-            , _ranges(std::ref(ranges))
+            : _cf_names(&cf_names)
+            , _ranges(&ranges)
             , _cf_names_idx(cf_names.size())
             , _ranges_idx(ranges.size())
     {
@@ -86,7 +85,7 @@ public:
         }
     }
     virtual_row_iterator& operator++() {
-        if (++_ranges_idx == _ranges.get().size() && ++_cf_names_idx < _cf_names.get().size()) {
+        if (++_ranges_idx == _ranges->size() && ++_cf_names_idx < _cf_names->size()) {
             _ranges_idx = 0;
         }
         return *this;
@@ -97,7 +96,7 @@ public:
         return i;
     }
     const value_type operator*() const {
-        return { _cf_names.get()[_cf_names_idx], _ranges.get()[_ranges_idx] };
+        return { (*_cf_names)[_cf_names_idx], (*_ranges)[_ranges_idx] };
     }
     bool operator==(const virtual_row_iterator& i) const {
         return _cf_names_idx == i._cf_names_idx
@@ -131,15 +130,15 @@ static std::vector<sstring> get_keyspaces(const schema& s, const replica::databa
     };
     auto keyspaces = db.get_non_system_keyspaces();
     auto cmp = keyspace_less_comparator(s);
-    boost::sort(keyspaces, cmp);
-    return boost::copy_range<std::vector<sstring>>(
-        range.slice(keyspaces, std::move(cmp)) | boost::adaptors::filtered([&s] (const auto& ks) {
+    std::ranges::sort(keyspaces, cmp);
+    return
+        range.slice(keyspaces, std::move(cmp)) | std::views::filter([&s] (const auto& ks) {
             // If this is a range query, results are divided between shards by the partition key (keyspace_name).
             return dht::static_shard_of(s, dht::get_token(s,
                         partition_key::from_single_value(s, utf8_type->decompose(ks))))
                 == this_shard_id();
         })
-    );
+        | std::ranges::to<std::vector<sstring>>();
 }
 
 /**
@@ -188,17 +187,17 @@ static future<std::vector<token_range>> get_local_ranges(replica::database& db, 
         auto ranges = db.get_token_metadata().get_primary_ranges_for(std::move(tokens));
         std::vector<token_range> local_ranges;
         auto to_bytes = [](const std::optional<dht::token_range::bound>& b) {
-            assert(b);
+            SCYLLA_ASSERT(b);
             return utf8_type->decompose(b->value().to_sstring());
         };
         // We merge the ranges to be compatible with how Cassandra shows it's size estimates table.
         // All queries will be on that table, where all entries are text and there's no notion of
         // token ranges form the CQL point of view.
-        auto left_inf = boost::find_if(ranges, [] (auto&& r) {
-            return r.end() && (!r.start() || r.start()->value() == dht::minimum_token());
+        auto left_inf = std::ranges::find_if(ranges, [] (auto&& r) {
+            return r.end() && (!r.start() || r.start()->value().is_minimum());
         });
-        auto right_inf = boost::find_if(ranges, [] (auto&& r) {
-            return r.start() && (!r.end() || r.end()->value() == dht::maximum_token());
+        auto right_inf = std::ranges::find_if(ranges, [] (auto&& r) {
+            return r.start() && (!r.end() || r.end()->value().is_maximum());
         });
         if (left_inf != right_inf && left_inf != ranges.end() && right_inf != ranges.end()) {
             local_ranges.push_back(token_range{to_bytes(right_inf->start()), to_bytes(left_inf->end())});
@@ -208,7 +207,7 @@ static future<std::vector<token_range>> get_local_ranges(replica::database& db, 
         for (auto&& r : ranges) {
             local_ranges.push_back(token_range{to_bytes(r.start()), to_bytes(r.end())});
         }
-        boost::sort(local_ranges, [] (auto&& tr1, auto&& tr2) {
+        std::ranges::sort(local_ranges, [] (auto&& tr1, auto&& tr2) {
             return utf8_type->less(tr1.start, tr2.start);
         });
         return local_ranges;
@@ -309,15 +308,15 @@ size_estimates_mutation_reader::estimates_for_current_keyspace(std::vector<token
     // For each specified range, estimate (crudely) mean partition size and partitions count.
     auto pkey = partition_key::from_single_value(*_schema, utf8_type->decompose(*_current_partition));
     auto cfs = _db.find_keyspace(*_current_partition).metadata()->cf_meta_data();
-    auto cf_names = boost::copy_range<std::vector<bytes>>(cfs | boost::adaptors::transformed([] (auto&& cf) {
+    auto cf_names = cfs | std::views::transform([] (auto&& cf) {
         return utf8_type->decompose(cf.first);
-    }));
-    boost::sort(cf_names, [] (auto&& n1, auto&& n2) {
+    }) | std::ranges::to<std::vector<bytes>>();
+    std::ranges::sort(cf_names, [] (auto&& n1, auto&& n2) {
         return utf8_type->less(n1, n2);
     });
     std::vector<db::system_keyspace::range_estimates> estimates;
     for (auto& range : _slice.row_ranges(*_schema, pkey)) {
-        auto rows = boost::make_iterator_range(
+        auto rows = std::ranges::subrange(
                 virtual_row_iterator(cf_names, local_ranges),
                 virtual_row_iterator(cf_names, local_ranges, virtual_row_iterator::end_iterator_tag()));
         auto rows_to_estimate = range.slice(rows, virtual_row_comparator(_schema));

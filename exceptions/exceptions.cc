@@ -5,11 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "exceptions.hh"
-#include <seastar/core/print.hh>
+
+#include "bytes.hh"
+#include <seastar/core/format.hh>
 #include <seastar/util/log.hh>
 
 namespace exceptions {
@@ -45,9 +47,9 @@ const std::unordered_map<exception_code, sstring>& exception_map() {
 }
 
 template<typename... Args>
-static inline sstring prepare_message(const char* fmt, Args&&... args) noexcept {
+static inline sstring prepare_message(fmt::format_string<Args...> fmt, Args&&... args) noexcept {
     try {
-        return format(fmt, std::forward<Args>(args)...);
+        return seastar::format(fmt, std::forward<Args>(args)...);
     } catch (...) {
         return sstring();
     }

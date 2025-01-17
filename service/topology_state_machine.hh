@@ -4,13 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include <boost/range/algorithm/find_if.hpp>
 #include <iostream>
+#include <set>
 #include <unordered_set>
 #include <unordered_map>
 #include <seastar/core/condition-variable.hh>
@@ -22,6 +22,10 @@
 #include "utils/UUID.hh"
 #include "service/session.hh"
 #include "mutation/canonical_mutation.hh"
+
+namespace db {
+    class system_keyspace;
+}
 
 namespace service {
 
@@ -73,6 +77,7 @@ enum class global_topology_request: uint16_t {
     new_cdc_generation,
     cleanup,
     keyspace_rf_change,
+    truncate_table,
 };
 
 struct ring_slice {
@@ -111,7 +116,7 @@ struct topology {
         write_both_read_old,
         write_both_read_new,
         tablet_migration,
-        tablet_split_finalization,
+        tablet_resize_finalization,
         left_token_ring,
         rollback_to_normal,
     };
@@ -210,6 +215,9 @@ struct topology {
 
     // Calculates a set of features that are supported by all normal nodes but not yet enabled.
     std::set<sstring> calculate_not_yet_enabled_features() const;
+
+    // Returns the set of zero-token normal nodes.
+    std::unordered_set<raft::server_id> get_normal_zero_token_nodes() const;
 };
 
 struct raft_snapshot {
@@ -226,8 +234,10 @@ struct topology_state_machine {
     using topology_type = topology;
     topology_type _topology;
     condition_variable event;
+    size_t reload_count = 0;
 
     future<> await_not_busy();
+    future<sstring> wait_for_request_completion(db::system_keyspace& sys_ks, utils::UUID id, bool require_entry);
 };
 
 // Raft leader uses this command to drive bootstrap process on other nodes
@@ -237,7 +247,7 @@ struct raft_topology_cmd {
           barrier_and_drain,    // same + drain requests which use previous versions
           stream_ranges,        // request to stream data, return when streaming is
                                 // done
-          wait_for_ip           // wait for a joining node IP to appear in raft_address_map
+          wait_for_ip           // wait for a joining node IP to appear in gossiper
       };
       command cmd;
 

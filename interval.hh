@@ -3,19 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
+#include <algorithm>
 #include <list>
 #include <vector>
 #include <optional>
 #include <iosfwd>
-#include <boost/range/algorithm/copy.hpp>
-#include <boost/range/adaptor/sliced.hpp>
-#include <boost/range/adaptor/transformed.hpp>
 #include <compare>
+#include <ranges>
 #include <fmt/format.h>
 
 template <typename Comparator, typename T>
@@ -138,7 +138,7 @@ public:
     // the point is before the interval (works only for non wrapped intervals)
     // Comparator must define a total ordering on T.
     bool before(const T& point, IntervalComparatorFor<T> auto&& cmp) const {
-        assert(!is_wrap_around(cmp));
+        SCYLLA_ASSERT(!is_wrap_around(cmp));
         if (!start()) {
             return false; //open start, no points before
         }
@@ -154,8 +154,8 @@ public:
     // the other interval is before this interval (works only for non wrapped intervals)
     // Comparator must define a total ordering on T.
     bool other_is_before(const wrapping_interval<T>& o, IntervalComparatorFor<T> auto&& cmp) const {
-        assert(!is_wrap_around(cmp));
-        assert(!o.is_wrap_around(cmp));
+        SCYLLA_ASSERT(!is_wrap_around(cmp));
+        SCYLLA_ASSERT(!o.is_wrap_around(cmp));
         if (!start() || !o.end()) {
             return false;
         }
@@ -181,7 +181,7 @@ public:
     // the point is after the interval (works only for non wrapped intervals)
     // Comparator must define a total ordering on T.
     bool after(const T& point, IntervalComparatorFor<T> auto&& cmp) const {
-        assert(!is_wrap_around(cmp));
+        SCYLLA_ASSERT(!is_wrap_around(cmp));
         if (!end()) {
             return false; //open end, no points after
         }
@@ -211,8 +211,8 @@ public:
         }
 
         // No interval should reach this point as wrap around.
-        assert(!this_wraps);
-        assert(!other_wraps);
+        SCYLLA_ASSERT(!this_wraps);
+        SCYLLA_ASSERT(!other_wraps);
 
         // if both this and other have an open start, the two intervals will overlap.
         if (!start() && !other.start()) {
@@ -368,7 +368,7 @@ public:
             }
         }
 
-        boost::copy(left, std::back_inserter(result));
+        std::ranges::copy(left, std::back_inserter(result));
 
         // TODO: Merge adjacent intervals (optimization)
         return result;
@@ -377,7 +377,7 @@ public:
     // split_point will belong to first interval
     // Comparator must define a total ordering on T.
     std::pair<wrapping_interval<T>, wrapping_interval<T>> split(const T& split_point, IntervalComparatorFor<T> auto&& cmp) const {
-        assert(contains(split_point, std::forward<decltype(cmp)>(cmp)));
+        SCYLLA_ASSERT(contains(split_point, std::forward<decltype(cmp)>(cmp)));
         wrapping_interval left(start(), bound(split_point));
         wrapping_interval right(bound(split_point, false), end());
         return std::make_pair(std::move(left), std::move(right));
@@ -576,15 +576,15 @@ public:
     // Comparator must define a total ordering on T.
     std::vector<interval> subtract(const interval& other, IntervalComparatorFor<T> auto&& cmp) const {
         auto subtracted = _interval.subtract(other._interval, std::forward<decltype(cmp)>(cmp));
-        return boost::copy_range<std::vector<interval>>(subtracted | boost::adaptors::transformed([](auto&& r) {
+        return subtracted | std::views::transform([](auto&& r) {
             return interval(std::move(r));
-        }));
+        }) | std::ranges::to<std::vector>();
     }
     // split interval in two around a split_point. split_point has to be inside the interval
     // split_point will belong to first interval
     // Comparator must define a total ordering on T.
     std::pair<interval<T>, interval<T>> split(const T& split_point, IntervalComparatorFor<T> auto&& cmp) const {
-        assert(contains(split_point, std::forward<decltype(cmp)>(cmp)));
+        SCYLLA_ASSERT(contains(split_point, std::forward<decltype(cmp)>(cmp)));
         interval left(start(), bound(split_point));
         interval right(bound(split_point, false), end());
         return std::make_pair(std::move(left), std::move(right));
@@ -644,7 +644,7 @@ public:
         deoverlapped_intervals.reserve(size);
 
         auto&& current = intervals[0];
-        for (auto&& r : intervals | boost::adaptors::sliced(1, intervals.size())) {
+        for (auto&& r : intervals | std::views::drop(1)) {
             bool includes_end = wrapping_interval<T>::greater_than_or_equal(r._interval.end_bound(), current._interval.start_bound(), cmp)
                                 && wrapping_interval<T>::greater_than_or_equal(current._interval.end_bound(), r._interval.end_bound(), cmp);
             if (includes_end) {
@@ -672,51 +672,51 @@ private:
 
     template<typename Range, IntervalLessComparatorFor<T> LessComparator,
              typename = decltype(std::declval<Range>().lower_bound(std::declval<T>(), std::declval<LessComparator>()))>
-    typename std::remove_reference<Range>::type::const_iterator do_lower_bound(const T& value, Range&& r, LessComparator&& cmp, built_in_) const {
+    typename std::ranges::const_iterator_t<Range> do_lower_bound(const T& value, Range&& r, LessComparator&& cmp, built_in_) const {
         return r.lower_bound(value, std::forward<LessComparator>(cmp));
     }
 
     template<typename Range, IntervalLessComparatorFor<T> LessComparator,
              typename = decltype(std::declval<Range>().upper_bound(std::declval<T>(), std::declval<LessComparator>()))>
-    typename std::remove_reference<Range>::type::const_iterator do_upper_bound(const T& value, Range&& r, LessComparator&& cmp, built_in_) const {
+    typename std::ranges::const_iterator_t<Range> do_upper_bound(const T& value, Range&& r, LessComparator&& cmp, built_in_) const {
         return r.upper_bound(value, std::forward<LessComparator>(cmp));
     }
 
     template<typename Range, IntervalLessComparatorFor<T> LessComparator>
-    typename std::remove_reference<Range>::type::const_iterator do_lower_bound(const T& value, Range&& r, LessComparator&& cmp, std_) const {
+    typename std::ranges::const_iterator_t<Range> do_lower_bound(const T& value, Range&& r, LessComparator&& cmp, std_) const {
         return std::lower_bound(r.begin(), r.end(), value, std::forward<LessComparator>(cmp));
     }
 
     template<typename Range, IntervalLessComparatorFor<T> LessComparator>
-    typename std::remove_reference<Range>::type::const_iterator do_upper_bound(const T& value, Range&& r, LessComparator&& cmp, std_) const {
+    typename std::ranges::const_iterator_t<Range> do_upper_bound(const T& value, Range&& r, LessComparator&& cmp, std_) const {
         return std::upper_bound(r.begin(), r.end(), value, std::forward<LessComparator>(cmp));
     }
 public:
     // Return the lower bound of the specified sequence according to these bounds.
     template<typename Range, IntervalLessComparatorFor<T> LessComparator>
-    typename std::remove_reference<Range>::type::const_iterator lower_bound(Range&& r, LessComparator&& cmp) const {
+    typename std::ranges::const_iterator_t<Range> lower_bound(Range&& r, LessComparator&& cmp) const {
         return start()
             ? (start()->is_inclusive()
                 ? do_lower_bound(start()->value(), std::forward<Range>(r), std::forward<LessComparator>(cmp), built_in_())
                 : do_upper_bound(start()->value(), std::forward<Range>(r), std::forward<LessComparator>(cmp), built_in_()))
-            : std::cbegin(r);
+            : std::ranges::begin(r);
     }
     // Return the upper bound of the specified sequence according to these bounds.
     template<typename Range, IntervalLessComparatorFor<T> LessComparator>
-    typename std::remove_reference<Range>::type::const_iterator upper_bound(Range&& r, LessComparator&& cmp) const {
+    typename std::ranges::const_iterator_t<Range> upper_bound(Range&& r, LessComparator&& cmp) const {
         return end()
              ? (end()->is_inclusive()
                 ? do_upper_bound(end()->value(), std::forward<Range>(r), std::forward<LessComparator>(cmp), built_in_())
                 : do_lower_bound(end()->value(), std::forward<Range>(r), std::forward<LessComparator>(cmp), built_in_()))
              : (is_singular()
                 ? do_upper_bound(start()->value(), std::forward<Range>(r), std::forward<LessComparator>(cmp), built_in_())
-                : std::cend(r));
+                : std::ranges::end(r));
     }
     // Returns a subset of the range that is within these bounds.
     template<typename Range, IntervalLessComparatorFor<T> LessComparator>
-    boost::iterator_range<typename std::remove_reference<Range>::type::const_iterator>
+    std::ranges::subrange<std::ranges::const_iterator_t<Range>>
     slice(Range&& range, LessComparator&& cmp) const {
-        return boost::make_iterator_range(lower_bound(range, cmp), upper_bound(range, cmp));
+        return std::ranges::subrange(lower_bound(range, cmp), upper_bound(range, cmp));
     }
 
     // Returns the intersection between this interval and other.

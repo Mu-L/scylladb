@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "client_state.hh"
@@ -222,7 +222,7 @@ void service::client_state::set_keyspace(replica::database& db, std::string_view
     // Skip keyspace validation for non-authenticated users. Apparently, some client libraries
     // call set_keyspace() before calling login(), and we have to handle that.
     if (_user && !db.has_keyspace(keyspace)) {
-        throw exceptions::invalid_request_exception(format("Keyspace '{}' does not exist", keyspace));
+        throw exceptions::invalid_request_exception(seastar::format("Keyspace '{}' does not exist", keyspace));
     }
     _keyspace = sstring(keyspace);
 }
@@ -239,33 +239,37 @@ future<> service::client_state::ensure_exists(const auth::resource& r) const {
 
 future<> service::client_state::maybe_update_per_service_level_params() {
     if (_sl_controller && _user && _user->name) {
-        auto& role_manager = _auth_service->underlying_role_manager();
-        auto role_set = co_await role_manager.query_granted(_user->name.value(), auth::recursive_role_query::yes);
-        auto slo_opt = co_await _sl_controller->find_service_level(role_set);
+        auto slo_opt = co_await _sl_controller->find_effective_service_level(_user->name.value());
         if (!slo_opt) {
             co_return;
         }
-        auto slo_timeout_or = [&] (const lowres_clock::duration& default_timeout) {
-            return std::visit(overloaded_functor{
-                [&] (const qos::service_level_options::unset_marker&) -> lowres_clock::duration {
-                    return default_timeout;
-                },
-                [&] (const qos::service_level_options::delete_marker&) -> lowres_clock::duration {
-                    return default_timeout;
-                },
-                [&] (const lowres_clock::duration& d) -> lowres_clock::duration {
-                    return d;
-                },
-            }, slo_opt->timeout);
-        };
-        _timeout_config.read_timeout = slo_timeout_or(_default_timeout_config.read_timeout);
-        _timeout_config.write_timeout = slo_timeout_or(_default_timeout_config.write_timeout);
-        _timeout_config.range_read_timeout = slo_timeout_or(_default_timeout_config.range_read_timeout);
-        _timeout_config.counter_write_timeout = slo_timeout_or(_default_timeout_config.counter_write_timeout);
-        _timeout_config.truncate_timeout = slo_timeout_or(_default_timeout_config.truncate_timeout);
-        _timeout_config.cas_timeout = slo_timeout_or(_default_timeout_config.cas_timeout);
-        _timeout_config.other_timeout = slo_timeout_or(_default_timeout_config.other_timeout);
-
-        _workload_type = slo_opt->workload;
+        
+        update_per_service_level_params(*slo_opt);
     }
+}
+
+void service::client_state::update_per_service_level_params(qos::service_level_options& slo) {
+    auto slo_timeout_or = [&] (const lowres_clock::duration& default_timeout) {
+        return std::visit(overloaded_functor{
+            [&] (const qos::service_level_options::unset_marker&) -> lowres_clock::duration {
+                return default_timeout;
+            },
+            [&] (const qos::service_level_options::delete_marker&) -> lowres_clock::duration {
+                return default_timeout;
+            },
+            [&] (const lowres_clock::duration& d) -> lowres_clock::duration {
+                return d;
+            },
+        }, slo.timeout);
+    };
+
+    _timeout_config.read_timeout = slo_timeout_or(_default_timeout_config.read_timeout);
+    _timeout_config.write_timeout = slo_timeout_or(_default_timeout_config.write_timeout);
+    _timeout_config.range_read_timeout = slo_timeout_or(_default_timeout_config.range_read_timeout);
+    _timeout_config.counter_write_timeout = slo_timeout_or(_default_timeout_config.counter_write_timeout);
+    _timeout_config.truncate_timeout = slo_timeout_or(_default_timeout_config.truncate_timeout);
+    _timeout_config.cas_timeout = slo_timeout_or(_default_timeout_config.cas_timeout);
+    _timeout_config.other_timeout = slo_timeout_or(_default_timeout_config.other_timeout);
+
+    _workload_type = slo.workload;
 }

@@ -5,11 +5,12 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "locator/gossiping_property_file_snitch.hh"
 
+#include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
 #include "gms/versioned_value.hh"
 #include "gms/gossiper.hh"

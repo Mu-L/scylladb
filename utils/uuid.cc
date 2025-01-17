@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
@@ -13,6 +13,8 @@
 #include <boost/iterator/function_input_iterator.hpp>
 #include <boost/algorithm/string.hpp>
 #include <string>
+#include <fmt/ostream.h>
+#include <seastar/core/format.hh>
 #include <seastar/core/sstring.hh>
 #include "marshal_exception.hh"
 
@@ -37,12 +39,12 @@ std::ostream& operator<<(std::ostream& out, const UUID& uuid) {
     return out;
 }
 
-UUID::UUID(sstring_view uuid) {
+UUID::UUID(std::string_view uuid) {
     sstring uuid_string(uuid.begin(), uuid.end());
     boost::erase_all(uuid_string, "-");
     auto size = uuid_string.size() / 2;
     if (size != 16) {
-        throw marshal_exception(format("UUID string size mismatch: '{}'", uuid));
+        throw marshal_exception(seastar::format("UUID string size mismatch: '{}'", uuid));
     }
     sstring most = sstring(uuid_string.begin(), uuid_string.begin() + size);
     sstring least = sstring(uuid_string.begin() + size, uuid_string.end());
@@ -58,7 +60,7 @@ UUID::UUID(sstring_view uuid) {
             throw std::invalid_argument("");
         }
     } catch (const std::logic_error&) {
-        throw marshal_exception(format("invalid UUID: '{}'", uuid));
+        throw marshal_exception(seastar::format("invalid UUID: '{}'", uuid));
     }
 }
 

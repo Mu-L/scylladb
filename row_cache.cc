@@ -3,16 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "row_cache.hh"
 #include <fmt/ranges.h>
 #include <seastar/core/memory.hh>
-#include <seastar/core/do_with.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/util/defer.hh>
 #include "replica/memtable.hh"
 #include <boost/version.hpp>
@@ -25,6 +26,7 @@
 #include "cache_mutation_reader.hh"
 #include "partition_snapshot_reader.hh"
 #include "clustering_key_filter.hh"
+#include "utils/assert.hh"
 #include "utils/updateable_value.hh"
 
 namespace cache {
@@ -1116,7 +1118,7 @@ future<> row_cache::update(external_updater eu, replica::memtable& m, preemption
         if (cache_i != partitions_end() && hint.match) {
             cache_entry& entry = *cache_i;
             upgrade_entry(entry);
-            assert(entry.schema() == _schema);
+            SCYLLA_ASSERT(entry.schema() == _schema);
             _tracker.on_partition_merge();
             mem_e.upgrade_schema(_tracker.region(), _schema, _tracker.memtable_cleaner());
             return entry.partition().apply_to_incomplete(*_schema, std::move(mem_e.partition()), _tracker.memtable_cleaner(),
@@ -1247,7 +1249,7 @@ future<> row_cache::invalidate(external_updater eu, dht::partition_range_vector&
                                     break;
                                 }
                             }
-                            assert(it != _partitions.end());
+                            SCYLLA_ASSERT(it != _partitions.end());
                             _tracker.clear_continuity(*it);
                             return stop_iteration(it == end);
                         });
@@ -1351,7 +1353,7 @@ void rows_entry::on_evicted(cache_tracker& tracker) noexcept {
 
     mutation_partition_v2::rows_type* rows = it.tree_if_singular();
     if (rows != nullptr) {
-        assert(it->is_last_dummy());
+        SCYLLA_ASSERT(it->is_last_dummy());
         partition_version& pv = partition_version::container_of(mutation_partition_v2::container_of(*rows));
         if (pv.is_referenced_from_entry()) {
             partition_entry& pe = partition_entry::container_of(pv);
@@ -1396,7 +1398,7 @@ mutation_reader cache_entry::read(row_cache& rc, std::unique_ptr<read_context> u
 // Assumes reader is in the corresponding partition
 mutation_reader cache_entry::do_read(row_cache& rc, read_context& reader) {
     auto snp = _pe.read(rc._tracker.region(), rc._tracker.cleaner(), &rc._tracker, reader.phase());
-    auto ckr = query::clustering_key_filter_ranges::get_native_ranges(*schema(), reader.native_slice(), _key.key());
+    auto ckr = query::clustering_key_filter_ranges::get_ranges(*schema(), reader.native_slice(), _key.key());
     schema_ptr entry_schema = to_query_domain(reader.slice(), schema());
     auto r = make_cache_mutation_reader(entry_schema, _key, std::move(ckr), rc, reader, std::move(snp));
     r.upgrade_schema(to_query_domain(reader.slice(), rc.schema()));
@@ -1406,7 +1408,7 @@ mutation_reader cache_entry::do_read(row_cache& rc, read_context& reader) {
 
 mutation_reader cache_entry::do_read(row_cache& rc, std::unique_ptr<read_context> unique_ctx) {
     auto snp = _pe.read(rc._tracker.region(), rc._tracker.cleaner(), &rc._tracker, unique_ctx->phase());
-    auto ckr = query::clustering_key_filter_ranges::get_native_ranges(*schema(), unique_ctx->native_slice(), _key.key());
+    auto ckr = query::clustering_key_filter_ranges::get_ranges(*schema(), unique_ctx->native_slice(), _key.key());
     schema_ptr reader_schema = unique_ctx->schema();
     schema_ptr entry_schema = to_query_domain(unique_ctx->slice(), schema());
     auto rc_schema = to_query_domain(unique_ctx->slice(), rc.schema());
@@ -1423,7 +1425,7 @@ const schema_ptr& row_cache::schema() const {
 void row_cache::upgrade_entry(cache_entry& e) {
     if (e.schema() != _schema && !e.partition().is_locked()) {
         auto& r = _tracker.region();
-        assert(!r.reclaiming_enabled());
+        SCYLLA_ASSERT(!r.reclaiming_enabled());
         e.partition().upgrade(r, _schema, _tracker.cleaner(), &_tracker);
     }
 }
@@ -1436,12 +1438,9 @@ std::ostream& operator<<(std::ostream& out, row_cache& rc) {
 }
 
 future<> row_cache::do_update(row_cache::external_updater eu, row_cache::internal_updater iu) noexcept {
-  // FIXME: indentation
-  return do_with(std::move(eu), std::move(iu), [this] (auto& eu, auto& iu) {
-    return futurize_invoke([this] {
-        return get_units(_update_sem, 1);
-    }).then([this, &eu, &iu] (auto permit) mutable {
-      return eu.prepare().then([this, &eu, &iu, permit = std::move(permit)] () mutable {
+    auto permit = co_await get_units(_update_sem, 1);
+    co_await eu.prepare();
+    {
         try {
             eu.execute();
         } catch (...) {
@@ -1454,18 +1453,17 @@ future<> row_cache::do_update(row_cache::external_updater eu, row_cache::interna
             _prev_snapshot = std::exchange(_underlying, _snapshot_source());
             ++_underlying_phase;
         }();
-        return futurize_invoke([&iu] {
+        auto f = co_await coroutine::as_future(futurize_invoke([&iu] {
             return iu();
-        }).then_wrapped([this, permit = std::move(permit)] (auto f) {
+        }));
+        {
             _prev_snapshot_pos = {};
             _prev_snapshot = {};
             if (f.failed()) {
                 clogger.warn("Failure during cache update: {}", f.get_exception());
             }
-        });
-      });
-    });
-  });
+        }
+    }
 }
 
 auto fmt::formatter<cache_entry>::format(const cache_entry& e, fmt::format_context& ctx) const

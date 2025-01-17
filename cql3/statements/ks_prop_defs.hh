@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -20,6 +20,11 @@
 namespace data_dictionary {
 class keyspace_metadata;
 }
+
+namespace db {
+    class config;
+}
+
 namespace gms {
     class inet_address;
 }
@@ -49,22 +54,16 @@ public:
 private:
     std::optional<sstring> _strategy_class;
 public:
-    struct init_tablets_options {
-        bool enabled;
-        std::optional<unsigned> specified_count;
-    };
-
     ks_prop_defs() = default;
     explicit ks_prop_defs(std::map<sstring, sstring> options);
 
     void validate();
     std::map<sstring, sstring> get_replication_options() const;
     std::optional<sstring> get_replication_strategy_class() const;
-    init_tablets_options get_initial_tablets(const sstring& strategy_class, bool enabled_by_default) const;
+    std::optional<unsigned> get_initial_tablets(std::optional<unsigned> default_value) const;
     data_dictionary::storage_options get_storage_options() const;
     bool get_durable_writes() const;
-    std::map<sstring, sstring> get_all_options_flattened(const gms::feature_service& feat) const;
-    lw_shared_ptr<data_dictionary::keyspace_metadata> as_ks_metadata(sstring ks_name, const locator::token_metadata&, const gms::feature_service&);
+    lw_shared_ptr<data_dictionary::keyspace_metadata> as_ks_metadata(sstring ks_name, const locator::token_metadata&, const gms::feature_service&, const db::config&);
     lw_shared_ptr<data_dictionary::keyspace_metadata> as_ks_metadata_update(lw_shared_ptr<data_dictionary::keyspace_metadata> old, const locator::token_metadata&, const gms::feature_service&);
 };
 

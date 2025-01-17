@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -26,6 +26,7 @@
 #include "raft/server.hh"
 #include "serializer.hh"
 #include "serializer_impl.hh"
+#include "utils/assert.hh"
 #include "utils/xx_hasher.hh"
 #include "utils/to_string.hh"
 #include "test/raft/helpers.hh"
@@ -432,7 +433,7 @@ public:
     future<> load_snapshot(raft::snapshot_id snp_id) override {
         hasher = make_lw_shared<hasher_int>((*_snapshots)[_id][snp_id].hasher);
         tlogger.debug("sm[{}] loads snapshot {} idx={}", _id, (*_snapshots)[_id][snp_id].hasher.finalize_uint64(), (*_snapshots)[_id][snp_id].idx);
-        _seen = (*_snapshots)[_id][snp_id].idx;
+        _seen = (*_snapshots)[_id][snp_id].idx.value();
         if (_seen >= _apply_entries) {
             _done.set_value();
         }
@@ -944,7 +945,7 @@ template <typename Clock>
 future<> raft_cluster<Clock>::add_entries_concurrent(size_t n, std::optional<size_t> server) {
     const auto start = _next_val;
     _next_val += n;
-    return parallel_for_each(boost::irange(start, _next_val), [this, server](size_t v) { return add_entry(v, server); });
+    return parallel_for_each(std::views::iota(start, _next_val), [this, server](size_t v) { return add_entry(v, server); });
 }
 
 template <typename Clock>
@@ -1018,7 +1019,7 @@ void raft_cluster<Clock>::set_ticker_callback(size_t id) noexcept {
     });
 }
 
-std::vector<raft::log_entry> create_log(std::vector<log_entry> list, unsigned start_idx);
+std::vector<raft::log_entry> create_log(std::vector<log_entry> list, raft::index_t start_idx);
 
 size_t apply_changes(raft::server_id id, const std::vector<raft::command_cref>& commands,
         lw_shared_ptr<hasher_int> hasher);
@@ -1287,7 +1288,7 @@ future<> raft_cluster<Clock>::partition(::partition p) {
         } else if (std::holds_alternative<struct range>(s)) {
             auto range = std::get<struct range>(s);
             for (size_t id = range.start; id <= range.end; id++) {
-                assert(id < _servers.size());
+                SCYLLA_ASSERT(id < _servers.size());
                 partition_servers.insert(id);
             }
         } else {
@@ -1389,7 +1390,7 @@ void raft_cluster<Clock>::verify() {
         for (auto& s : (*_persisted_snapshots)) {
             auto& [snp, val] = s.second;
             auto digest = val.hasher.finalize_uint64();
-            auto expected = hasher_int::hash_range(val.idx).finalize_uint64();
+            auto expected = hasher_int::hash_range(val.idx.value()).finalize_uint64();
             BOOST_CHECK_MESSAGE(digest == expected,
                                 format("Persisted snapshot {} doesn't match {} != {}", snp.id, digest, expected));
         }
@@ -1406,12 +1407,12 @@ std::vector<initial_state> raft_cluster<Clock>::get_states(test_case test, bool 
 
     // Server initial logs, etc
     for (size_t i = 0; i < states.size(); ++i) {
-        size_t start_idx = 1;
+        raft::index_t start_idx{1};
         if (i < test.initial_snapshots.size()) {
             states[i].snapshot = test.initial_snapshots[i].snap;
-            states[i].snp_value.hasher = hasher_int::hash_range(test.initial_snapshots[i].snap.idx);
+            states[i].snp_value.hasher = hasher_int::hash_range(test.initial_snapshots[i].snap.idx.value());
             states[i].snp_value.idx = test.initial_snapshots[i].snap.idx;
-            start_idx = states[i].snapshot.idx + 1;
+            start_idx = states[i].snapshot.idx + raft::index_t{1};
         }
         if (i < test.initial_states.size()) {
             auto state = test.initial_states[i];

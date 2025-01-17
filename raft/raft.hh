@@ -3,19 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
-#include <concepts>
+#include "utils/assert.hh"
 #include <vector>
 #include <unordered_set>
 #include <functional>
 #include <boost/container/deque.hpp>
-#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/future.hh>
 #include <seastar/util/log.hh>
-#include <seastar/util/source_location-compat.hh>
 #include <seastar/core/abort_source.hh>
 #include "bytes_ostream.hh"
 #include "internal.hh"
@@ -228,7 +226,7 @@ struct configuration {
 
     // Transition from C_old + C_new to C_new.
     void leave_joint() {
-        assert(is_joint());
+        SCYLLA_ASSERT(is_joint());
         previous.clear();
     }
 };
@@ -323,7 +321,7 @@ struct no_other_voting_member : public error {
 };
 
 struct request_aborted : public error {
-    request_aborted() : error("Request is aborted by a caller") {}
+    request_aborted(const std::string& error_msg) : error(error_msg) {}
 };
 
 inline bool is_uncertainty(const std::exception& e) {
@@ -814,16 +812,6 @@ public:
 };
 
 } // namespace raft
-
-#if FMT_VERSION < 100000
-// fmt v10 introduced formatter for std::exception
-template <std::derived_from<raft::error> T>
-struct fmt::formatter<T> : fmt::formatter<string_view> {
-    auto format(const T& e, fmt::format_context& ctx) const {
-        return fmt::format_to(ctx.out(), "{}", e.what());
-    }
-};
-#endif
 
 template <>
 struct fmt::formatter<raft::server_address> : fmt::formatter<string_view> {

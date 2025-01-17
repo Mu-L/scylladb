@@ -3,16 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
 #include <random>
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/algorithm/copy.hpp>
 #include <boost/range/algorithm_ext/push_back.hpp>
 #include <boost/range/combine.hpp>
+#include "compaction/compaction_garbage_collector.hh"
 #include "mutation_query.hh"
+#include "utils/assert.hh"
 #include "utils/hashers.hh"
 #include "utils/preempt.hh"
 #include "utils/xx_hasher.hh"
@@ -48,6 +48,7 @@
 #include "test/lib/mutation_assertions.hh"
 #include "test/lib/random_utils.hh"
 #include "test/lib/simple_schema.hh"
+#include "test/lib/sstable_utils.hh"
 #include "test/lib/test_utils.hh"
 #include "test/lib/log.hh"
 #include "types/map.hh"
@@ -100,12 +101,11 @@ with_column_family(schema_ptr s, replica::column_family::config cfg, sstables::s
     for (auto x_log2_compaction_groups : x_log2_compaction_group_values) {
         auto tracker = make_lw_shared<cache_tracker>();
         auto dir = tmpdir();
-        cfg.datadir = dir.path().string();
         cfg.x_log2_compaction_groups = x_log2_compaction_groups;
         tasks::task_manager tm;
         auto cm = make_lw_shared<compaction_manager>(tm, compaction_manager::for_testing_tag{});
         auto cl_stats = make_lw_shared<cell_locker_stats>();
-        auto s_opts = make_lw_shared<replica::storage_options>();
+        auto s_opts = make_lw_shared<replica::storage_options>(data_dictionary::make_local_options(dir.path()));
         auto cf = make_lw_shared<replica::column_family>(s, cfg, s_opts, *cm, sm, *cl_stats, *tracker, nullptr);
         cf->mark_ready_for_writes(nullptr);
         co_await func(*cf);
@@ -117,8 +117,11 @@ SEASTAR_TEST_CASE(test_mutation_is_applied) {
     return seastar::async([] {
         tests::reader_concurrency_semaphore_wrapper semaphore;
 
-        auto s = make_shared_schema({}, some_keyspace, some_column_family,
-            {{"p1", utf8_type}}, {{"c1", int32_type}}, {{"r1", int32_type}}, {}, utf8_type);
+        auto s = schema_builder(some_keyspace, some_column_family)
+                    .with_column("p1", utf8_type, column_kind::partition_key)
+                    .with_column("c1", int32_type, column_kind::clustering_key)
+                    .with_column("r1", int32_type)
+                    .build();
 
         auto mt = make_lw_shared<replica::memtable>(s);
 
@@ -142,10 +145,13 @@ SEASTAR_TEST_CASE(test_mutation_is_applied) {
 }
 
 SEASTAR_TEST_CASE(test_multi_level_row_tombstones) {
-    auto s = make_shared_schema({}, some_keyspace, some_column_family,
-        {{"p1", utf8_type}},
-        {{"c1", int32_type}, {"c2", int32_type}, {"c3", int32_type}},
-        {{"r1", int32_type}}, {}, utf8_type);
+    auto s = schema_builder(some_keyspace, some_column_family)
+                .with_column("p1", utf8_type, column_kind::partition_key)
+                .with_column("c1", int32_type, column_kind::clustering_key)
+                .with_column("c2", int32_type, column_kind::clustering_key)
+                .with_column("c3", int32_type, column_kind::clustering_key)
+                .with_column("r1", int32_type)
+                .build();
 
     auto ttl = gc_clock::now() + std::chrono::seconds(1);
 
@@ -177,8 +183,12 @@ SEASTAR_TEST_CASE(test_multi_level_row_tombstones) {
 }
 
 SEASTAR_TEST_CASE(test_row_tombstone_updates) {
-    auto s = make_shared_schema({}, some_keyspace, some_column_family,
-        {{"p1", utf8_type}}, {{"c1", int32_type}, {"c2", int32_type}}, {{"r1", int32_type}}, {}, utf8_type);
+    auto s = schema_builder(some_keyspace, some_column_family)
+                .with_column("p1", utf8_type, column_kind::partition_key)
+                .with_column("c1", int32_type, column_kind::clustering_key)
+                .with_column("c2", int32_type, column_kind::clustering_key)
+                .with_column("r1", int32_type)
+                .build();
 
     auto key = partition_key::from_exploded(*s, {to_bytes("key1")});
     auto c_key1 = clustering_key::from_deeply_exploded(*s, {1, 0});
@@ -222,8 +232,11 @@ SEASTAR_TEST_CASE(test_map_mutations) {
         tests::reader_concurrency_semaphore_wrapper semaphore;
 
         auto my_map_type = map_type_impl::get_instance(int32_type, utf8_type, true);
-        auto s = make_shared_schema({}, some_keyspace, some_column_family,
-            {{"p1", utf8_type}}, {{"c1", int32_type}}, {}, {{"s1", my_map_type}}, utf8_type);
+        auto s = schema_builder(some_keyspace, some_column_family)
+                    .with_column("p1", utf8_type, column_kind::partition_key)
+                    .with_column("c1", int32_type, column_kind::clustering_key)
+                    .with_column("s1", my_map_type, column_kind::static_column)
+                    .build();
         auto mt = make_lw_shared<replica::memtable>(s);
         auto key = partition_key::from_exploded(*s, {to_bytes("key1")});
         auto& column = *s->get_column_definition("s1");
@@ -260,8 +273,11 @@ SEASTAR_TEST_CASE(test_set_mutations) {
         tests::reader_concurrency_semaphore_wrapper semaphore;
 
         auto my_set_type = set_type_impl::get_instance(int32_type, true);
-        auto s = make_shared_schema({}, some_keyspace, some_column_family,
-            {{"p1", utf8_type}}, {{"c1", int32_type}}, {}, {{"s1", my_set_type}}, utf8_type);
+        auto s = schema_builder(some_keyspace, some_column_family)
+                    .with_column("p1", utf8_type, column_kind::partition_key)
+                    .with_column("c1", int32_type, column_kind::clustering_key)
+                    .with_column("s1", my_set_type, column_kind::static_column)
+                    .build();
         auto mt = make_lw_shared<replica::memtable>(s);
         auto key = partition_key::from_exploded(*s, {to_bytes("key1")});
         auto& column = *s->get_column_definition("s1");
@@ -298,8 +314,11 @@ SEASTAR_TEST_CASE(test_list_mutations) {
         tests::reader_concurrency_semaphore_wrapper semaphore;
 
         auto my_list_type = list_type_impl::get_instance(int32_type, true);
-        auto s = make_shared_schema({}, some_keyspace, some_column_family,
-            {{"p1", utf8_type}}, {{"c1", int32_type}}, {}, {{"s1", my_list_type}}, utf8_type);
+        auto s = schema_builder(some_keyspace, some_column_family)
+                    .with_column("p1", utf8_type, column_kind::partition_key)
+                    .with_column("c1", int32_type, column_kind::clustering_key)
+                    .with_column("s1", my_list_type, column_kind::static_column)
+                    .build();
         auto mt = make_lw_shared<replica::memtable>(s);
         auto key = partition_key::from_exploded(*s, {to_bytes("key1")});
         auto& column = *s->get_column_definition("s1");
@@ -341,8 +360,11 @@ SEASTAR_THREAD_TEST_CASE(test_udt_mutations) {
             {int32_type, utf8_type, long_type, utf8_type},
             true);
 
-    auto s = make_shared_schema({}, some_keyspace, some_column_family,
-        {{"p1", utf8_type}}, {{"c1", int32_type}}, {}, {{"s1", ut}}, utf8_type);
+    auto s = schema_builder(some_keyspace, some_column_family)
+                .with_column("p1", utf8_type, column_kind::partition_key)
+                .with_column("c1", int32_type, column_kind::clustering_key)
+                .with_column("s1", ut, column_kind::static_column)
+                .build();
     auto mt = make_lw_shared<replica::memtable>(s);
     auto key = partition_key::from_exploded(*s, {to_bytes("key1")});
     auto& column = *s->get_column_definition("s1");
@@ -457,7 +479,7 @@ SEASTAR_THREAD_TEST_CASE(test_large_collection_allocation) {
         auto res_mut_opt = read_mutation_from_mutation_reader(rd).get();
         BOOST_REQUIRE(res_mut_opt);
 
-        res_mut_opt->partition().compact_for_query(*schema, res_mut_opt->decorated_key(), gc_clock::now(), {query::full_clustering_range}, true, false,
+        res_mut_opt->partition().compact_for_query(*schema, res_mut_opt->decorated_key(), gc_clock::now(), {query::full_clustering_range}, true,
                 std::numeric_limits<uint32_t>::max());
 
         const auto stats_after = memory::stats();
@@ -494,8 +516,11 @@ SEASTAR_THREAD_TEST_CASE(test_large_collection_serialization_exception_safety) {
 
 SEASTAR_TEST_CASE(test_multiple_memtables_one_partition) {
     return sstables::test_env::do_with_async([] (sstables::test_env& env) {
-    auto s = make_shared_schema({}, some_keyspace, some_column_family,
-        {{"p1", utf8_type}}, {{"c1", int32_type}}, {{"r1", int32_type}}, {}, utf8_type);
+    auto s = schema_builder(some_keyspace, some_column_family)
+                .with_column("p1", utf8_type, column_kind::partition_key)
+                .with_column("c1", int32_type, column_kind::clustering_key)
+                .with_column("r1", int32_type)
+                .build();
 
     auto cf_stats = make_lw_shared<replica::cf_stats>();
     replica::column_family::config cfg = env.make_table_config();
@@ -598,7 +623,7 @@ SEASTAR_TEST_CASE(test_flush_in_the_middle_of_a_scan) {
                 assert_that_scanner3.produces(mutations[i]);
             }
 
-            auto ms = cf.active_memtables(); // held by scanners
+            auto ms = active_memtables(cf); // held by scanners
 
             auto flushed = cf.flush();
 
@@ -626,8 +651,11 @@ SEASTAR_TEST_CASE(test_flush_in_the_middle_of_a_scan) {
 
 SEASTAR_TEST_CASE(test_multiple_memtables_multiple_partitions) {
     return sstables::test_env::do_with_async([] (sstables::test_env& env) {
-    auto s = make_shared_schema({}, some_keyspace, some_column_family,
-            {{"p1", int32_type}}, {{"c1", int32_type}}, {{"r1", int32_type}}, {}, utf8_type);
+    auto s = schema_builder(some_keyspace, some_column_family)
+                .with_column("p1", int32_type, column_kind::partition_key)
+                .with_column("c1", int32_type, column_kind::clustering_key)
+                .with_column("r1", int32_type)
+                .build();
 
     auto cf_stats = make_lw_shared<replica::cf_stats>();
 
@@ -1326,8 +1354,10 @@ SEASTAR_TEST_CASE(test_large_blobs) {
     return seastar::async([] {
         tests::reader_concurrency_semaphore_wrapper semaphore;
 
-        auto s = make_shared_schema({}, some_keyspace, some_column_family,
-            {{"p1", utf8_type}}, {}, {}, {{"s1", bytes_type}}, utf8_type);
+        auto s = schema_builder(some_keyspace, some_column_family)
+                    .with_column("p1", utf8_type, column_kind::partition_key)
+                    .with_column("s1", bytes_type, column_kind::static_column)
+                    .build();
 
         auto mt = make_lw_shared<replica::memtable>(s);
 
@@ -1602,8 +1632,6 @@ SEASTAR_THREAD_TEST_CASE(test_mutation_upgrade_type_change) {
 // duplicated logic that decides if a row is expired, and this test verifies that they behave the same with respect
 // to TTL.
 SEASTAR_THREAD_TEST_CASE(test_row_marker_expiry) {
-    can_gc_fn never_gc = [] (tombstone) { return false; };
-
     auto must_be_alive = [&] (row_marker mark, gc_clock::time_point t) {
         testlog.trace("must_be_alive({}, {})", mark, t);
         BOOST_REQUIRE(mark.is_live(tombstone(), t));
@@ -1907,11 +1935,18 @@ SEASTAR_TEST_CASE(test_trim_rows) {
 
         auto compact_and_expect_empty = [&] (mutation m, std::vector<query::clustering_range> ranges) {
             mutation m2 = m;
-            m.partition().compact_for_query(*s, m.decorated_key(), now, ranges, false, false, query::max_rows);
+            m.partition().compact_for_query(*s, m.decorated_key(), now, ranges, false, query::max_rows);
             BOOST_REQUIRE(m.partition().clustered_rows().empty());
 
             std::reverse(ranges.begin(), ranges.end());
-            m2.partition().compact_for_query(*s, m2.decorated_key(), now, ranges, false, true, query::max_rows);
+            for (auto& range : ranges) {
+                if (!range.is_singular()) {
+                    range = query::clustering_range(range.end(), range.start());
+                }
+            }
+            m2 = reverse(m);
+            auto reversed_schema = s->make_reversed();
+            m2.partition().compact_for_query(*reversed_schema, m2.decorated_key(), now, ranges, false, query::max_rows);
             BOOST_REQUIRE(m2.partition().clustered_rows().empty());
         };
 
@@ -1939,8 +1974,10 @@ SEASTAR_TEST_CASE(test_trim_rows) {
 
 SEASTAR_TEST_CASE(test_collection_cell_diff) {
     return seastar::async([] {
-        auto s = make_shared_schema({}, some_keyspace, some_column_family,
-            {{"p", utf8_type}}, {}, {{"v", list_type_impl::get_instance(bytes_type, true)}}, {}, utf8_type);
+        auto s = schema_builder(some_keyspace, some_column_family)
+                    .with_column("p", utf8_type, column_kind::partition_key)
+                    .with_column("v", list_type_impl::get_instance(bytes_type, true))
+                    .build();
 
         auto& col = s->column_at(column_kind::regular_column, 0);
         auto k = dht::decorate_key(*s, partition_key::from_single_value(*s, to_bytes("key")));
@@ -1986,7 +2023,6 @@ SEASTAR_TEST_CASE(test_mutation_diff_with_random_generator) {
             }
         };
         const auto now = gc_clock::now();
-        can_gc_fn never_gc = [] (tombstone) { return false; };
         for_each_mutation_pair([&] (auto m1, auto m2, are_equal eq) {
             mutation_application_stats app_stats;
             auto s = m1.schema();
@@ -2663,24 +2699,24 @@ SEASTAR_THREAD_TEST_CASE(test_collection_compaction) {
     // No collection tombstone, row tombstone covers all cells
     auto cmut = make_collection_mutation({}, key, make_collection_member(bytes_type, value));
     auto row_tomb = row_tombstone(tombstone { 1, gc_clock::time_point() });
-    auto any_live = cmut.compact_and_expire(0, row_tomb, gc_clock::time_point(), always_gc, gc_clock::time_point());
-    BOOST_CHECK(!any_live);
+    auto res = cmut.compact_and_expire(0, row_tomb, gc_clock::time_point(), always_gc, gc_clock::time_point());
+    BOOST_CHECK(!res.is_live());
     BOOST_CHECK(!cmut.tomb);
     BOOST_CHECK(cmut.cells.empty());
 
     // No collection tombstone, row tombstone doesn't cover anything
     cmut = make_collection_mutation({}, key, make_collection_member(bytes_type, value));
     row_tomb = row_tombstone(tombstone { -1, gc_clock::time_point() });
-    any_live = cmut.compact_and_expire(0, row_tomb, gc_clock::time_point(), always_gc, gc_clock::time_point());
-    BOOST_CHECK(any_live);
+    res = cmut.compact_and_expire(0, row_tomb, gc_clock::time_point(), always_gc, gc_clock::time_point());
+    BOOST_CHECK(res.is_live());
     BOOST_CHECK(!cmut.tomb);
     BOOST_CHECK_EQUAL(cmut.cells.size(), 1);
 
     // Collection tombstone covers everything
     cmut = make_collection_mutation(tombstone { 2, gc_clock::time_point() }, key, make_collection_member(bytes_type, value));
     row_tomb = row_tombstone(tombstone { 1, gc_clock::time_point() });
-    any_live = cmut.compact_and_expire(0, row_tomb, gc_clock::time_point(), always_gc, gc_clock::time_point());
-    BOOST_CHECK(!any_live);
+    res = cmut.compact_and_expire(0, row_tomb, gc_clock::time_point(), always_gc, gc_clock::time_point());
+    BOOST_CHECK(!res.is_live());
     BOOST_CHECK(cmut.tomb);
     BOOST_CHECK_EQUAL(cmut.tomb.timestamp, 2);
     BOOST_CHECK(cmut.cells.empty());
@@ -2688,8 +2724,8 @@ SEASTAR_THREAD_TEST_CASE(test_collection_compaction) {
     // Collection tombstone covered by row tombstone
     cmut = make_collection_mutation(tombstone { 2, gc_clock::time_point() }, key, make_collection_member(bytes_type, value));
     row_tomb = row_tombstone(tombstone { 3, gc_clock::time_point() });
-    any_live = cmut.compact_and_expire(0, row_tomb, gc_clock::time_point(), always_gc, gc_clock::time_point());
-    BOOST_CHECK(!any_live);
+    res = cmut.compact_and_expire(0, row_tomb, gc_clock::time_point(), always_gc, gc_clock::time_point());
+    BOOST_CHECK(!res.is_live());
     BOOST_CHECK(!cmut.tomb);
     BOOST_CHECK(cmut.cells.empty());
 }
@@ -2701,7 +2737,7 @@ class basic_compacted_fragments_consumer_base {
     const schema& _schema;
     gc_clock::time_point _query_time;
     gc_clock::time_point _gc_before;
-    std::function<api::timestamp_type(const dht::decorated_key&)> _get_max_purgeable;
+    max_purgeable_fn _get_max_purgeable;
     api::timestamp_type _max_purgeable;
 
     std::vector<mutation> _mutations;
@@ -2762,7 +2798,7 @@ private:
 
 public:
     basic_compacted_fragments_consumer_base(const schema& schema, gc_clock::time_point query_time,
-            std::function<api::timestamp_type(const dht::decorated_key&)> get_max_purgeable)
+            max_purgeable_fn get_max_purgeable)
         : _schema(schema)
         , _query_time(query_time)
         , _gc_before(saturating_subtract(query_time, _schema.gc_grace_seconds()))
@@ -2770,7 +2806,7 @@ public:
         , _mutation(_schema.shared_from_this()) {
     }
     void consume_new_partition(const dht::decorated_key& dk) {
-        _max_purgeable = _get_max_purgeable(dk);
+        _max_purgeable = _get_max_purgeable(dk, is_shadowable::no);
         _mutation.consume_new_partition(dk);
     }
     void consume(tombstone t) {
@@ -2832,16 +2868,13 @@ using purged_compacted_fragments_consumer = basic_compacted_fragments_consumer_b
 
 void run_compaction_data_stream_split_test(const schema& schema, reader_permit permit, gc_clock::time_point query_time,
         std::vector<mutation> mutations) {
-    auto never_gc = std::function<bool(tombstone)>([] (tombstone) { return false; });
     for (auto& mut : mutations) {
         mut.partition().compact_for_compaction(schema, never_gc, mut.decorated_key(), query_time, tombstone_gc_state(nullptr));
     }
 
     auto reader = make_mutation_reader_from_mutations_v2(schema.shared_from_this(), std::move(permit), mutations);
     auto close_reader = deferred_close(reader);
-    auto get_max_purgeable = [] (const dht::decorated_key&) {
-        return api::max_timestamp;
-    };
+    auto get_max_purgeable = can_always_purge;
     auto consumer = compact_for_compaction_v2<survived_compacted_fragments_consumer, purged_compacted_fragments_consumer>(
             schema,
             query_time,
@@ -2926,13 +2959,13 @@ SEASTAR_THREAD_TEST_CASE(test_compaction_data_stream_split) {
             if (destination == tests::timestamp_destination::partition_tombstone ||
                     destination == tests::timestamp_destination::row_tombstone ||
                     destination == tests::timestamp_destination::range_tombstone) {
-                assert(min_timestamp < tomb_ts_max);
+                SCYLLA_ASSERT(min_timestamp < tomb_ts_max);
                 return tests::random::get_int<api::timestamp_type>(tomb_ts_min, tomb_ts_max, engine);
             } else if (destination == tests::timestamp_destination::collection_tombstone) {
-                assert(min_timestamp < collection_tomb_ts_max);
+                SCYLLA_ASSERT(min_timestamp < collection_tomb_ts_max);
                 return tests::random::get_int<api::timestamp_type>(collection_tomb_ts_min, collection_tomb_ts_max, engine);
             } else {
-                assert(min_timestamp < other_ts_max);
+                SCYLLA_ASSERT(min_timestamp < other_ts_max);
                 return tests::random::get_int<api::timestamp_type>(other_ts_min, other_ts_max, engine);
             }
         };
@@ -2961,13 +2994,13 @@ SEASTAR_THREAD_TEST_CASE(test_compaction_data_stream_split) {
             if (destination == tests::timestamp_destination::partition_tombstone ||
                     destination == tests::timestamp_destination::row_tombstone ||
                     destination == tests::timestamp_destination::range_tombstone) {
-                assert(min_timestamp < tomb_ts_max);
+                SCYLLA_ASSERT(min_timestamp < tomb_ts_max);
                 return tests::random::get_int<api::timestamp_type>(tomb_ts_min, tomb_ts_max, engine);
             } else if (destination == tests::timestamp_destination::collection_tombstone) {
-                assert(min_timestamp < tomb_ts_max);
+                SCYLLA_ASSERT(min_timestamp < tomb_ts_max);
                 return tests::random::get_int<api::timestamp_type>(collection_tomb_ts_min, collection_tomb_ts_max, engine);
             } else {
-                assert(min_timestamp < other_ts_max);
+                SCYLLA_ASSERT(min_timestamp < other_ts_max);
                 return tests::random::get_int<api::timestamp_type>(other_ts_min, other_ts_max, engine);
             }
         };
@@ -3413,7 +3446,7 @@ SEASTAR_THREAD_TEST_CASE(test_compactor_range_tombstone_spanning_many_pages) {
         auto mut_opt = reader.consume(mutation_rebuilder_v2(s)).get();
         BOOST_REQUIRE(mut_opt);
         ref_mut = std::move(*mut_opt);
-        ref_mut.partition().compact_for_query(*s, pk, query_time, {query::clustering_range::make_open_ended_both_sides()}, true, false, max_rows);
+        ref_mut.partition().compact_for_query(*s, pk, query_time, {query::clustering_range::make_open_ended_both_sides()}, true, max_rows);
     }
 
     struct consumer_v2 {
@@ -3726,7 +3759,7 @@ SEASTAR_THREAD_TEST_CASE(test_compactor_validator) {
             auto msg = fmt::format("expected_is_valid ({}) != is_valid ({}), fragments:\n{}",
                     expected_is_valid,
                     is_valid,
-                    fmt::join(frag_refs | boost::adaptors::transformed([&] (std::reference_wrapper<const mutation_fragment_v2> mf) {
+                    fmt::join(frag_refs | std::views::transform([&] (std::reference_wrapper<const mutation_fragment_v2> mf) {
                         return fmt::format("{}", mutation_fragment_v2::printer(*s, mf.get()));
                     }), "\n"));
             BOOST_FAIL(msg);
@@ -3794,10 +3827,137 @@ SEASTAR_TEST_CASE(test_tracing_format) {
     // scylla-dtest/tools/cdc_utils.py::CDCTraceInfoMatcher matches the
     // formatted token with "{key: pk(.*?), token:(.*)}", so let's make
     // sure we don't break it
-    dht::token token{dht::token_kind::key, 42};
+    dht::token token{42};
     int8_t bytes[] = {0x01, 0x03, 0x00};
     dht::decorated_key key{token, partition_key::from_bytes(bytes)};
     std::string formatted = fmt::to_string(key);
     BOOST_CHECK_EQUAL(formatted, "{key: pk{0103}, token: 42}");
     return make_ready_future();
  }
+
+void do_make_collection(collection_mutation_description& desc, std::pair<bytes, atomic_cell>&& cell) {
+    desc.cells.push_back(std::move(cell));
+};
+
+template <typename... Cell>
+void do_make_collection(collection_mutation_description& desc, std::pair<bytes, atomic_cell>&& cell, Cell&& ...cells) {
+    desc.cells.push_back(std::move(cell));
+    do_make_collection(desc, std::forward<Cell>(cells)...);
+};
+
+SEASTAR_TEST_CASE(test_compact_and_expire_cell_stats) {
+    const auto collection_type = map_type_impl::get_instance(int32_type, int32_type, true);
+
+    auto schema = schema_builder("test", "test_compact_and_expire_cell_stats")
+        .with_column("pk", int32_type, column_kind::partition_key)
+        .with_column("ck", int32_type, column_kind::clustering_key)
+        .with_column("static_atomic", int32_type, column_kind::static_column)
+        .with_column("static_collection", collection_type, column_kind::static_column)
+        .with_column("regular_atomic", int32_type, column_kind::regular_column)
+        .with_column("regular_collection", collection_type, column_kind::regular_column)
+        .build();
+    auto& s = *schema;
+
+    api::timestamp_type live_ts = 10;
+    api::timestamp_type tomb_ts = 5;
+    api::timestamp_type dead_ts = 0;
+
+    const auto now = gc_clock::now();
+
+    const auto value = data_value(10).serialize_nonnull();
+    const auto value1 = data_value(11).serialize_nonnull();
+
+    struct row_content {
+        std::optional<atomic_cell> atomic_column;
+        std::optional<collection_mutation> collection_column;
+    };
+
+    const auto make_collection = [&] (tombstone tomb, auto&&... cells) {
+        collection_mutation_description desc;
+        desc.tomb = tomb;
+        do_make_collection(desc, std::forward<decltype(cells)>(cells)...);
+        return desc.serialize(*collection_type);
+    };
+
+    const auto check = [&] (row_content rc, row_tombstone rt, compact_and_expire_result expected_res, std::source_location sl = std::source_location::current()) {
+        testlog.info("check() @ {}:{}", sl.file_name(), sl.line());
+        const static std::unordered_map<column_kind, std::array<bytes, 2>> column_names = {
+            {column_kind::static_column, {"static_atomic", "static_collection"}},
+            {column_kind::regular_column, {"regular_atomic", "regular_collection"}},
+        };
+        for (const auto col_kind : {column_kind::static_column, column_kind::regular_column}) {
+            row r;
+            if (rc.atomic_column) {
+                const auto cdef = *s.get_column_definition(column_names.at(col_kind)[0]);
+                r.apply(cdef, atomic_cell_or_collection(atomic_cell(*int32_type, *rc.atomic_column)));
+            }
+            if (rc.collection_column) {
+                const auto cdef = *s.get_column_definition(column_names.at(col_kind)[1]);
+                r.apply(cdef, atomic_cell_or_collection(collection_mutation(*collection_type, *rc.collection_column)));
+            }
+            auto res = r.compact_and_expire(s, col_kind, rt, now, always_gc, now);
+            BOOST_REQUIRE_EQUAL(res, expected_res);
+        }
+    };
+
+    check(row_content{}, row_tombstone{}, {});
+
+    check(row_content{.atomic_column = atomic_cell::make_live(*int32_type, live_ts, value)}, row_tombstone{}, {.live_cells = 1});
+    check(row_content{.atomic_column = atomic_cell::make_live(*int32_type, live_ts, value)}, row_tombstone{tombstone(tomb_ts, now)}, {.live_cells = 1});
+
+    check(row_content{.atomic_column = atomic_cell::make_dead(dead_ts, now)}, row_tombstone{}, {.dead_cells = 1});
+    check(row_content{.atomic_column = atomic_cell::make_live(*int32_type, dead_ts, value)}, row_tombstone{tombstone(tomb_ts, now)}, {.dead_cells = 1});
+
+    check(row_content{
+                .collection_column = make_collection({}, std::pair(value, atomic_cell::make_live(*int32_type, live_ts, value)))
+            }, row_tombstone{}, {.live_cells = 1});
+
+    check(row_content{
+                .collection_column = make_collection({}, std::pair(value, atomic_cell::make_live(*int32_type, live_ts, value)),
+                         std::pair(value1, atomic_cell::make_live(*int32_type, live_ts, value1)))
+            }, row_tombstone{}, {.live_cells = 2});
+
+    check(row_content{
+                .atomic_column = atomic_cell::make_dead(dead_ts, now),
+                .collection_column = make_collection({}, std::pair(value, atomic_cell::make_live(*int32_type, live_ts, value)),
+                         std::pair(value1, atomic_cell::make_live(*int32_type, live_ts, value1)))
+            }, row_tombstone{}, {.live_cells = 2, .dead_cells = 1});
+
+    check(row_content{
+                .atomic_column = atomic_cell::make_live(*int32_type, live_ts, value),
+                .collection_column = make_collection({}, std::pair(value, atomic_cell::make_live(*int32_type, live_ts, value)),
+                         std::pair(value1, atomic_cell::make_live(*int32_type, live_ts, value1)))
+            }, row_tombstone{}, {.live_cells = 3});
+
+    check(row_content{
+                .atomic_column = atomic_cell::make_live(*int32_type, live_ts, value),
+                .collection_column = make_collection({}, std::pair(value, atomic_cell::make_dead(dead_ts, now)),
+                         std::pair(value1, atomic_cell::make_live(*int32_type, live_ts, value1)))
+            }, row_tombstone{}, {.live_cells = 2, .dead_cells = 1});
+
+    check(row_content{
+                .atomic_column = atomic_cell::make_live(*int32_type, live_ts, value),
+                .collection_column = make_collection(tombstone(tomb_ts, now), std::pair(value, atomic_cell::make_dead(dead_ts, now)),
+                         std::pair(value1, atomic_cell::make_live(*int32_type, live_ts, value1)))
+            }, row_tombstone{}, {.live_cells = 2, .dead_cells = 1, .collection_tombstones = 1});
+
+    check(row_content{
+                .atomic_column = atomic_cell::make_live(*int32_type, live_ts, value),
+                .collection_column = make_collection(tombstone(tomb_ts, now), std::pair(value, atomic_cell::make_live(*int32_type, dead_ts, value)),
+                         std::pair(value1, atomic_cell::make_live(*int32_type, live_ts, value1)))
+            }, row_tombstone{}, {.live_cells = 2, .dead_cells = 1, .collection_tombstones = 1});
+
+    check(row_content{
+                .atomic_column = atomic_cell::make_live(*int32_type, dead_ts, value),
+                .collection_column = make_collection({}, std::pair(value, atomic_cell::make_dead(dead_ts, now)),
+                         std::pair(value1, atomic_cell::make_live(*int32_type, live_ts, value1)))
+            }, row_tombstone(tombstone(tomb_ts, now)), {.live_cells = 1, .dead_cells = 2});
+
+    check(row_content{
+                .atomic_column = atomic_cell::make_live(*int32_type, dead_ts, value),
+                .collection_column = make_collection(tombstone(dead_ts, now), std::pair(value, atomic_cell::make_dead(dead_ts, now)),
+                         std::pair(value1, atomic_cell::make_live(*int32_type, live_ts, value1)))
+            }, row_tombstone(tombstone(tomb_ts, now)), {.live_cells = 1, .dead_cells = 2, .collection_tombstones = 1});
+
+    return make_ready_future();
+}

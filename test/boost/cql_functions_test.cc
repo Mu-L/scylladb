@@ -3,30 +3,35 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <algorithm>
 
 #include <boost/range/irange.hpp>
-#include <boost/range/adaptors.hpp>
 #include <boost/range/algorithm.hpp>
+#include <boost/range/adaptor/uniqued.hpp>
 #include <boost/test/unit_test.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
 
 #include <seastar/net/inet_address.hh>
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
 
 #include <seastar/core/future-util.hh>
 #include "transport/messages/result_message.hh"
+#include "utils/assert.hh"
 #include "utils/big_decimal.hh"
 #include "types/map.hh"
 #include "types/list.hh"
 #include "types/set.hh"
 #include "schema/schema_builder.hh"
+
+BOOST_AUTO_TEST_SUITE(cql_functions_test)
 
 using namespace std::literals::chrono_literals;
 
@@ -69,7 +74,7 @@ SEASTAR_TEST_CASE(test_functions) {
             validator v;
             msg->accept(v);
             // No boost::adaptors::sorted
-            boost::sort(v.res);
+            std::ranges::sort(v.res);
             BOOST_REQUIRE_EQUAL(boost::distance(v.res | boost::adaptors::uniqued), 3);
         }).then([&] {
             return e.execute_cql("select sum(c1), count(c1) from cf where p1 = 'key1';");
@@ -316,7 +321,7 @@ SEASTAR_TEST_CASE(test_aggregate_functions_timeuuid_type) {
             timeuuid_native_type{utils::UUID("00000000-0000-1000-0000-000000000000")},
             timeuuid_native_type{utils::UUID("00000000-0000-1000-0000-000000000001")},
             timeuuid_native_type{utils::UUID("00000000-0000-1000-0000-000000000002")}
-        ).test_count(); // min and max will fail, because we assert using UUID order, not timestamp order.
+        ).test_count(); // min and max will fail, because we SCYLLA_ASSERT using UUID order, not timestamp order.
     });
 }
 
@@ -406,3 +411,5 @@ SEASTAR_TEST_CASE(test_aggregate_functions_map_type) {
         ).test_min_max_count();
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

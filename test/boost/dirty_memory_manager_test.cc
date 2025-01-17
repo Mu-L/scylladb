@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
@@ -14,9 +14,10 @@
 
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/gate.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/timer.hh>
+#include <seastar/core/shared_future.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread_cputime_clock.hh>
 #include <seastar/core/when_all.hh>
@@ -32,7 +33,7 @@
 #include "utils/managed_ref.hh"
 #include "utils/managed_bytes.hh"
 #include "test/lib/log.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 [[gnu::unused]]
 static auto x = [] {

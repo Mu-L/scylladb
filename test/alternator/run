@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# Use the run.py library from ../cql-pytest:
+# Use the run.py library from ../cqlpy:
 import sys
-sys.path.insert(1, sys.path[0] + '/../cql-pytest')
+sys.path.insert(1, sys.path[0] + '/../cqlpy')
 import run
 
 import os
@@ -21,6 +21,22 @@ if '--aws' in sys.argv:
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+
+# If the first option is "--release", download that release (see
+# fetch_scylla.py for supported release numbers), and use that.
+# The downloaded Scylla will be cached in the directory build/<release>,
+# where <release> is the specific release downloaded - E.g., if the user
+# asks "--release 2022.1" and the downloaded release is 2022.1.9, it
+# will be stored in build/2022.1.9.
+if len(sys.argv) > 1 and sys.argv[1] == '--release':
+    release = sys.argv[2]
+    exe = run.download_precompiled_scylla(release)
+    run_scylla_cmd = lambda pid, dir: run.run_precompiled_scylla_cmd(exe, pid, dir)
+    sys.argv = sys.argv[0:1] + sys.argv[3:]
+    os.environ['SCYLLA'] = exe # so find_scylla() prints the right one
+else:
+    run_scylla_cmd = run.run_scylla_cmd
+
 print('Scylla is: ' + run.find_scylla() + '.')
 
 extra_scylla_options = []
@@ -33,6 +49,8 @@ remove_scylla_options = []
 if '--vnodes' in sys.argv:
     sys.argv.remove('--vnodes')
     remove_scylla_options.append('--enable-tablets=true')
+    # Tablets are now enabled by default on some releases, it is not enough to remove the enable above.
+    extra_scylla_options.append('--enable-tablets=false')
 
 if "-h" in sys.argv or "--help" in sys.argv:
     run.run_pytest(sys.path[0], sys.argv)
@@ -44,7 +62,7 @@ run.omit_scylla_output = "--omit-scylla-output" in sys.argv
 # parameters, so in particular both CQL and Alternator will be enabled.
 # This is useful for us because we need CQL to setup authentication.
 def run_alternator_cmd(pid, dir):
-    (cmd, env) = run.run_scylla_cmd(pid, dir)
+    (cmd, env) = run_scylla_cmd(pid, dir)
     ip = run.pid_to_ip(pid)
     cmd += [
         '--alternator-address', ip,
@@ -56,7 +74,7 @@ def run_alternator_cmd(pid, dir):
         # Allow testing experimental features. Following issue #9467, we need
         # to add here specific experimental features as they are introduced.
         # We only list here Alternator-specific experimental features - CQL
-        # ones are listed in test/cql-pytest/run.py.
+        # ones are listed in test/cqlpy/run.py.
         '--experimental-features=alternator-streams',
     ]
     if '--https' in sys.argv:

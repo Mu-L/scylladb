@@ -3,18 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "mutation/partition_version.hh"
 #include "row_cache.hh"
+#include "utils/assert.hh"
 #include "utils/small_vector.hh"
-#include <boost/algorithm/cxx11/any_of.hpp>
-#include <boost/range/algorithm/find_if.hpp>
-#include <boost/range/algorithm/heap_algorithm.hpp>
 #include <fmt/core.h>
+#include <ranges>
 
 class partition_snapshot_row_cursor;
 
@@ -200,7 +199,7 @@ class partition_snapshot_row_cursor final {
         version_heap_less_compare heap_less(*this);
         position_in_partition::equal_compare eq(*_snp.schema());
         do {
-            boost::range::pop_heap(_heap, heap_less);
+            std::ranges::pop_heap(_heap, heap_less);
             memory::on_alloc_point();
             position_in_version& v = _heap.back();
             rows_entry& e = *v.it;
@@ -302,7 +301,7 @@ class partition_snapshot_row_cursor final {
             ++version_no;
             first = false;
         }
-        boost::range::make_heap(_heap, heap_less);
+        std::ranges::make_heap(_heap, heap_less);
         _change_mark = _snp.get_change_mark();
     }
 
@@ -314,7 +313,7 @@ class partition_snapshot_row_cursor final {
     bool advance(bool keep) {
         memory::on_alloc_point();
         version_heap_less_compare heap_less(*this);
-        assert(iterators_valid());
+        SCYLLA_ASSERT(iterators_valid());
         for (auto&& curr : _current_row) {
             if (!keep && curr.unique_owner) {
                 mutation_partition::rows_type::key_grabber kg(curr.it);
@@ -358,7 +357,7 @@ class partition_snapshot_row_cursor final {
                     _latest_it = curr.it;
                 }
                 _heap.push_back(curr);
-                boost::range::push_heap(_heap, heap_less);
+                std::ranges::push_heap(_heap, heap_less);
             }
         }
         return recreate_current_row();
@@ -382,7 +381,7 @@ public:
 
     // If is_in_latest_version() then this returns an iterator to the entry under cursor in the latest version.
     mutation_partition::rows_type::iterator get_iterator_in_latest_version() const {
-        assert(_latest_it);
+        SCYLLA_ASSERT(_latest_it);
         return *_latest_it;
     }
 
@@ -435,7 +434,7 @@ public:
             bool match;
             auto it = rows.lower_bound(_position, match, cmp);
             _latest_it = it;
-            auto heap_i = boost::find_if(_heap, [](auto&& v) { return v.version_no == 0; });
+            auto heap_i = std::ranges::find_if(_heap, [](auto&& v) { return v.version_no == 0; });
 
             is_continuous cont;
             tombstone rt;
@@ -468,25 +467,25 @@ public:
             if (!it) {
                 if (heap_i != _heap.end()) {
                     _heap.erase(heap_i);
-                    boost::range::make_heap(_heap, heap_less);
+                    std::ranges::make_heap(_heap, heap_less);
                 }
             } else if (match) {
                 _current_row.insert(_current_row.begin(), position_in_version{
                     it, std::move(rows), 0, _snp.version()->get_schema().get(), _unique_owner, cont, rt});
                 if (heap_i != _heap.end()) {
                     _heap.erase(heap_i);
-                    boost::range::make_heap(_heap, heap_less);
+                    std::ranges::make_heap(_heap, heap_less);
                 }
             } else {
                 if (heap_i != _heap.end()) {
                     heap_i->it = it;
                     heap_i->continuous = cont;
                     heap_i->rt = rt;
-                    boost::range::make_heap(_heap, heap_less);
+                    std::ranges::make_heap(_heap, heap_less);
                 } else {
                     _heap.push_back(position_in_version{
                         it, std::move(rows), 0, _snp.version()->get_schema().get(), _unique_owner, cont, rt});
-                    boost::range::push_heap(_heap, heap_less);
+                    std::ranges::push_heap(_heap, heap_less);
                 }
             }
         }
@@ -688,7 +687,7 @@ public:
         position_in_partition::less_compare less(_schema);
         if (!iterators_valid() || less(position(), pos)) {
             auto has_entry = maybe_advance_to(pos);
-            assert(has_entry); // evictable snapshots must have a dummy after all rows.
+            SCYLLA_ASSERT(has_entry); // evictable snapshots must have a dummy after all rows.
         }
         auto&& rows = _snp.version()->partition().mutable_clustered_rows();
         auto latest_i = get_iterator_in_latest_version();

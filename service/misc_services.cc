@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/sleep.hh>
@@ -137,8 +137,8 @@ future<lowres_clock::duration> cache_hitrate_calculator::recalculate_hitrates() 
     };
 
     auto cf_to_cache_hit_stats = [non_system_filter] (replica::database& db) {
-        return boost::copy_range<std::unordered_map<table_id, stat>>(db.get_tables_metadata().filter(non_system_filter) |
-                boost::adaptors::transformed([]  (const std::pair<table_id, lw_shared_ptr<replica::column_family>>& cf) {
+        return std::ranges::to<std::unordered_map<table_id, stat>>(db.get_tables_metadata().filter(non_system_filter) |
+                std::views::transform([]  (const std::pair<table_id, lw_shared_ptr<replica::column_family>>& cf) {
             auto& stats = cf.second->get_row_cache().stats();
             return std::make_pair(cf.first, stat{float(stats.reads_with_no_misses.rate().rates[0]), float(stats.reads_with_misses.rate().rates[0])});
         }));
@@ -268,6 +268,10 @@ future<> view_update_backlog_broker::stop() {
 
 future<> view_update_backlog_broker::on_change(gms::inet_address endpoint, const gms::application_state_map& states, gms::permit_id pid) {
     return on_application_state_change(endpoint, states, gms::application_state::VIEW_BACKLOG, pid, [this] (gms::inet_address endpoint, const gms::versioned_value& value, gms::permit_id) {
+        if (utils::get_local_injector().enter("skip_updating_local_backlog_via_view_update_backlog_broker")) {
+            return make_ready_future<>();
+        }
+
         size_t current;
         size_t max;
         api::timestamp_type ticks;
@@ -290,8 +294,8 @@ future<> view_update_backlog_broker::on_change(gms::inet_address endpoint, const
             return make_ready_future();
         }
         auto backlog = view_update_backlog_timestamped{db::view::update_backlog{current, max}, ticks};
-        return _sp.invoke_on_all([endpoint, backlog] (service::storage_proxy& sp) {
-            auto[it, inserted] = sp._view_update_backlogs.try_emplace(endpoint, backlog);
+        return _sp.invoke_on_all([id = _gossiper.get_host_id(endpoint), backlog] (service::storage_proxy& sp) {
+            auto[it, inserted] = sp._view_update_backlogs.try_emplace(id, backlog);
             if (!inserted && it->second.ts < backlog.ts) {
                 it->second = backlog;
             }
@@ -301,7 +305,7 @@ future<> view_update_backlog_broker::on_change(gms::inet_address endpoint, const
 }
 
 future<> view_update_backlog_broker::on_remove(gms::inet_address endpoint, gms::permit_id) {
-    _sp.local()._view_update_backlogs.erase(endpoint);
+    _sp.local()._view_update_backlogs.erase(_gossiper.get_host_id(endpoint));
     return make_ready_future();
 }
 

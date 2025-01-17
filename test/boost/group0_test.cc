@@ -3,16 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include "test/lib/cql_assertions.hh"
 #include <seastar/core/coroutine.hh>
 
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/log.hh"
 
+#include "schema/schema_builder.hh"
 #include "utils/UUID_gen.hh"
 #include "utils/error_injection.hh"
 #include "transport/messages/result_message.hh"
@@ -31,6 +33,8 @@ static future<size_t> get_history_size(cql_test_env& e) {
     co_return (co_await fetch_rows(e, "select * from system.group0_history")).size();
 }
 
+BOOST_AUTO_TEST_SUITE(group0_test)
+
 SEASTAR_TEST_CASE(test_abort_server_on_background_error) {
 #ifndef SCYLLA_ENABLE_ERROR_INJECTION
     std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
@@ -42,7 +46,7 @@ SEASTAR_TEST_CASE(test_abort_server_on_background_error) {
         auto get_metric_ui64 = [&](sstring name) {
             const auto& value_map = seastar::metrics::impl::get_value_map();
             const auto& metric_family = value_map.at("raft_group0_" + name);
-            const auto& registered_metric = metric_family.at({{"shard", "0"}});
+            const auto& registered_metric = metric_family.at(make_lw_shared<const metrics::impl::labels_type>({{"shard", "0"}}));
             return (*registered_metric)().ui();
         };
 
@@ -204,7 +208,7 @@ SEASTAR_TEST_CASE(test_concurrent_group0_modifications) {
         size_t M = 4;
 
         // Run N concurrent tasks, each performing M schema changes in sequence.
-        auto successes = co_await map_reduce(boost::irange(size_t{0}, N), std::bind_front(perform_schema_changes, std::ref(e), M), 0, std::plus{});
+        auto successes = co_await map_reduce(std::views::iota(size_t{0}, N), std::bind_front(perform_schema_changes, std::ref(e), M), 0, std::plus{});
 
         // The number of new entries that appeared in group 0 history table should be exactly equal
         // to the number of successful schema changes.
@@ -215,7 +219,7 @@ SEASTAR_TEST_CASE(test_concurrent_group0_modifications) {
 
         // Run N concurrent tasks, each performing M schema changes in sequence.
         // (use different range of task_ids so the new tasks' statements don't conflict with existing keyspaces from previous tasks)
-        successes = co_await map_reduce(boost::irange(N, 2*N), std::bind_front(perform_schema_changes, std::ref(e), M), 0, std::plus{});
+        successes = co_await map_reduce(std::views::iota(N, 2*N), std::bind_front(perform_schema_changes, std::ref(e), M), 0, std::plus{});
 
         // Each task performs M schema changes. There are N tasks.
         // Thus, for each task, all other tasks combined perform (N-1) * M schema changes.
@@ -231,7 +235,7 @@ SEASTAR_TEST_CASE(test_concurrent_group0_modifications) {
         rclient.operation_mutex().consume(1337);
         mm.set_concurrent_ddl_retries(0);
 
-        successes = co_await map_reduce(boost::irange(2*N, 3*N), std::bind_front(perform_schema_changes, std::ref(e), M), 0, std::plus{});
+        successes = co_await map_reduce(std::views::iota(2*N, 3*N), std::bind_front(perform_schema_changes, std::ref(e), M), 0, std::plus{});
 
         // Each execution should have succeeded on first attempt because the mutex serialized them all.
         BOOST_REQUIRE_EQUAL(successes, N*M);
@@ -244,6 +248,14 @@ SEASTAR_TEST_CASE(test_group0_batch) {
         auto& rclient = e.get_raft_group0_client();
         abort_source as;
 
+        // mark the table as group0 to pass the mutation apply check
+        // (group0 mutations are not allowed on non-group0 tables)
+        schema_builder::register_static_configurator([](const sstring& ks_name, const sstring& cf_name, schema_static_props& props) {
+            if (cf_name == "test_group0_batch") {
+                props.is_group0_table = true;
+            }
+        });
+
         co_await e.execute_cql("CREATE TABLE test_group0_batch (key int, part int, PRIMARY KEY (key, part))");
 
         auto insert_mut = [&] (int key, int part) -> future<mutation> {
@@ -252,7 +264,7 @@ SEASTAR_TEST_CASE(test_group0_batch) {
         };
 
         auto do_transaction = [&] (std::function<future<>(service::group0_batch&)> f) -> future<> {
-            auto guard = co_await rclient.start_operation(&as);
+            auto guard = co_await rclient.start_operation(as);
             service::group0_batch mc(std::move(guard));
             co_await f(mc);
             co_await std::move(mc).commit(rclient, as, ::service::raft_timeout{});
@@ -273,7 +285,7 @@ SEASTAR_TEST_CASE(test_group0_batch) {
 
         // test extract
         {
-            auto guard = co_await rclient.start_operation(&as);
+            auto guard = co_await rclient.start_operation(as);
             service::group0_batch mc(std::move(guard));
             mc.add_mutation(co_await insert_mut(1, 2));
             mc.add_generator([&] (api::timestamp_type t) -> ::service::mutations_generator {
@@ -332,3 +344,5 @@ SEASTAR_TEST_CASE(test_group0_batch) {
         co_await std::move(mc1).commit(rclient, as, ::service::raft_timeout{});
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

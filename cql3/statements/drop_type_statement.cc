@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
@@ -90,7 +90,7 @@ bool drop_type_statement::validate_while_executing(query_processor& qp) const {
         auto&& keyspace = type->_keyspace;
         auto&& name = type->_name;
 
-        for (auto&& ut : all_types | boost::adaptors::map_values) {
+        for (auto&& ut : all_types | std::views::values) {
             if (ut->_keyspace == keyspace && ut->_name == name) {
                 continue;
             }
@@ -100,7 +100,7 @@ bool drop_type_statement::validate_while_executing(query_processor& qp) const {
             }
         }
 
-        for (auto&& cfm : ks.metadata()->cf_meta_data() | boost::adaptors::map_values) {
+        for (auto&& cfm : ks.metadata()->cf_meta_data() | std::views::values) {
             for (auto&& col : cfm->all_columns()) {
                 if (col.type->references_user_type(keyspace, name)) {
                     throw exceptions::invalid_request_exception(format("Cannot drop user type {}.{} as it is still used by table {}.{}", keyspace, type->get_name_as_string(), cfm->ks_name(), cfm->cf_name()));
@@ -108,7 +108,7 @@ bool drop_type_statement::validate_while_executing(query_processor& qp) const {
             }
         }
 
-        if (auto&& fun_name = functions::functions::used_by_user_function(_name)) {
+        if (auto&& fun_name = functions::instance().used_by_user_function(_name)) {
             throw exceptions::invalid_request_exception(format("Cannot drop user type {}.{} as it is still used by function {}", keyspace, type->get_name_as_string(), *fun_name));
         }
         return true;
@@ -154,7 +154,7 @@ drop_type_statement::prepare_schema_mutations(query_processor& qp, const query_o
 
 std::unique_ptr<cql3::statements::prepared_statement>
 drop_type_statement::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<drop_type_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<drop_type_statement>(*this));
 }
 
 }

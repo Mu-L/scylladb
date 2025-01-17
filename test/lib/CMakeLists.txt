@@ -1,4 +1,4 @@
-add_library(test-lib)
+add_library(test-lib STATIC)
 target_sources(test-lib
   PRIVATE
     cql_assertions.cc
@@ -28,6 +28,7 @@ target_link_libraries(test-lib
     Seastar::seastar
     xxHash::xxhash
   PRIVATE
+    audit
     auth
     cdc
     compaction

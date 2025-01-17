@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/util/lazy.hh>
@@ -16,11 +16,11 @@ logging::logger mrlog("mutation_reader");
 
 static size_t compute_buffer_size(const schema& s, const mutation_reader::tracked_buffer& buffer)
 {
-    return boost::accumulate(
+    return std::ranges::fold_left(
         buffer
-        | boost::adaptors::transformed([] (const mutation_fragment_v2& mf) {
+        | std::views::transform([] (const mutation_fragment_v2& mf) {
             return mf.memory_usage();
-        }), size_t(0)
+        }), size_t(0), std::plus<size_t>()
     );
 }
 

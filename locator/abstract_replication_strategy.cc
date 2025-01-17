@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "locator/abstract_replication_strategy.hh"
@@ -18,19 +18,42 @@
 #include "replica/database.hh"
 #include "utils/stall_free.hh"
 
+#include <boost/icl/interval.hpp>
+#include <boost/icl/interval_map.hpp>
+
 namespace locator {
 
-template <typename ResultSet, typename SourceSet>
-static ResultSet resolve_endpoints(const SourceSet& host_ids, const token_metadata& tm) {
-    ResultSet result{};
-    result.reserve(host_ids.size());
-    for (const auto& host_id: host_ids) {
-        // Empty host_id is used as a marker for local address.
-        // The reason for this hack is that we need local_strategy to
-        // work before the local host_id is loaded from the system.local table.
-        result.push_back(host_id ? tm.get_endpoint_for_host_id(host_id) : tm.get_topology().my_address());
-    }
-    return result;
+using ring_mapping_underlying_type = boost::icl::interval_map<token, std::unordered_set<locator::host_id>>;
+
+struct ring_mapping_impl {
+     ring_mapping_underlying_type map;
+};
+
+ring_mapping::ring_mapping()
+    : _impl(std::make_unique<ring_mapping_impl>()) {
+}
+
+ring_mapping::ring_mapping(ring_mapping&&) noexcept = default;
+
+ring_mapping&
+ring_mapping::operator=(ring_mapping&&) noexcept = default;
+
+ring_mapping::~ring_mapping() = default;
+
+auto* ring_mapping::operator->() {
+    return &_impl->map;
+}
+
+auto* ring_mapping::operator->() const {
+    return &std::as_const(_impl->map);
+}
+
+auto& ring_mapping::operator*() {
+    return _impl->map;
+}
+
+auto& ring_mapping::operator*() const {
+    return std::as_const(_impl->map);
 }
 
 logging::logger rslogger("replication_strategy");
@@ -39,7 +62,11 @@ abstract_replication_strategy::abstract_replication_strategy(
     replication_strategy_params params,
     replication_strategy_type my_type)
         : _config_options(params.options)
-        , _my_type(my_type) {}
+        , _my_type(my_type) {
+    if (params.initial_tablets.has_value()) {
+        _uses_tablets = true;
+    }
+}
 
 abstract_replication_strategy::ptr_type abstract_replication_strategy::create_replication_strategy(const sstring& strategy_name, replication_strategy_params params) {
     try {
@@ -68,11 +95,6 @@ void abstract_replication_strategy::validate_replication_strategy(const sstring&
     }
 }
 
-future<endpoint_set> abstract_replication_strategy::calculate_natural_ips(const token& search_token, const token_metadata& tm) const {
-    const auto host_ids = co_await calculate_natural_endpoints(search_token, tm);
-    co_return resolve_endpoints<endpoint_set>(host_ids, tm);
-}
-
 using strategy_class_registry = class_registry<
     locator::abstract_replication_strategy,
     replication_strategy_params>;
@@ -81,61 +103,29 @@ sstring abstract_replication_strategy::to_qualified_class_name(std::string_view 
     return strategy_class_registry::to_qualified_class_name(strategy_class_name);
 }
 
-inet_address_vector_replica_set vnode_effective_replication_map::get_natural_endpoints_without_node_being_replaced(const token& search_token) const {
-    inet_address_vector_replica_set natural_endpoints = get_natural_endpoints(search_token);
-    maybe_remove_node_being_replaced(*_tmptr, *_rs, natural_endpoints);
-    return natural_endpoints;
-}
-
-void maybe_remove_node_being_replaced(const token_metadata& tm,
-                                      const abstract_replication_strategy& rs,
-                                      inet_address_vector_replica_set& natural_endpoints) {
-    if (tm.is_any_node_being_replaced() &&
-        rs.allow_remove_node_being_replaced_from_natural_endpoints()) {
-        // When a new node is started to replace an existing dead node, we want
-        // to make the replacing node take writes but do not count it for
-        // consistency level, because the replacing node can die and go away.
-        // To do this, we filter out the existing node being replaced from
-        // natural_endpoints and make the replacing node in the pending_endpoints.
-        //
-        // However, we can only apply the filter for the replication strategy
-        // that allows it. For example, we can not apply the filter for
-        // LocalStrategy because LocalStrategy always returns the node itself
-        // as the natural_endpoints and the node will not appear in the
-        // pending_endpoints.
-        auto it = boost::range::remove_if(natural_endpoints, [&] (gms::inet_address& p) {
-            const auto host_id = tm.get_host_id(p);
-            return tm.is_being_replaced(host_id);
-        });
-        natural_endpoints.erase(it, natural_endpoints.end());
-    }
-}
-
 static const std::unordered_set<locator::host_id>* find_token(const ring_mapping& ring_mapping, const token& token) {
-    if (ring_mapping.empty()) {
+    if (ring_mapping->empty()) {
         return nullptr;
     }
     const auto interval = token_metadata::range_to_interval(wrapping_interval<dht::token>(token));
-    const auto it = ring_mapping.find(interval);
-    return it != ring_mapping.end() ? &it->second : nullptr;
+    const auto it = ring_mapping->find(interval);
+    return it != ring_mapping->end() ? &it->second : nullptr;
 }
 
-inet_address_vector_topology_change vnode_effective_replication_map::get_pending_endpoints(const token& search_token) const {
-    inet_address_vector_topology_change endpoints;
+host_id_vector_topology_change vnode_effective_replication_map::get_pending_replicas(const token& search_token) const {
     const auto* pending_endpoints = find_token(_pending_endpoints, search_token);
-    if (pending_endpoints) {
-        // interval_map does not work with std::vector, convert to inet_address_vector_topology_change
-        endpoints = resolve_endpoints<inet_address_vector_topology_change>(*pending_endpoints, *_tmptr);
+    if (!pending_endpoints) {
+        return host_id_vector_topology_change{};
     }
-    return endpoints;
+    return *pending_endpoints | std::ranges::to<host_id_vector_topology_change>();
 }
 
-inet_address_vector_replica_set vnode_effective_replication_map::get_endpoints_for_reading(const token& token) const {
+host_id_vector_replica_set vnode_effective_replication_map::get_replicas_for_reading(const token& token) const {
     const auto* endpoints = find_token(_read_endpoints, token);
     if (endpoints == nullptr) {
-        return get_natural_endpoints_without_node_being_replaced(token);
+        return get_natural_replicas(token);
     }
-    return resolve_endpoints<inet_address_vector_replica_set>(*endpoints, *_tmptr);
+    return *endpoints | std::ranges::to<host_id_vector_replica_set>();
 }
 
 std::optional<tablet_routing_info> vnode_effective_replication_map::check_locality(const token& token) const {
@@ -143,7 +133,7 @@ std::optional<tablet_routing_info> vnode_effective_replication_map::check_locali
 }
 
 bool vnode_effective_replication_map::has_pending_ranges(locator::host_id endpoint) const {
-    for (const auto& item : _pending_endpoints) {
+    for (const auto& item : *_pending_endpoints) {
         const auto& nodes = item.second;
         if (nodes.contains(endpoint)) {
             return true;
@@ -154,7 +144,7 @@ bool vnode_effective_replication_map::has_pending_ranges(locator::host_id endpoi
 
 std::unordered_set<locator::host_id> vnode_effective_replication_map::get_all_pending_nodes() const {
     std::unordered_set<locator::host_id> endpoints;
-    for (const auto& item : _pending_endpoints) {
+    for (const auto& item : *_pending_endpoints) {
         endpoints.insert(item.second.begin(), item.second.end());
     }
 
@@ -227,8 +217,8 @@ insert_token_range_to_sorted_container_while_unwrapping(
     }
 }
 
-dht::token_range_vector
-vnode_effective_replication_map::do_get_ranges(noncopyable_function<stop_iteration(bool&, const inet_address&)> consider_range_for_endpoint) const {
+future<dht::token_range_vector>
+vnode_effective_replication_map::do_get_ranges(noncopyable_function<stop_iteration(bool&, const host_id&)> consider_range_for_endpoint) const {
     dht::token_range_vector ret;
     const auto& tm = *_tmptr;
     const auto& sorted_tokens = tm.sorted_tokens();
@@ -238,23 +228,24 @@ vnode_effective_replication_map::do_get_ranges(noncopyable_function<stop_iterati
     auto prev_tok = sorted_tokens.back();
     for (const auto& tok : sorted_tokens) {
         bool add_range = false;
-        for_each_natural_endpoint_until(tok, [&] (const inet_address& ep) {
+        for_each_natural_endpoint_until(tok, [&] (const host_id& ep) {
             return consider_range_for_endpoint(add_range, ep);
         });
         if (add_range) {
             insert_token_range_to_sorted_container_while_unwrapping(prev_tok, tok, ret);
         }
         prev_tok = tok;
+        co_await coroutine::maybe_yield();
     }
-    return ret;
+    co_return ret;
 }
 
-dht::token_range_vector
-vnode_effective_replication_map::get_ranges(inet_address ep) const {
+future<dht::token_range_vector>
+vnode_effective_replication_map::get_ranges(host_id ep) const {
     // The callback function below is called for each endpoint
     // in each token natural endpoints.
     // Add the range if `ep` is found in the token's natural endpoints
-    return do_get_ranges([ep] (bool& add_range, const inet_address& e) {
+    return do_get_ranges([ep] (bool& add_range, const host_id& e) {
         if ((add_range = (e == ep))) {
             // stop iteration a match is found
             return stop_iteration::yes;
@@ -299,29 +290,29 @@ abstract_replication_strategy::get_ranges(locator::host_id ep, const token_metad
     co_return ret;
 }
 
-dht::token_range_vector
-vnode_effective_replication_map::get_primary_ranges(inet_address ep) const {
+future<dht::token_range_vector>
+vnode_effective_replication_map::get_primary_ranges(locator::host_id ep) const {
     // The callback function below is called for each endpoint
     // in each token natural endpoints.
     // Add the range if `ep` is the primary replica in the token's natural endpoints.
     // The primary replica is first in the natural endpoints list.
-    return do_get_ranges([ep] (bool& add_range, const inet_address& e) {
+    return do_get_ranges([ep] (bool& add_range, const locator::host_id& e) {
         add_range = (e == ep);
         // stop the iteration once the first node was considered.
         return stop_iteration::yes;
     });
 }
 
-dht::token_range_vector
-vnode_effective_replication_map::get_primary_ranges_within_dc(inet_address ep) const {
+future<dht::token_range_vector>
+vnode_effective_replication_map::get_primary_ranges_within_dc(locator::host_id ep) const {
     const topology& topo = _tmptr->get_topology();
     sstring local_dc = topo.get_datacenter(ep);
-    std::unordered_set<inet_address> local_dc_nodes = topo.get_datacenter_endpoints().at(local_dc);
+    std::unordered_set<locator::host_id> local_dc_nodes = _tmptr->get_datacenter_token_owners().at(local_dc);
     // The callback function below is called for each endpoint
     // in each token natural endpoints.
     // Add the range if `ep` is the datacenter primary replica in the token's natural endpoints.
     // The primary replica in each datacenter is determined by the natural endpoints list order.
-    return do_get_ranges([ep, local_dc_nodes = std::move(local_dc_nodes)] (bool& add_range, const inet_address& e) {
+    return do_get_ranges([ep, local_dc_nodes = std::move(local_dc_nodes)] (bool& add_range, const locator::host_id& e) {
         // Unlike get_primary_ranges() which checks if ep is the first
         // owner of this range, here we check if ep is the first just
         // among nodes which belong to the local dc of ep.
@@ -334,26 +325,26 @@ vnode_effective_replication_map::get_primary_ranges_within_dc(inet_address ep) c
     });
 }
 
-future<std::unordered_map<dht::token_range, inet_address_vector_replica_set>>
-vnode_effective_replication_map::get_range_addresses() const {
+future<std::unordered_map<dht::token_range, host_id_vector_replica_set>>
+vnode_effective_replication_map::get_range_host_ids() const {
     const token_metadata& tm = *_tmptr;
-    std::unordered_map<dht::token_range, inet_address_vector_replica_set> ret;
+    std::unordered_map<dht::token_range, host_id_vector_replica_set> ret;
     for (auto& t : tm.sorted_tokens()) {
         dht::token_range_vector ranges = tm.get_primary_ranges_for(t);
         for (auto& r : ranges) {
-            ret.emplace(r, do_get_natural_endpoints(t, true));
+            ret.emplace(r, do_get_replicas(t, true));
         }
         co_await coroutine::maybe_yield();
     }
     co_return ret;
 }
 
-future<std::unordered_map<dht::token_range, inet_address_vector_replica_set>>
-abstract_replication_strategy::get_range_addresses(const token_metadata& tm) const {
-    std::unordered_map<dht::token_range, inet_address_vector_replica_set> ret;
+future<std::unordered_map<dht::token_range, host_id_vector_replica_set>>
+abstract_replication_strategy::get_range_host_ids(const token_metadata& tm) const {
+    std::unordered_map<dht::token_range, host_id_vector_replica_set> ret;
     for (auto& t : tm.sorted_tokens()) {
         dht::token_range_vector ranges = tm.get_primary_ranges_for(t);
-        auto eps = co_await calculate_natural_ips(t, tm);
+        auto eps = co_await calculate_natural_endpoints(t, tm);
         for (auto& r : ranges) {
             ret.emplace(r, eps.get_vector());
         }
@@ -402,20 +393,20 @@ future<mutable_vnode_effective_replication_map_ptr> calculate_effective_replicat
             auto target_endpoints = co_await rs->calculate_natural_endpoints(token, *topology_changes->target_token_metadata);
 
             auto add_mapping = [&](ring_mapping& target, std::unordered_set<locator::host_id>&& endpoints) {
-                using interval = ring_mapping::interval_type;
+                using interval = ring_mapping_underlying_type::interval_type;
                 if (!depend_on_token) {
-                    target += std::make_pair(
+                    *target += std::make_pair(
                         interval::open(dht::minimum_token(), dht::maximum_token()),
                         std::move(endpoints));
                 } else if (i == 0) {
-                    target += std::make_pair(
+                    *target += std::make_pair(
                         interval::open(all_tokens.back(), dht::maximum_token()),
                         endpoints);
-                    target += std::make_pair(
+                    *target += std::make_pair(
                         interval::left_open(dht::minimum_token(), token),
                         std::move(endpoints));
                 } else {
-                    target += std::make_pair(
+                    *target += std::make_pair(
                         interval::left_open(all_tokens[i - 1], token),
                         std::move(endpoints));
                 }
@@ -477,13 +468,13 @@ auto vnode_effective_replication_map::clone_data_gently() const -> future<std::u
         co_await coroutine::maybe_yield();
     }
 
-    for (const auto& i : _pending_endpoints) {
-        result->pending_endpoints += i;
+    for (const auto& i : *_pending_endpoints) {
+        *result->pending_endpoints += i;
         co_await coroutine::maybe_yield();
     }
 
-    for (const auto& i : _read_endpoints) {
-        result->read_endpoints += i;
+    for (const auto& i : *_read_endpoints) {
+        *result->read_endpoints += i;
         co_await coroutine::maybe_yield();
     }
 
@@ -503,22 +494,16 @@ host_id_vector_replica_set vnode_effective_replication_map::do_get_replicas(cons
     return it->second;
 }
 
-inet_address_vector_replica_set vnode_effective_replication_map::do_get_natural_endpoints(const token& tok,
-    bool is_vnode) const
-{
-    return resolve_endpoints<inet_address_vector_replica_set>(do_get_replicas(tok, is_vnode), *_tmptr);
-}
-
 host_id_vector_replica_set vnode_effective_replication_map::get_replicas(const token& tok) const {
     return do_get_replicas(tok, false);
 }
 
-inet_address_vector_replica_set vnode_effective_replication_map::get_natural_endpoints(const token& search_token) const {
-    return do_get_natural_endpoints(search_token, false);
+host_id_vector_replica_set vnode_effective_replication_map::get_natural_replicas(const token& search_token) const {
+    return get_replicas(search_token);
 }
 
-stop_iteration vnode_effective_replication_map::for_each_natural_endpoint_until(const token& vnode_tok, const noncopyable_function<stop_iteration(const inet_address&)>& func) const {
-    for (const auto& ep : do_get_natural_endpoints(vnode_tok, true)) {
+stop_iteration vnode_effective_replication_map::for_each_natural_endpoint_until(const token& vnode_tok, const noncopyable_function<stop_iteration(const host_id&)>& func) const {
+    for (const auto& ep : do_get_replicas(vnode_tok, true)) {
         if (func(ep) == stop_iteration::yes) {
             return stop_iteration::yes;
         }
@@ -531,8 +516,8 @@ vnode_effective_replication_map::~vnode_effective_replication_map() {
         _factory->erase_effective_replication_map(this);
         try {
             _factory->submit_background_work(clear_gently(std::move(_replication_map),
-                std::move(_pending_endpoints),
-                std::move(_read_endpoints),
+                std::move(*_pending_endpoints),
+                std::move(*_read_endpoints),
                 std::move(_tmptr)));
         } catch (...) {
             // ignore
@@ -674,7 +659,7 @@ future<> global_vnode_effective_replication_map::get_keyspace_erms(sharded<repli
         auto erm = db.find_keyspace(keyspace_name).get_vnode_effective_replication_map();
         auto ring_version = erm->get_token_metadata().get_ring_version();
         _erms[0] = make_foreign(std::move(erm));
-        co_await coroutine::parallel_for_each(boost::irange(1u, smp::count), [this, &sharded_db, keyspace_name, ring_version] (unsigned shard) -> future<> {
+        co_await coroutine::parallel_for_each(std::views::iota(1u, smp::count), [this, &sharded_db, keyspace_name, ring_version] (unsigned shard) -> future<> {
             _erms[shard] = co_await sharded_db.invoke_on(shard, [keyspace_name, ring_version] (const replica::database& db) {
                 const auto& ks = db.find_keyspace(keyspace_name);
                 auto erm = ks.get_vnode_effective_replication_map();
@@ -696,27 +681,34 @@ future<global_vnode_effective_replication_map> make_global_effective_replication
 
 } // namespace locator
 
-std::ostream& operator<<(std::ostream& os, locator::replication_strategy_type t) {
+auto fmt::formatter<locator::replication_strategy_type>::format(locator::replication_strategy_type t,
+                                                                fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    std::string_view name;
     switch (t) {
-    case locator::replication_strategy_type::simple:
-        return os << "simple";
-    case locator::replication_strategy_type::local:
-        return os << "local";
-    case locator::replication_strategy_type::network_topology:
-        return os << "network_topology";
-    case locator::replication_strategy_type::everywhere_topology:
-        return os << "everywhere_topology";
+    using enum locator::replication_strategy_type;
+    case simple:
+        name = "simple";
+        break;
+    case local:
+        name = "local";
+        break;
+    case network_topology:
+        name = "network_topology";
+        break;
+    case everywhere_topology:
+        name = "everywhere_topology";
+        break;
     };
-    std::abort();
+    return fmt::format_to(ctx.out(), "{}", name);
 }
 
-std::ostream& operator<<(std::ostream& os, const locator::vnode_effective_replication_map::factory_key& key) {
-    os << key.rs_type;
-    os << '.' << key.ring_version;
+auto fmt::formatter<locator::vnode_effective_replication_map::factory_key>::format(const locator::vnode_effective_replication_map::factory_key& key,
+                                                                                   fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    auto out = fmt::format_to(ctx.out(), "{}.{}", key.rs_type, key.ring_version);
     char sep = ':';
     for (const auto& [opt, val] : key.rs_config_options) {
-        os << sep << opt << '=' << val;
+        out = fmt::format_to(out, "{}{}={}", sep, opt, val);
         sep = ',';
     }
-    return os;
+    return out;
 }

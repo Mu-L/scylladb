@@ -3,21 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <iosfwd>
-#include <boost/intrusive/set.hpp>
-#include <boost/range/iterator_range.hpp>
-#include <boost/range/adaptor/filtered.hpp>
 #include <boost/intrusive/parent_from_member.hpp>
 
-#include <seastar/core/bitset-iter.hh>
-#include <seastar/util/optimized_optional.hh>
-
 #include "mutation_partition.hh"
+
+#include <ranges>
+
+#ifdef SEASTAR_DEBUG
+#include "utils/assert.hh"
+#endif
 
 // is_evictable::yes means that the object is part of an evictable snapshots in MVCC,
 // and non-evictable one otherwise.
@@ -214,6 +213,7 @@ public:
     mutation_partition as_mutation_partition(const schema&) const;
 private:
     // Erases the entry if it's safe to do so without changing the logical state of the partition.
+    // (It's allowed to evict empty row entries, though).
     rows_type::iterator maybe_drop(const schema&, cache_tracker*, rows_type::iterator, mutation_application_stats&);
     void insert_row(const schema& s, const clustering_key& key, deletable_row&& row);
     void insert_row(const schema& s, const clustering_key& key, const deletable_row& row);
@@ -242,16 +242,16 @@ public:
     rows_type& mutable_clustered_rows() noexcept { return _rows; }
 
     const row* find_row(const schema& s, const clustering_key& key) const;
-    boost::iterator_range<rows_type::const_iterator> range(const schema& schema, const query::clustering_range& r) const;
+    std::ranges::subrange<rows_type::const_iterator> range(const schema& schema, const query::clustering_range& r) const;
     rows_type::const_iterator lower_bound(const schema& schema, const query::clustering_range& r) const;
     rows_type::const_iterator upper_bound(const schema& schema, const query::clustering_range& r) const;
     rows_type::iterator lower_bound(const schema& schema, const query::clustering_range& r);
     rows_type::iterator upper_bound(const schema& schema, const query::clustering_range& r);
-    boost::iterator_range<rows_type::iterator> range(const schema& schema, const query::clustering_range& r);
+    std::ranges::subrange<rows_type::iterator> range(const schema& schema, const query::clustering_range& r);
     // Returns an iterator range of rows_entry, with only non-dummy entries.
     auto non_dummy_rows() const {
-        return boost::make_iterator_range(_rows.begin(), _rows.end())
-            | boost::adaptors::filtered([] (const rows_entry& e) { return bool(!e.dummy()); });
+        return std::ranges::subrange(_rows.begin(), _rows.end())
+            | std::views::filter([] (const rows_entry& e) { return bool(!e.dummy()); });
     }
     void accept(const schema&, mutation_partition_visitor&) const;
 
@@ -268,7 +268,7 @@ private:
 
     void check_schema(const schema& s) const {
 #ifdef SEASTAR_DEBUG
-        assert(s.version() == _schema_version);
+        SCYLLA_ASSERT(s.version() == _schema_version);
 #endif
     }
 };

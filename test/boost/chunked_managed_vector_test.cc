@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/test/unit_test.hpp>
@@ -11,14 +11,15 @@
 
 #include <deque>
 #include <random>
+#include <ranges>
+#include <algorithm>
+
 #include "utils/lsa/chunked_managed_vector.hh"
 #include "utils/managed_ref.hh"
 #include "test/lib/log.hh"
 
-#include <boost/range/algorithm/sort.hpp>
 #include <boost/range/algorithm/equal.hpp>
 #include <boost/range/algorithm/reverse.hpp>
-#include <boost/range/irange.hpp>
 
 using namespace logalloc;
 
@@ -50,7 +51,7 @@ SEASTAR_TEST_CASE(test_random_walk) {
             }
             case 1: {
                 auto nr_pushes = nr_dist(rand);
-                for (auto i : boost::irange(size_t(0), nr_pushes)) {
+                for (auto i : std::views::iota(size_t(0), nr_pushes)) {
                     (void)i;
                     auto n = rand();
                     c.push_back(n);
@@ -73,8 +74,8 @@ SEASTAR_TEST_CASE(test_random_walk) {
                 break;
             }
             case 4: {
-                boost::sort(c);
-                boost::sort(d);
+                std::ranges::sort(c);
+                std::ranges::sort(d);
                 break;
             }
             case 5: {

@@ -3,12 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/lexical_cast.hpp>
 #include <algorithm>
 #include "cql3/cql3_type.hh"
+#include "cql3/description.hh"
 #include "cql3/lists.hh"
 #include "cql3/maps.hh"
 #include "cql3/sets.hh"
@@ -16,9 +17,10 @@
 #include "concrete_types.hh"
 #include <exception>
 #include <iterator>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/core/shared_ptr.hh>
 #include "types/types.hh"
+#include "utils/assert.hh"
 #include "utils/serialization.hh"
 #include "vint-serialization.hh"
 #include <cmath>
@@ -30,15 +32,10 @@
 #include <ctime>
 #include <cstdlib>
 #include <fmt/chrono.h>
-#include <boost/iterator/transform_iterator.hpp>
-#include <boost/range/adaptor/filtered.hpp>
-#include <boost/range/numeric.hpp>
-#include <boost/range/combine.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/date_time/c_local_time_adjustor.hpp>
 #include <boost/locale/encoding_utf.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
-#include <boost/algorithm/cxx11/any_of.hpp>
 #include <seastar/net/inet_address.hh>
 #include <unordered_set>
 #include "utils/big_decimal.hh"
@@ -174,16 +171,16 @@ template <typename T> static bytes decompose_value(T v) {
     return b;
 }
 
-template <typename T> static T parse_int(const integer_type_impl<T>& t, sstring_view s) {
+template <typename T> static T parse_int(const integer_type_impl<T>& t, std::string_view s) {
     try {
         auto value64 = boost::lexical_cast<int64_t>(s.begin(), s.size());
         auto value = static_cast<T>(value64);
         if (value != value64) {
-            throw marshal_exception(format("Value out of range for type {}: '{}'", t.name(), s));
+            throw marshal_exception(seastar::format("Value out of range for type {}: '{}'", t.name(), s));
         }
         return static_cast<T>(value);
     } catch (const boost::bad_lexical_cast& e) {
-        throw marshal_exception(format("Invalid number format '{}'", s));
+        throw marshal_exception(seastar::format("Invalid number format '{}'", s));
     }
 }
 
@@ -267,7 +264,7 @@ static boost::posix_time::time_duration get_utc_offset(const std::string& s) {
     throw marshal_exception("Cannot get UTC offset for a timestamp");
 }
 
-int64_t timestamp_from_string(sstring_view s) {
+int64_t timestamp_from_string(std::string_view s) {
     try {
         std::string str;
         str.resize(s.size());
@@ -285,7 +282,7 @@ int64_t timestamp_from_string(sstring_view s) {
         static const boost::regex date_re("^(\\d{4})-(\\d+)-(\\d+)([ tT](\\d+):(\\d+)(:(\\d+)(\\.(\\d+))?)?)?");
         boost::smatch dsm;
         if (!boost::regex_search(str, dsm, date_re)) {
-            throw marshal_exception(format("Unable to parse timestamp from '{}'", str));
+            throw marshal_exception(seastar::format("Unable to parse timestamp from '{}'", str));
         }
         auto t = get_time(dsm);
 
@@ -303,17 +300,18 @@ int64_t timestamp_from_string(sstring_view s) {
             auto dst_offset = t2 - t;
             t -= tz_offset + dst_offset;
         } else if (tz != "z") {
-            throw marshal_exception(format("Unable to parse timezone '{}'", tz));
+            throw marshal_exception(seastar::format("Unable to parse timezone '{}'", tz));
         }
         return (t - boost::posix_time::from_time_t(0)).total_milliseconds();
     } catch (const marshal_exception& me) {
-        throw marshal_exception(format("unable to parse date '{}': {}", s, me.what()));
+        throw marshal_exception(
+            seastar::format("unable to parse date '{}': {}", s, me.what()));
     } catch (...) {
-        throw marshal_exception(format("unable to parse date '{}': {}", s, std::current_exception()));
+        throw marshal_exception(seastar::format("unable to parse date '{}': {}", s, std::current_exception()));
     }
 }
 
-db_clock::time_point timestamp_type_impl::from_sstring(sstring_view s) {
+db_clock::time_point timestamp_type_impl::from_string_view(std::string_view s) {
     return db_clock::time_point(db_clock::duration(timestamp_from_string(s)));
 }
 
@@ -329,25 +327,25 @@ static date::year_month_day get_simple_date_time(const boost::match_results<Cons
     auto day = boost::lexical_cast<unsigned>(sm[3]);
     return date::year_month_day{date::year{year}, date::month{month}, date::day{day}};
 }
-static uint32_t serialize(sstring_view input, int64_t days) {
+static uint32_t serialize(std::string_view input, int64_t days) {
     if (days < std::numeric_limits<int32_t>::min()) {
-        throw marshal_exception(format("Input date {} is less than min supported date -5877641-06-23", input));
+        throw marshal_exception(seastar::format("Input date {} is less than min supported date -5877641-06-23", input));
     }
     if (days > std::numeric_limits<int32_t>::max()) {
-        throw marshal_exception(format("Input date {} is greater than max supported date 5881580-07-11", input));
+        throw marshal_exception(seastar::format("Input date {} is greater than max supported date 5881580-07-11", input));
     }
     days += 1UL << 31;
     return static_cast<uint32_t>(days);
 }
-uint32_t simple_date_type_impl::from_sstring(sstring_view s) {
+uint32_t simple_date_type_impl::from_string_view(std::string_view s) {
     char* end;
     errno = 0;
     auto v = std::strtoll(s.begin(), &end, 10);
     if(end != s.end()) {
         static const boost::regex date_re("^(-?\\d+)-(\\d+)-(\\d+)");
-        boost::match_results<sstring_view::const_iterator> dsm;
+        boost::match_results<std::string_view::const_iterator> dsm;
         if (!boost::regex_match(s.begin(), s.end(), dsm, date_re)) {
-        throw marshal_exception(format("Unable to coerce '{}' to a formatted date (long)", s));
+        throw marshal_exception(seastar::format("Unable to coerce '{}' to a formatted date (long)", s));
         }
         auto t = get_simple_date_time(dsm);
         return serialize(s, date::local_days(t).time_since_epoch().count());
@@ -363,7 +361,7 @@ uint32_t simple_date_type_impl::from_sstring(sstring_view s) {
 
 time_type_impl::time_type_impl() : simple_type_impl{kind::time, time_type_name, {}} {}
 
-int64_t time_type_impl::from_sstring(sstring_view s) {
+int64_t time_type_impl::from_string_view(std::string_view s) {
     static auto format_error = "Timestamp format must be hh:mm:ss[.fffffffff]";
     auto hours_end = s.find(':');
     if (hours_end == std::string::npos) {
@@ -394,7 +392,7 @@ int64_t time_type_impl::from_sstring(sstring_view s) {
         nanoseconds = std::stol(sstring(s.substr(seconds_end + 1)));
         auto nano_digits = s.length() - (seconds_end + 1);
         if (nano_digits > 9) {
-            throw marshal_exception(format("more than 9 nanosecond digits: {}", s));
+            throw marshal_exception(seastar::format("more than 9 nanosecond digits: {}", s));
         }
         nanoseconds *= std::pow(10, 9 - nano_digits);
         if (nanoseconds < 0 || nanoseconds >= 1000 * 1000 * 1000) {
@@ -518,7 +516,7 @@ listlike_collection_type_impl::listlike_collection_type_impl(
 
 std::strong_ordering listlike_collection_type_impl::compare_with_map(const map_type_impl& map_type, bytes_view list, bytes_view map) const
 {
-    assert((is_set() && map_type.get_keys_type() == _elements) || (!is_set() && map_type.get_values_type() == _elements));
+    SCYLLA_ASSERT((is_set() && map_type.get_keys_type() == _elements) || (!is_set() && map_type.get_values_type() == _elements));
 
     if (list.empty()) {
         return map.empty() ? std::strong_ordering::equal : std::strong_ordering::less;
@@ -558,7 +556,7 @@ std::strong_ordering listlike_collection_type_impl::compare_with_map(const map_t
 
 bytes listlike_collection_type_impl::serialize_map(const map_type_impl& map_type, const data_value& value) const
 {
-    assert((is_set() && map_type.get_keys_type() == _elements) || (!is_set() && map_type.get_values_type() == _elements));
+    SCYLLA_ASSERT((is_set() && map_type.get_keys_type() == _elements) || (!is_set() && map_type.get_values_type() == _elements));
     const std::vector<std::pair<data_value, data_value>>& map = map_type.from_value(value);
     // Lists are represented as vector<pair<timeuuid, value>>, sets are vector<pair<value, empty>>
     bool first = is_set();
@@ -816,7 +814,7 @@ static bool find(const abstract_type& t, const Predicate& f) {
         bool operator()(const abstract_type&) { return false; }
         bool operator()(const reversed_type_impl& r) { return find(*r.underlying_type(), f); }
         bool operator()(const tuple_type_impl& t) {
-            return boost::algorithm::any_of(t.all_types(), [&] (const data_type& dt) { return find(*dt, f); });
+            return std::ranges::any_of(t.all_types(), [&] (const data_type& dt) { return find(*dt, f); });
         }
         bool operator()(const map_type_impl& m) { return find(*m.get_keys_type(), f) || find(*m.get_values_type(), f); }
         bool operator()(const listlike_collection_type_impl& l) { return find(*l.get_elements_type(), f); }
@@ -1040,7 +1038,7 @@ static sstring cql3_type_name_impl(const abstract_type& t) {
         sstring operator()(const time_type_impl&) { return "time"; }
         sstring operator()(const timeuuid_type_impl&) { return "timeuuid"; }
         sstring operator()(const tuple_type_impl& t) {
-            return format("tuple<{}>", fmt::join(t.all_types() | boost::adaptors::transformed(std::mem_fn(
+            return seastar::format("tuple<{}>", fmt::join(t.all_types() | std::views::transform(std::mem_fn(
                                                                             &abstract_type::as_cql3_type)), ", "));
         }
         sstring operator()(const user_type_impl& u) { return u.get_name_as_cql_string(); }
@@ -1060,6 +1058,10 @@ const sstring& abstract_type::cql3_type_name() const {
         _cql3_type_name = name;
     }
     return _cql3_type_name;
+}
+
+sstring abstract_type::cql3_type_name_without_frozen() const {
+    return cql3_type_name_impl(*this);
 }
 
 void write_collection_value(bytes::iterator& out, data_type type, const data_value& value) {
@@ -1112,7 +1114,7 @@ map_type_impl::freeze() const {
 
 bool
 map_type_impl::is_compatible_with_frozen(const collection_type_impl& previous) const {
-    assert(!_is_multi_cell);
+    SCYLLA_ASSERT(!_is_multi_cell);
     auto* p = dynamic_cast<const map_type_impl*>(&previous);
     if (!p) {
         return false;
@@ -1123,7 +1125,7 @@ map_type_impl::is_compatible_with_frozen(const collection_type_impl& previous) c
 
 bool
 map_type_impl::is_value_compatible_with_frozen(const collection_type_impl& previous) const {
-    assert(!_is_multi_cell);
+    SCYLLA_ASSERT(!_is_multi_cell);
     auto* p = dynamic_cast<const map_type_impl*>(&previous);
     if (!p) {
         return false;
@@ -1192,6 +1194,7 @@ map_type_impl::deserialize(View in) const {
     return make_value(std::move(m));
 }
 template data_value map_type_impl::deserialize<>(ser::buffer_view<bytes_ostream::fragment_iterator>) const;
+template data_value map_type_impl::deserialize<>(managed_bytes_view) const;
 
 template <FragmentedView View>
 static void validate_aux(const map_type_impl& t, View v) {
@@ -1209,7 +1212,7 @@ static sstring map_to_string(const std::vector<std::pair<data_value, data_value>
         out << "(";
     }
 
-    fmt::print(out, "{}", fmt::join(v | boost::adaptors::transformed([] (const std::pair<data_value, data_value>& p) {
+    fmt::print(out, "{}", fmt::join(v | std::views::transform([] (const std::pair<data_value, data_value>& p) {
         std::ostringstream out;
         const auto& k = p.first;
         const auto& v = p.second;
@@ -1315,7 +1318,7 @@ set_type_impl::freeze() const {
 
 bool
 set_type_impl::is_compatible_with_frozen(const collection_type_impl& previous) const {
-    assert(!_is_multi_cell);
+    SCYLLA_ASSERT(!_is_multi_cell);
     auto* p = dynamic_cast<const set_type_impl*>(&previous);
     if (!p) {
         return false;
@@ -1459,7 +1462,7 @@ list_type_impl::freeze() const {
 
 bool
 list_type_impl::is_compatible_with_frozen(const collection_type_impl& previous) const {
-    assert(!_is_multi_cell);
+    SCYLLA_ASSERT(!_is_multi_cell);
     auto* p = dynamic_cast<const list_type_impl*>(&previous);
     if (!p) {
         return false;
@@ -1523,7 +1526,7 @@ template data_value list_type_impl::deserialize<>(ser::buffer_view<bytes_ostream
 
 static sstring vector_to_string(const std::vector<data_value>& v, std::string_view sep) {
     return fmt::to_string(fmt::join(
-            v | boost::adaptors::transformed([] (const data_value& e) { return e.type()->to_string_impl(e); }),
+            v | std::views::transform([] (const data_value& e) { return e.type()->to_string_impl(e); }),
             sep));
 }
 
@@ -1707,7 +1710,7 @@ struct validate_visitor {
             using counter_value_type = decltype(counter_value_type_instance);
 
             if (static_cast<counter_value_type>(value) != value) {
-                throw marshal_exception(format("The duration {} ({:d}) must be a {:d} bit integer", counter_name, value,
+                throw marshal_exception(seastar::format("The duration {} ({:d}) must be a {:d} bit integer", counter_name, value,
                         std::numeric_limits<counter_value_type>::digits + 1));
             }
         };
@@ -1800,10 +1803,10 @@ void abstract_type::validate(bytes_view v) const {
 }
 
 static void serialize_aux(const tuple_type_impl& type, const tuple_type_impl::native_type* val, bytes::iterator& out) {
-    assert(val);
+    SCYLLA_ASSERT(val);
     auto& elems = *val;
 
-    assert(elems.size() <= type.size());
+    SCYLLA_ASSERT(elems.size() <= type.size());
 
     for (size_t i = 0; i < elems.size(); ++i) {
         const abstract_type& t = type.type(i)->without_reversed();
@@ -2507,7 +2510,7 @@ bool abstract_type::equal(bytes_view v1, managed_bytes_view v2) const {
 }
 
 // Count number of ':' which are not preceded by '\'.
-static std::size_t count_segments(sstring_view v) {
+static std::size_t count_segments(std::string_view v) {
     std::size_t segment_count = 1;
     char prev_ch = '.';
     for (char ch : v) {
@@ -2520,11 +2523,11 @@ static std::size_t count_segments(sstring_view v) {
 }
 
 // Split on ':', unless it's preceded by '\'.
-static std::vector<sstring_view> split_field_strings(sstring_view v) {
+static std::vector<std::string_view> split_field_strings(std::string_view v) {
     if (v.empty()) {
-        return std::vector<sstring_view>();
+        return std::vector<std::string_view>();
     }
-    std::vector<sstring_view> result;
+    std::vector<std::string_view> result;
     result.reserve(count_segments(v));
     std::size_t prev = 0;
     char prev_ch = '.';
@@ -2540,12 +2543,12 @@ static std::vector<sstring_view> split_field_strings(sstring_view v) {
 }
 
 // Replace "\:" with ":" and "\@" with "@".
-static std::string unescape(sstring_view s) {
+static std::string unescape(std::string_view s) {
     return boost::regex_replace(std::string(s), boost::regex("\\\\([@:])"), "$1");
 }
 
 // Replace ":" with "\:" and "@" with "\@".
-static std::string escape(sstring_view s) {
+static std::string escape(std::string_view s) {
     return boost::regex_replace(std::string(s), boost::regex("[@:]"), "\\\\$0");
 }
 
@@ -2579,12 +2582,12 @@ size_t abstract_type::hash(managed_bytes_view v) const {
         size_t operator()(const abstract_type& t) { return std::hash<managed_bytes_view>()(v); }
         size_t operator()(const tuple_type_impl& t) {
             auto apply_hash = [] (auto&& type_value) {
-                auto&& type = boost::get<0>(type_value);
-                auto&& value = boost::get<1>(type_value);
+                auto&& type = std::get<0>(type_value);
+                auto&& value = std::get<1>(type_value);
                 return value ? type->hash(*value) : 0;
             };
             // FIXME: better accumulation function
-            return boost::accumulate(combine(t.all_types(), t.make_range(v)) | boost::adaptors::transformed(apply_hash),
+            return std::ranges::fold_left(std::views::zip(t.all_types(), t.make_range(v)) | std::views::transform(apply_hash),
                     0, std::bit_xor<>());
         }
         size_t operator()(const varint_type_impl& t) {
@@ -2689,26 +2692,26 @@ static bytes serialize_value(const T& t, const typename T::native_type& v) {
     return b;
 }
 
-seastar::net::inet_address inet_addr_type_impl::from_sstring(sstring_view s) {
+seastar::net::inet_address inet_addr_type_impl::from_string_view(std::string_view s) {
     try {
         return inet_address(std::string(s.data(), s.size()));
     } catch (...) {
-        throw marshal_exception(format("Failed to parse inet_addr from '{}'", s));
+        throw marshal_exception(seastar::format("Failed to parse inet_addr from '{}'", s));
     }
 }
 
-utils::UUID uuid_type_impl::from_sstring(sstring_view s) {
+utils::UUID uuid_type_impl::from_string_view(std::string_view s) {
     static const boost::regex re("^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$");
     if (!boost::regex_match(s.begin(), s.end(), re)) {
-        throw marshal_exception(format("Cannot parse uuid from '{}'", s));
+        throw marshal_exception(seastar::format("Cannot parse uuid from '{}'", s));
     }
     return utils::UUID(s);
 }
 
-utils::UUID timeuuid_type_impl::from_sstring(sstring_view s) {
+utils::UUID timeuuid_type_impl::from_string_view(std::string_view s) {
     static const boost::regex re("^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$");
     if (!boost::regex_match(s.begin(), s.end(), re)) {
-        throw marshal_exception(format("Invalid UUID format ({})", s));
+        throw marshal_exception(seastar::format("Invalid UUID format ({})", s));
     }
     utils::UUID v(s);
     if (v.version() != 1) {
@@ -2719,7 +2722,7 @@ utils::UUID timeuuid_type_impl::from_sstring(sstring_view s) {
 
 namespace {
 struct from_string_visitor {
-    sstring_view s;
+    std::string_view s;
     bytes operator()(const reversed_type_impl& r) { return r.underlying_type()->from_string(s); }
     bytes operator()(const counter_type_impl&) { return long_type->from_string(s); }
     template <typename T> bytes operator()(const integer_type_impl<T>& t) { return decompose_value(parse_int(t, s)); }
@@ -2728,7 +2731,7 @@ struct from_string_visitor {
         if (utils::ascii::validate(bv)) {
             return to_bytes(bv);
         } else {
-            throw marshal_exception(format("Invalid ASCII character in string literal: '{}'", s));
+            throw marshal_exception(seastar::format("Invalid ASCII character in string literal: '{}'", s));
         }
     }
     bytes operator()(const string_type_impl&) {
@@ -2744,7 +2747,7 @@ struct from_string_visitor {
         } else if (s_lower == "true") {
             v = true;
         } else {
-            throw marshal_exception(format("unable to make boolean from '{}'", s));
+            throw marshal_exception(seastar::format("unable to make boolean from '{}'", s));
         }
         return serialize_value(t, v);
     }
@@ -2752,31 +2755,31 @@ struct from_string_visitor {
         if (s.empty()) {
             return bytes();
         }
-        return timeuuid_type_impl::from_sstring(s).serialize();
+        return timeuuid_type_impl::from_string_view(s).serialize();
     }
     bytes operator()(const timestamp_date_base_class& t) {
         if (s.empty()) {
             return bytes();
         }
-        return serialize_value(t, timestamp_type_impl::from_sstring(s));
+        return serialize_value(t, timestamp_type_impl::from_string_view(s));
     }
     bytes operator()(const simple_date_type_impl& t) {
         if (s.empty()) {
             return bytes();
         }
-        return serialize_value(t, simple_date_type_impl::from_sstring(s));
+        return serialize_value(t, simple_date_type_impl::from_string_view(s));
     }
     bytes operator()(const time_type_impl& t) {
         if (s.empty()) {
             return bytes();
         }
-        return serialize_value(t, time_type_impl::from_sstring(s));
+        return serialize_value(t, time_type_impl::from_string_view(s));
     }
     bytes operator()(const uuid_type_impl&) {
         if (s.empty()) {
             return bytes();
         }
-        return uuid_type_impl::from_sstring(s).serialize();
+        return uuid_type_impl::from_string_view(s).serialize();
     }
     template <typename T> bytes operator()(const floating_type_impl<T>& t) {
         if (s.empty()) {
@@ -2786,7 +2789,7 @@ struct from_string_visitor {
             auto d = boost::lexical_cast<T>(s.begin(), s.size());
             return serialize_value(t, d);
         } catch (const boost::bad_lexical_cast& e) {
-            throw marshal_exception(format("Invalid number format '{}'", s));
+            throw marshal_exception(seastar::format("Invalid number format '{}'", s));
         }
     }
     bytes operator()(const varint_type_impl& t) {
@@ -2798,7 +2801,7 @@ struct from_string_visitor {
             varint_type_impl::native_type num(str);
             return serialize_value(t, num);
         } catch (...) {
-            throw marshal_exception(format("unable to make int from '{}'", s));
+            throw marshal_exception(seastar::format("unable to make int from '{}'", s));
         }
     }
     bytes operator()(const decimal_type_impl& t) {
@@ -2809,7 +2812,7 @@ struct from_string_visitor {
             decimal_type_impl::native_type bd(s);
             return serialize_value(t, bd);
         } catch (...) {
-            throw marshal_exception(format("unable to make BigDecimal from '{}'", s));
+            throw marshal_exception(seastar::format("unable to make BigDecimal from '{}'", s));
         }
     }
     bytes operator()(const duration_type_impl& t) {
@@ -2829,10 +2832,10 @@ struct from_string_visitor {
         if (s.empty()) {
             return bytes();
         }
-        return serialize_value(t, t.from_sstring(s));
+        return serialize_value(t, t.from_string_view(s));
     }
     bytes operator()(const tuple_type_impl& t) {
-        std::vector<sstring_view> field_strings = split_field_strings(s);
+        std::vector<std::string_view> field_strings = split_field_strings(s);
         if (field_strings.size() > t.size()) {
             throw marshal_exception(
                     format("Invalid tuple literal: too many elements. Type {} expects {:d} but got {:d}",
@@ -2857,7 +2860,7 @@ struct from_string_visitor {
 };
 }
 
-bytes abstract_type::from_string(sstring_view s) const { return visit(*this, from_string_visitor{s}); }
+bytes abstract_type::from_string(std::string_view s) const { return visit(*this, from_string_visitor{s}); }
 
 static sstring tuple_to_string(const tuple_type_impl &t, const tuple_type_impl::native_type& b) {
     std::ostringstream out;
@@ -3060,7 +3063,7 @@ tuple_type_impl::make_name(const std::vector<data_type>& types) {
     // "org.apache.cassandra.db.marshal.FrozenType(...)".
     // Even when the tuple is frozen.
     // For more details see #4087
-    return format("org.apache.cassandra.db.marshal.TupleType({})", fmt::join(types | boost::adaptors::transformed(std::mem_fn(&abstract_type::name)), ", "));
+    return seastar::format("org.apache.cassandra.db.marshal.TupleType({})", fmt::join(types | std::views::transform(std::mem_fn(&abstract_type::name)), ", "));
 }
 
 static std::optional<std::vector<data_type>>
@@ -3228,18 +3231,33 @@ sstring user_type_impl::get_name_as_cql_string() const {
     return cql3::util::maybe_quote(get_name_as_string());
 }
 
-std::ostream& user_type_impl::describe(std::ostream& os) const {
-    os << "CREATE TYPE " << cql3::util::maybe_quote(_keyspace) << "." << get_name_as_cql_string() << " (\n";
-    for (size_t i = 0; i < _string_field_names.size(); i++) {
-        os << "    " << cql3::util::maybe_quote(_string_field_names[i]) << " " << _types[i]->cql3_type_name();
-        if (i < _string_field_names.size() - 1) {
-            os << ",";
+cql3::description user_type_impl::describe(cql3::with_create_statement with_create_statement) const {
+    auto maybe_create_statement = std::invoke([&] -> std::optional<sstring> {
+        if (!with_create_statement) {
+            return std::nullopt;
         }
-        os << "\n";
-    }
-    os << ");";
 
-    return os;
+        std::ostringstream os;
+
+        os << "CREATE TYPE " << cql3::util::maybe_quote(_keyspace) << "." << get_name_as_cql_string() << " (\n";
+        for (size_t i = 0; i < _string_field_names.size(); i++) {
+            os << "    " << cql3::util::maybe_quote(_string_field_names[i]) << " " << _types[i]->cql3_type_name();
+            if (i < _string_field_names.size() - 1) {
+                os << ",";
+            }
+            os << "\n";
+        }
+        os << ");";
+
+        return std::move(os).str();
+    });
+
+    return cql3::description {
+        .keyspace = _keyspace,
+        .type = "type",
+        .name = get_name_as_string(),
+        .create_statement = std::move(maybe_create_statement)
+    };
 }
 
 data_type
@@ -3353,15 +3371,15 @@ static bytes_ostream serialize_for_cql_aux(const list_type_impl&, collection_mut
 }
 
 static bytes_ostream serialize_for_cql_aux(const user_type_impl& type, collection_mutation_view_description mut) {
-    assert(type.is_multi_cell());
-    assert(mut.cells.size() <= type.size());
+    SCYLLA_ASSERT(type.is_multi_cell());
+    SCYLLA_ASSERT(mut.cells.size() <= type.size());
 
     bytes_ostream out;
 
     size_t curr_field_pos = 0;
     for (auto&& e : mut.cells) {
         auto field_pos = deserialize_field_index(e.first);
-        assert(field_pos < type.size());
+        SCYLLA_ASSERT(field_pos < type.size());
 
         // Some fields don't have corresponding cells -- these fields are null.
         while (curr_field_pos < field_pos) {
@@ -3391,7 +3409,7 @@ static bytes_ostream serialize_for_cql_aux(const user_type_impl& type, collectio
 }
 
 bytes_ostream serialize_for_cql(const abstract_type& type, collection_mutation_view v) {
-    assert(type.is_multi_cell());
+    SCYLLA_ASSERT(type.is_multi_cell());
 
     return v.with_deserialized(type, [&] (collection_mutation_view_description mv) {
         return visit(type, make_visitor(
@@ -3418,12 +3436,12 @@ bytes serialize_field_index(size_t idx) {
 }
 
 size_t deserialize_field_index(const bytes_view& b) {
-    assert(b.size() == sizeof(int16_t));
+    SCYLLA_ASSERT(b.size() == sizeof(int16_t));
     return read_be<int16_t>(reinterpret_cast<const char*>(b.data()));
 }
 
 size_t deserialize_field_index(managed_bytes_view b) {
-    assert(b.size_bytes() == sizeof(int16_t));
+    SCYLLA_ASSERT(b.size_bytes() == sizeof(int16_t));
     return be_to_cpu(read_simple_native<int16_t>(b));
 }
 
@@ -3585,7 +3603,7 @@ data_value::data_value(empty_type_representation e) : data_value(make_new(empty_
 
 sstring data_value::to_parsable_string() const {
     // For some reason trying to do it using fmt::format refuses to compile
-    // auto to_parsable_str_transform = boost::adaptors::transformed([](const data_value& dv) -> sstring {
+    // auto to_parsable_str_transform = std::views::transform([](const data_value& dv) -> sstring {
     //     return dv.to_parsable_string();
     // });
 
@@ -3634,7 +3652,7 @@ sstring data_value::to_parsable_string() const {
         }
         result << "}";
         return std::move(result).str();
-        //auto to_map_elem_transform = boost::adaptors::transformed(
+        //auto to_map_elem_transform = std::views::transform(
         //    [](const std::pair<data_value, data_value>& map_elem) -> sstring {
         //        return fmt::format("{{{}:{}}}", map_elem.first.to_parsable_string(), map_elem.second.to_parsable_string());
         //    }

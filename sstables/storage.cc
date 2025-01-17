@@ -3,28 +3,32 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "storage.hh"
 
 #include <cerrno>
 #include <boost/algorithm/string.hpp>
+#include <boost/algorithm/string/erase.hpp>
 
 #include <exception>
 #include <stdexcept>
 #include <fmt/std.h>
+#include <seastar/core/when_all.hh>
 #include <seastar/coroutine/exception.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/util/file.hh>
 #include <seastar/util/closeable.hh>
 
+#include "db/config.hh"
 #include "sstables/exceptions.hh"
 #include "sstables/sstable_directory.hh"
 #include "sstables/sstables_manager.hh"
 #include "sstables/sstable_version.hh"
 #include "sstables/integrity_checked_file_impl.hh"
 #include "sstables/writer.hh"
+#include "utils/assert.hh"
 #include "utils/lister.hh"
 #include "utils/overloaded_functor.hh"
 #include "utils/memory_data_sink.hh"
@@ -39,7 +43,8 @@ namespace sstables {
 // cannot define these classes in an anonymous namespace, as we need to
 // declare these storage classes as "friend" of class sstable
 class filesystem_storage final : public sstables::storage {
-    std::filesystem::path _dir;
+    mutable opened_directory _base_dir;
+    mutable opened_directory _dir;
     std::optional<std::filesystem::path> _temp_dir; // Valid while the sstable is being created, until sealed
 
 private:
@@ -55,13 +60,19 @@ private:
     future<> move(const sstable& sst, sstring new_dir, generation_type generation, delayed_commit_changes* delay) override;
     future<> rename_new_file(const sstable& sst, sstring from_name, sstring to_name) const;
 
-    virtual void change_dir_for_test(sstring nd) override {
-        _dir = nd;
+    future<> change_dir(sstring new_dir) {
+        auto old_dir = std::exchange(_dir, opened_directory(new_dir));
+        return old_dir.close();
+    }
+
+    virtual future<> change_dir_for_test(sstring nd) override {
+        return change_dir(nd);
     }
 
 public:
     explicit filesystem_storage(sstring dir, sstable_state state)
-        : _dir(make_path(dir, state))
+        : _base_dir(dir)
+        , _dir(make_path(dir, state))
     {}
 
     virtual future<> seal(const sstable& sst) override;
@@ -89,7 +100,7 @@ future<data_sink> filesystem_storage::make_data_or_index_sink(sstable& sst, comp
     options.buffer_size = sst.sstable_buffer_size;
     options.write_behind = 10;
 
-    assert(type == component_type::Data || type == component_type::Index);
+    SCYLLA_ASSERT(type == component_type::Data || type == component_type::Index);
     return make_file_data_sink(type == component_type::Data ? std::move(sst._data_file) : std::move(sst._index_file), options);
 }
 
@@ -117,7 +128,7 @@ future<> filesystem_storage::rename_new_file(const sstable& sst, sstring from_na
 future<file> filesystem_storage::open_component(const sstable& sst, component_type type, open_flags flags, file_open_options options, bool check_integrity) {
     auto create_flags = open_flags::create | open_flags::exclusive;
     auto readonly = (flags & create_flags) != create_flags;
-    auto tgt_dir = !readonly && _temp_dir ? *_temp_dir : _dir;
+    auto tgt_dir = !readonly && _temp_dir ? *_temp_dir : _dir.path();
     auto name = tgt_dir / sst.component_basename(type);
 
     auto f = open_sstable_component_file_non_checked(name.native(), flags, options, check_integrity);
@@ -163,20 +174,18 @@ void filesystem_storage::open(sstable& sst) {
 
     // Flushing parent directory to guarantee that temporary TOC file reached
     // the disk.
-    sst.sstable_write_io_check(sync_directory, _dir.native()).get();
+    _dir.sync(sst._write_error_handler).get();
 }
 
 future<> filesystem_storage::seal(const sstable& sst) {
     // SSTable sealing is about renaming temporary TOC file after guaranteeing
     // that each component reached the disk safely.
     co_await remove_temp_dir();
-    auto dir_f = co_await open_checked_directory(sst._write_error_handler, _dir.native());
     // Guarantee that every component of this sstable reached the disk.
-    co_await dir_f.flush();
+    co_await _dir.sync(sst._write_error_handler);
     // Rename TOC because it's no longer temporary.
     co_await sst.sstable_write_io_check(rename_file, sst.filename(component_type::TemporaryTOC), sst.filename(component_type::TOC));
-    co_await dir_f.flush();
-    co_await dir_f.close();
+    co_await _dir.sync(sst._write_error_handler);
     // If this point was reached, sstable should be safe in disk.
     sstlog.debug("SSTable with generation {} of {}.{} was sealed successfully.", sst._generation, sst._schema->ks_name(), sst._schema->cf_name());
 }
@@ -185,7 +194,7 @@ future<> filesystem_storage::touch_temp_dir(const sstable& sst) {
     if (_temp_dir) {
         co_return;
     }
-    auto tmp = _dir / fmt::format("{}{}", sst._generation, tempdir_extension);
+    auto tmp = _dir.path() / fmt::format("{}{}", sst._generation, tempdir_extension);
     sstlog.debug("Touching temp_dir={}", tmp);
     co_await sst.sstable_touch_directory_io_check(tmp);
     _temp_dir = std::move(tmp);
@@ -195,9 +204,7 @@ future<> filesystem_storage::remove_temp_dir() {
     if (!_temp_dir) {
         co_return;
     }
-    std::optional<int> opt;
-    sstlog.debug("Removing temp_dir={}", opt);
-    //sstlog.debug("Removing temp_dir={}", _temp_dir);
+    sstlog.debug("Removing temp_dir={}", _temp_dir);
     try {
         co_await remove_file(_temp_dir->native());
     } catch (...) {
@@ -319,26 +326,28 @@ future<> filesystem_storage::create_links_common(const sstable& sst, sstring dst
     // TemporaryTOC is always first, TOC is always last
     auto dst = sstable::filename(dst_dir, sst._schema->ks_name(), sst._schema->cf_name(), sst._version, generation, sst._format, component_type::TemporaryTOC);
     co_await sst.sstable_write_io_check(idempotent_link_file, sst.filename(component_type::TOC), std::move(dst));
-    co_await sst.sstable_write_io_check(sync_directory, dst_dir);
+    auto dir = opened_directory(dst_dir);
+    co_await dir.sync(sst._write_error_handler);
     co_await parallel_for_each(comps, [this, &sst, &dst_dir, generation] (auto p) {
         auto src = sstable::filename(_dir.native(), sst._schema->ks_name(), sst._schema->cf_name(), sst._version, sst._generation, sst._format, p.second);
         auto dst = sstable::filename(dst_dir, sst._schema->ks_name(), sst._schema->cf_name(), sst._version, generation, sst._format, p.second);
         return sst.sstable_write_io_check(idempotent_link_file, std::move(src), std::move(dst));
     });
-    co_await sst.sstable_write_io_check(sync_directory, dst_dir);
+    co_await dir.sync(sst._write_error_handler);
     auto dst_temp_toc = sstable::filename(dst_dir, sst._schema->ks_name(), sst._schema->cf_name(), sst._version, generation, sst._format, component_type::TemporaryTOC);
     if (mark_for_removal) {
         // Now that the source sstable is linked to new_dir, mark the source links for
         // deletion by leaving a TemporaryTOC file in the source directory.
         auto src_temp_toc = sstable::filename(_dir.native(), sst._schema->ks_name(), sst._schema->cf_name(), sst._version, sst._generation, sst._format, component_type::TemporaryTOC);
         co_await sst.sstable_write_io_check(rename_file, std::move(dst_temp_toc), std::move(src_temp_toc));
-        co_await sst.sstable_write_io_check(sync_directory, _dir.native());
+        co_await _dir.sync(sst._write_error_handler);
     } else {
         // Now that the source sstable is linked to dir, remove
         // the TemporaryTOC file at the destination.
         co_await sst.sstable_write_io_check(remove_file, std::move(dst_temp_toc));
     }
-    co_await sst.sstable_write_io_check(sync_directory, dst_dir);
+    co_await dir.sync(sst._write_error_handler);
+    co_await dir.close();
     sstlog.trace("create_links: {} -> {} generation={}: done", sst.get_filename(), dst_dir, generation);
 }
 
@@ -355,7 +364,7 @@ future<> filesystem_storage::snapshot(const sstable& sst, sstring dir, absolute_
     if (abs) {
         snapshot_dir = dir;
     } else {
-        snapshot_dir = _dir / dir;
+        snapshot_dir = _dir.path() / dir;
     }
     co_await sst.sstable_touch_directory_io_check(snapshot_dir);
     co_await create_links_common(sst, snapshot_dir, std::move(gen));
@@ -367,7 +376,7 @@ future<> filesystem_storage::move(const sstable& sst, sstring new_dir, generatio
     sstlog.debug("Moving {} old_generation={} to {} new_generation={} do_sync_dirs={}",
             sst.get_filename(), sst._generation, new_dir, new_generation, delay_commit == nullptr);
     co_await create_links_common(sst, new_dir, new_generation, mark_for_removal::yes);
-    _dir = new_dir;
+    co_await change_dir(new_dir);
     generation_type old_generation = sst._generation;
     co_await coroutine::parallel_for_each(sst.all_components(), [&sst, old_generation, old_dir] (auto p) {
         return sst.sstable_write_io_check(remove_file, sstable::filename(old_dir, sst._schema->ks_name(), sst._schema->cf_name(), sst._version, old_generation, sst._format, p.second));
@@ -375,7 +384,7 @@ future<> filesystem_storage::move(const sstable& sst, sstring new_dir, generatio
     auto temp_toc = sstable_version_constants::get_component_map(sst._version).at(component_type::TemporaryTOC);
     co_await sst.sstable_write_io_check(remove_file, sstable::filename(old_dir, sst._schema->ks_name(), sst._schema->cf_name(), sst._version, old_generation, sst._format, temp_toc));
     if (delay_commit == nullptr) {
-        co_await when_all(sst.sstable_write_io_check(sync_directory, old_dir), sst.sstable_write_io_check(sync_directory, new_dir)).discard_result();
+        co_await when_all(sst.sstable_write_io_check(sync_directory, old_dir), _dir.sync(sst._write_error_handler)).discard_result();
     } else {
         delay_commit->_dirs.insert(old_dir);
         delay_commit->_dirs.insert(new_dir);
@@ -384,7 +393,7 @@ future<> filesystem_storage::move(const sstable& sst, sstring new_dir, generatio
 
 future<> filesystem_storage::change_state(const sstable& sst, sstable_state state, generation_type new_generation, delayed_commit_changes* delay_commit) {
     auto to = state_to_dir(state);
-    auto path = _dir;
+    auto path = _dir.path();
     auto current = path.filename().native();
 
     // Moving between states means moving between basedir/state subdirectories.
@@ -470,32 +479,25 @@ future<> filesystem_storage::wipe(const sstable& sst, sync_dir sync) noexcept {
     }
 }
 
-class filesystem_atomic_delete_ctx : public atomic_delete_context_impl {
-public:
-    sstring log;
-    sstring directory;
-    filesystem_atomic_delete_ctx(sstring l, sstring dir) noexcept : log(std::move(l)), directory(std::move(dir)) {}
-};
-
 future<atomic_delete_context> filesystem_storage::atomic_delete_prepare(const std::vector<shared_sstable>& ssts) const {
-    auto [ pending_delete_log, sst_directory ] = co_await sstable_directory::create_pending_deletion_log(ssts);
-    co_return std::make_unique<filesystem_atomic_delete_ctx>(std::move(pending_delete_log), std::move(sst_directory));
+    co_return co_await sstable_directory::create_pending_deletion_log(_base_dir, ssts);
 }
 
-future<> filesystem_storage::atomic_delete_complete(atomic_delete_context ctx_) const {
-    auto& ctx = static_cast<filesystem_atomic_delete_ctx&>(*ctx_);
+future<> filesystem_storage::atomic_delete_complete(atomic_delete_context ctx) const {
+    co_await coroutine::parallel_for_each(ctx.prefixes, [] (const auto& dir) -> future<> {
+        co_await sync_directory(dir);
+    });
 
-    co_await sync_directory(ctx.directory);
-
-    // Once all sstables are deleted, the log file can be removed.
-    // Note: the log file will be removed also if unlink failed to remove
-    // any sstable and ignored the error.
-    try {
-        co_await remove_file(ctx.log);
-        sstlog.debug("{} removed.", ctx.log);
-    } catch (...) {
-        sstlog.warn("Error removing {}: {}. Ignoring.", ctx.log, std::current_exception());
-    }
+        // Once all sstables are deleted, the log file can be removed.
+        // Note: the log file will be removed also if unlink failed to remove
+        // any sstable and ignored the error.
+        const auto& log = ctx.pending_delete_log;
+        try {
+            co_await remove_file(log);
+            sstlog.debug("{} removed.", log);
+        } catch (...) {
+            sstlog.warn("Error removing {}: {}. Ignoring.", log, std::current_exception());
+        }
 }
 
 future<> filesystem_storage::remove_by_registry_entry(entry_descriptor desc) {
@@ -505,7 +507,8 @@ future<> filesystem_storage::remove_by_registry_entry(entry_descriptor desc) {
 class s3_storage : public sstables::storage {
     shared_ptr<s3::client> _client;
     sstring _bucket;
-    sstring _location;
+    std::variant<sstring, table_id> _location;
+    seastar::abort_source* _as;
 
     static constexpr auto status_creating = "creating";
     static constexpr auto status_sealed = "sealed";
@@ -513,11 +516,19 @@ class s3_storage : public sstables::storage {
 
     sstring make_s3_object_name(const sstable& sst, component_type type) const;
 
+    table_id owner() const {
+        if (std::holds_alternative<sstring>(_location)) {
+            on_internal_error(sstlog, format("Storage holds {} prefix, but registry owner is expected", std::get<sstring>(_location)));
+        }
+        return std::get<table_id>(_location);
+    }
+
 public:
-    s3_storage(shared_ptr<s3::client> client, sstring bucket, sstring dir)
+    s3_storage(shared_ptr<s3::client> client, sstring bucket, std::variant<sstring, table_id> loc, seastar::abort_source* as)
         : _client(std::move(client))
         , _bucket(std::move(bucket))
-        , _location(std::move(dir))
+        , _location(std::move(loc))
+        , _as(as)
     {
     }
 
@@ -541,19 +552,27 @@ public:
         return make_ready_future<uint64_t>(std::numeric_limits<uint64_t>::max());
     }
 
-    virtual sstring prefix() const override { return _location; }
+    virtual sstring prefix() const override { return std::visit([] (const auto& v) { return fmt::to_string(v); }, _location); }
 };
 
 sstring s3_storage::make_s3_object_name(const sstable& sst, component_type type) const {
     if (!sst.generation().is_uuid_based()) {
         throw std::runtime_error("'S3' STORAGE only works with uuid_sstable_identifier enabled");
     }
-    return format("/{}/{}/{}", _bucket, sst.generation(), sstable_version_constants::get_component_map(sst.get_version()).at(type));
+
+    return std::visit(overloaded_functor {
+        [&] (const sstring& prefix) -> sstring {
+            return format("/{}/{}", _bucket, sst.filename(type, prefix));
+        },
+        [&] (const table_id& owner) -> sstring {
+            return format("/{}/{}/{}", _bucket, sst.generation(), sstable_version_constants::get_component_map(sst.get_version()).at(type));
+        }
+    }, _location);
 }
 
 void s3_storage::open(sstable& sst) {
     entry_descriptor desc(sst._generation, sst._version, sst._format, component_type::TOC);
-    sst.manager().sstables_registry().create_entry(_location, status_creating, sst._state, std::move(desc)).get();
+    sst.manager().sstables_registry().create_entry(owner(), status_creating, sst._state, std::move(desc)).get();
 
     memory_data_sink_buffers bufs;
     sst.write_toc(
@@ -569,21 +588,21 @@ void s3_storage::open(sstable& sst) {
 }
 
 future<file> s3_storage::open_component(const sstable& sst, component_type type, open_flags flags, file_open_options options, bool check_integrity) {
-    co_return _client->make_readable_file(make_s3_object_name(sst, type));
+    co_return _client->make_readable_file(make_s3_object_name(sst, type), _as);
 }
 
 future<data_sink> s3_storage::make_data_or_index_sink(sstable& sst, component_type type) {
-    assert(type == component_type::Data || type == component_type::Index);
+    SCYLLA_ASSERT(type == component_type::Data || type == component_type::Index);
     // FIXME: if we have file size upper bound upfront, it's better to use make_upload_sink() instead
-    co_return _client->make_upload_jumbo_sink(make_s3_object_name(sst, type));
+    co_return _client->make_upload_jumbo_sink(make_s3_object_name(sst, type), std::nullopt, _as);
 }
 
 future<data_sink> s3_storage::make_component_sink(sstable& sst, component_type type, open_flags oflags, file_output_stream_options options) {
-    co_return _client->make_upload_sink(make_s3_object_name(sst, type));
+    co_return _client->make_upload_sink(make_s3_object_name(sst, type), _as);
 }
 
 future<> s3_storage::seal(const sstable& sst) {
-    co_await sst.manager().sstables_registry().update_entry_status(_location, sst.generation(), status_sealed);
+    co_await sst.manager().sstables_registry().update_entry_status(owner(), sst.generation(), status_sealed);
 }
 
 future<> s3_storage::change_state(const sstable& sst, sstable_state state, generation_type generation, delayed_commit_changes* delay) {
@@ -593,24 +612,24 @@ future<> s3_storage::change_state(const sstable& sst, sstable_state state, gener
         // is moved from upload directory and this is another issue for S3 (#13018)
         co_await coroutine::return_exception(std::runtime_error("Cannot change state and generation of an S3 object"));
     }
-    co_await sst.manager().sstables_registry().update_entry_state(_location, sst.generation(), state);
+    co_await sst.manager().sstables_registry().update_entry_state(owner(), sst.generation(), state);
 }
 
 future<> s3_storage::wipe(const sstable& sst, sync_dir) noexcept {
     auto& sstables_registry = sst.manager().sstables_registry();
 
-    co_await sstables_registry.update_entry_status(_location, sst.generation(), status_removing);
+    co_await sstables_registry.update_entry_status(owner(), sst.generation(), status_removing);
 
     co_await coroutine::parallel_for_each(sst._recognized_components, [this, &sst] (auto type) -> future<> {
         co_await _client->delete_object(make_s3_object_name(sst, type));
     });
 
-    co_await sstables_registry.delete_entry(_location, sst.generation());
+    co_await sstables_registry.delete_entry(owner(), sst.generation());
 }
 
 future<atomic_delete_context> s3_storage::atomic_delete_prepare(const std::vector<shared_sstable>&) const {
     // FIXME -- need atomicity, see #13567
-    co_return nullptr;
+    co_return atomic_delete_context{};
 }
 
 future<> s3_storage::atomic_delete_complete(atomic_delete_context ctx) const {
@@ -641,26 +660,83 @@ future<> s3_storage::remove_by_registry_entry(entry_descriptor desc) {
 }
 
 future<> s3_storage::snapshot(const sstable& sst, sstring dir, absolute_path abs, std::optional<generation_type> gen) const {
-    co_await coroutine::return_exception(std::runtime_error("Snapshotting S3 objects not implemented"));
+    on_internal_error(sstlog, "Snapshotting S3 objects not implemented");
+    co_return;
 }
 
-std::unique_ptr<sstables::storage> make_storage(sstables_manager& manager, const data_dictionary::storage_options& s_opts, sstring dir, sstable_state state) {
+std::unique_ptr<sstables::storage> make_storage(sstables_manager& manager, const data_dictionary::storage_options& s_opts, sstable_state state) {
     return std::visit(overloaded_functor {
-        [dir, state] (const data_dictionary::storage_options::local& loc) mutable -> std::unique_ptr<sstables::storage> {
-            return std::make_unique<sstables::filesystem_storage>(std::move(dir), state);
+        [state] (const data_dictionary::storage_options::local& loc) mutable -> std::unique_ptr<sstables::storage> {
+            if (loc.dir.empty()) {
+                on_internal_error(sstlog, "Local storage options is missing 'dir'");
+            }
+            return std::make_unique<sstables::filesystem_storage>(loc.dir.native(), state);
         },
-        [dir, &manager] (const data_dictionary::storage_options::s3& os) mutable -> std::unique_ptr<sstables::storage> {
-            return std::make_unique<sstables::s3_storage>(manager.get_endpoint_client(os.endpoint), os.bucket, std::move(dir));
+        [&manager] (const data_dictionary::storage_options::s3& os) mutable -> std::unique_ptr<sstables::storage> {
+            if (std::visit(overloaded_functor {
+                        [] (const sstring& prefix) { return prefix.empty(); },
+                        [] (const table_id& owner) { return owner.id.is_null(); }
+                    }, os.location)) {
+                on_internal_error(sstlog, "S3 storage options is missing 'location'");
+            }
+            return std::make_unique<sstables::s3_storage>(manager.get_endpoint_client(os.endpoint), os.bucket, os.location, os.abort_source);
         }
     }, s_opts.value);
 }
 
-future<> init_table_storage(const data_dictionary::storage_options& so, sstring dir) {
+future<lw_shared_ptr<const data_dictionary::storage_options>> init_table_storage(const sstables_manager& mgr, const schema& s, const data_dictionary::storage_options::local& so) {
+    std::vector<sstring> dirs;
+    for (const auto& dd : mgr.config().data_file_directories()) {
+        auto uuid_sstring = s.id().to_sstring();
+        boost::erase_all(uuid_sstring, "-");
+        auto dir = format("{}/{}/{}-{}", dd, s.ks_name(), s.cf_name(), uuid_sstring);
+        dirs.emplace_back(std::move(dir));
+    }
+    co_await coroutine::parallel_for_each(dirs, [] (sstring dir) -> future<> {
+        co_await io_check([&dir] { return recursive_touch_directory(dir); });
+        co_await io_check([&dir] { return touch_directory(dir + "/upload"); });
+        co_await io_check([&dir] { return touch_directory(dir + "/staging"); });
+    });
+
+    data_dictionary::storage_options nopts;
+    nopts.value = data_dictionary::storage_options::local {
+        .dir = fs::path(std::move(dirs[0])),
+    };
+    co_return make_lw_shared<const data_dictionary::storage_options>(std::move(nopts));
+}
+
+std::vector<std::filesystem::path> get_local_directories(const db::config& db, const data_dictionary::storage_options::local& so) {
+    // see how this path is formatted by init_table_storage() above
+    auto table_dir = so.dir.parent_path().filename() / so.dir.filename();
+    return db.data_file_directories()
+            | std::views::transform([&table_dir] (const auto& datadir) {
+                return std::filesystem::path(datadir) / table_dir;
+            })
+            | std::ranges::to<std::vector<std::filesystem::path>>();
+}
+
+future<lw_shared_ptr<const data_dictionary::storage_options>> init_table_storage(const sstables_manager& mgr, const schema& s, const data_dictionary::storage_options::s3& so) {
+    data_dictionary::storage_options nopts;
+    nopts.value = data_dictionary::storage_options::s3 {
+        .bucket = so.bucket,
+        .endpoint = so.endpoint,
+        .location = s.id(),
+    };
+    co_return make_lw_shared<const data_dictionary::storage_options>(std::move(nopts));
+}
+
+future<lw_shared_ptr<const data_dictionary::storage_options>> init_table_storage(const sstables_manager& mgr, const schema& s, const data_dictionary::storage_options& so) {
+    co_return co_await std::visit([&mgr, &s] (const auto& so) { return init_table_storage(mgr, s, so); }, so.value);
+}
+
+future<> init_keyspace_storage(const sstables_manager& mgr, const data_dictionary::storage_options& so, sstring ks_name) {
     co_await std::visit(overloaded_functor {
-        [&dir] (const data_dictionary::storage_options::local&) -> future<> {
-            co_await io_check([&dir] { return recursive_touch_directory(dir); });
-            co_await io_check([&dir] { return touch_directory(dir + "/upload"); });
-            co_await io_check([&dir] { return touch_directory(dir + "/staging"); });
+        [&mgr, &ks_name] (const data_dictionary::storage_options::local&) -> future<> {
+            const auto& data_dirs = mgr.config().data_file_directories();
+            if (data_dirs.size() > 0) {
+                auto dir = format("{}/{}", data_dirs[0], ks_name);
+                co_await io_check([&dir] { return touch_directory(dir); });
+            }
         },
         [] (const data_dictionary::storage_options::s3&) -> future<> {
             co_return;
@@ -668,21 +744,13 @@ future<> init_table_storage(const data_dictionary::storage_options& so, sstring 
     }, so.value);
 }
 
-future<> init_keyspace_storage(const data_dictionary::storage_options& so, sstring dir) {
+future<> destroy_table_storage(const data_dictionary::storage_options& so) {
     co_await std::visit(overloaded_functor {
-        [&dir] (const data_dictionary::storage_options::local&) -> future<> {
-            co_await io_check([&dir] { return touch_directory(dir); });
-        },
-        [] (const data_dictionary::storage_options::s3&) -> future<> {
-            co_return;
-        }
-    }, so.value);
-}
-
-future<> destroy_table_storage(const data_dictionary::storage_options& so, sstring dir) {
-    co_await std::visit(overloaded_functor {
-        [&dir] (const data_dictionary::storage_options::local&) -> future<> {
-            co_await sstables::remove_table_directory_if_has_no_snapshots(fs::path(dir));
+        [] (const data_dictionary::storage_options::local& so) -> future<> {
+            if (so.dir.empty()) {
+                on_internal_error(sstlog, "Non-table local storage options");
+            }
+            co_await sstables::remove_table_directory_if_has_no_snapshots(so.dir);
         },
         [] (const data_dictionary::storage_options::s3&) -> future<> {
             co_return;

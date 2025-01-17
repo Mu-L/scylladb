@@ -3,12 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <seastar/core/print.hh>
+#include <ranges>
+#include <seastar/core/format.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/distributed.hh>
 #include <seastar/core/weak_ptr.hh>
@@ -132,7 +133,7 @@ public:
         auto stats_start = executor_shard_stats_snapshot();
         _instructions_retired_counter.enable();
         _cpu_cycles_retired_counter.enable();
-        auto idx = boost::irange(0, (int)_n_workers);
+        auto idx = std::views::iota(0, (int)_n_workers);
         return parallel_for_each(idx.begin(), idx.end(), [this] (auto idx) mutable {
             return this->run_worker();
         }).then([this, stats_start] {

@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 """
 Test clusters can restart fine after an IP address change.
@@ -12,6 +12,7 @@ import time
 
 import pytest
 import uuid
+from cassandra.cluster import NoHostAvailable  # type: ignore # pylint: disable=no-name-in-module
 from cassandra.pool import Host  # type: ignore # pylint: disable=no-name-in-module
 from test.pylib.internal_types import ServerInfo
 from test.pylib.random_tables import Column, IntType, TextType
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.mark.asyncio
-async def test_change_two(manager, random_tables, mode):
+async def test_change_two(manager, random_tables, build_mode):
     """Stop two nodes, change their IPs and start, check the cluster is
     functional"""
     servers = await manager.running_servers()
@@ -88,12 +89,22 @@ async def test_change_two(manager, random_tables, mode):
 
                 return True
 
-            await wait_for(see_proper_ips, time.time() + 60)
+            # FIXME: This is a workaround for the scylladb/python-driver#295 issue.
+            #        We ignore the exception and keep retrying the operation.
+            #        Can be removed once the issue is fixed.
+            async def safe_see_proper_ips():
+                try:
+                    return await see_proper_ips()
+                except NoHostAvailable as e:
+                    logger.info(f"see_proper_ips failed: {e}")
+                    return None
+
+            await wait_for(safe_see_proper_ips, time.time() + 60)
 
     # We're checking the crash scenario here - the servers[0] crashes just after
     # saving s1_new_ip but before removing s1_old_ip. After its restart we should
     # see s1_new_ip.
-    if mode != 'release':
+    if build_mode != 'release':
         await manager.api.enable_injection(servers[0].ip_addr, 'crash-before-prev-ip-removed', one_shot=True)
         # There is a code in raft_ip_address_updater::on_endpoint_change which
         # calls gossiper.force_remove_endpoint for an endpoint if it sees
@@ -105,8 +116,8 @@ async def test_change_two(manager, random_tables, mode):
         # and the mentioned above code is not exercised by this test.
         await manager.api.enable_injection(servers[0].ip_addr, 'ip-change-raft-sync-delay', one_shot=False)
     await manager.server_start(servers[1].server_id)
-    servers[1] = ServerInfo(servers[1].server_id, s1_new_ip, s1_new_ip)
-    if mode != 'release':
+    servers[1] = ServerInfo(servers[1].server_id, s1_new_ip, s1_new_ip, servers[1].datacenter, servers[1].rack)
+    if build_mode != 'release':
         s0_logs = await manager.server_open_log(servers[0].server_id)
         await s0_logs.wait_for('crash-before-prev-ip-removed hit, killing the node')
         await manager.server_stop(servers[0].server_id)
@@ -116,7 +127,7 @@ async def test_change_two(manager, random_tables, mode):
     await wait_proper_ips([servers[0], servers[1]])
 
     await manager.server_start(servers[2].server_id)
-    servers[2] = ServerInfo(servers[2].server_id, s2_new_ip, s2_new_ip)
+    servers[2] = ServerInfo(servers[2].server_id, s2_new_ip, s2_new_ip, servers[2].datacenter, servers[2].rack)
     await reconnect_driver(manager)
     await wait_proper_ips([servers[0], servers[1], servers[2]])
 

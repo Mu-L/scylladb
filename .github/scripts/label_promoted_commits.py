@@ -1,8 +1,9 @@
-from github import Github
 import argparse
 import re
 import sys
 import os
+from github import Github
+from github.GithubException import UnknownObjectException
 
 try:
     github_token = os.environ["GITHUB_TOKEN"]
@@ -15,13 +16,8 @@ def parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--repository', type=str, required=True,
                         help='Github repository name (e.g., scylladb/scylladb)')
-    parser.add_argument('--commit_before_merge', type=str, required=True, help='Git commit ID to start labeling from ('
-                                                                               'newest commit).')
-    parser.add_argument('--commit_after_merge', type=str, required=True,
-                        help='Git commit ID to end labeling at (oldest '
-                             'commit, exclusive).')
-    parser.add_argument('--update_issue', type=bool, default=False, help='Set True to update issues when backport was '
-                                                                         'done')
+    parser.add_argument('--commits', type=str, required=True, help='Range of promoted commits.')
+    parser.add_argument('--label', type=str, default='promoted-to-master', help='Label to use')
     parser.add_argument('--ref', type=str, required=True, help='PR target branch')
     return parser.parse_args()
 
@@ -52,35 +48,41 @@ def main():
     target_branch = re.search(r'branch-(\d+\.\d+)', args.ref)
     g = Github(github_token)
     repo = g.get_repo(args.repository, lazy=False)
-    commits = repo.compare(head=args.commit_after_merge, base=args.commit_before_merge)
+    start_commit, end_commit = args.commits.split('..')
+    commits = repo.compare(start_commit, end_commit).commits
     processed_prs = set()
     # Print commit information
-    for commit in commits.commits:
+    for commit in commits:
         print(f'Commit sha is: {commit.sha}')
-        match = pr_pattern.search(commit.commit.message)
-        if match:
-            pr_number = int(match.group(1))
-            if pr_number in processed_prs:
-                continue
-            if target_branch:
-                pr = repo.get_pull(pr_number)
-                branch_name = target_branch[1]
-                refs_pr = re.findall(r'Refs (?:#|https.*?)(\d+)', pr.body)
-                if refs_pr:
-                    print(f'branch-{target_branch.group(1)}, pr number is: {pr_number}')
-                    # 1. change the backport label of the parent PR to note that
-                    #    we've merge the corresponding backport PR
-                    # 2. close the backport PR and leave a comment on it to note
-                    #    that it has been merged with a certain git commit,
-                    ref_pr_number = refs_pr[0]
-                    mark_backport_done(repo, ref_pr_number, branch_name)
-                    comment = f'Closed via {commit.sha}'
-                    add_comment_and_close_pr(pr, comment)
-            else:
-                print(f'master branch, pr number is: {pr_number}')
-                pr = repo.get_pull(pr_number)
-                pr.add_to_labels('promoted-to-master')
-            processed_prs.add(pr_number)
+        pr_last_line = commit.commit.message.splitlines()
+        for line in reversed(pr_last_line):
+            match = pr_pattern.search(line)
+            if match:
+                pr_number = int(match.group(1))
+                if pr_number in processed_prs:
+                    continue
+                if target_branch:
+                    pr = repo.get_pull(pr_number)
+                    branch_name = target_branch[1]
+                    refs_pr = re.findall(r'Parent PR: (?:#|https.*?)(\d+)', pr.body)
+                    if refs_pr:
+                        print(f'branch-{target_branch.group(1)}, pr number is: {pr_number}')
+                        # 1. change the backport label of the parent PR to note that
+                        #    we've merged the corresponding backport PR
+                        # 2. close the backport PR and leave a comment on it to note
+                        #    that it has been merged with a certain git commit.
+                        ref_pr_number = refs_pr[0]
+                        mark_backport_done(repo, ref_pr_number, branch_name)
+                        comment = f'Closed via {commit.sha}'
+                        add_comment_and_close_pr(pr, comment)
+                else:
+                    try:
+                        pr = repo.get_pull(pr_number)
+                        pr.add_to_labels('promoted-to-master')
+                        print(f'master branch, pr number is: {pr_number}')
+                    except UnknownObjectException:
+                        print(f'{pr_number} is not a PR but an issue, no need to add label')
+                processed_prs.add(pr_number)
 
 
 if __name__ == "__main__":

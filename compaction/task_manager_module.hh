@@ -3,12 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
-
-#include <fmt/format.h>
 
 #include "compaction/compaction.hh"
 #include "replica/database_fwd.hh"
@@ -64,9 +62,11 @@ public:
             std::string table,
             std::string entity,
             tasks::task_id parent_id,
-            flush_mode fm = flush_mode::compacted_tables) noexcept
+            flush_mode fm = flush_mode::compacted_tables,
+            bool consider_only_existing_data = false) noexcept
         : compaction_task_impl(module, id, sequence_number, std::move(scope), std::move(keyspace), std::move(table), std::move(entity), parent_id)
         , _flush_mode(fm)
+        , _consider_only_existing_data(consider_only_existing_data)
     {
         // FIXME: add progress units
     }
@@ -77,6 +77,7 @@ public:
 
 protected:
     flush_mode _flush_mode;
+    bool _consider_only_existing_data;
 
     virtual future<> run() override = 0;
 };
@@ -87,11 +88,14 @@ private:
 public:
     global_major_compaction_task_impl(tasks::task_manager::module_ptr module,
             sharded<replica::database>& db,
-            std::optional<flush_mode> fm = std::nullopt) noexcept
+            std::optional<flush_mode> fm = std::nullopt,
+            bool consider_only_existing_data = false) noexcept
         : major_compaction_task_impl(module, tasks::task_id::create_random_id(), module->new_sequence_number(), "global", "", "", "", tasks::task_id::create_null_id(),
-                fm.value_or(flush_mode::all_tables))
+                fm.value_or(flush_mode::all_tables), consider_only_existing_data)
         , _db(db)
     {}
+
+    tasks::is_user_task is_user_task() const noexcept override;
 protected:
     virtual future<> run() override;
 };
@@ -111,17 +115,20 @@ public:
             sharded<replica::database>& db,
             std::vector<table_info> table_infos,
             std::optional<flush_mode> fm = std::nullopt,
+            bool consider_only_existing_data = false,
             seastar::condition_variable* cv = nullptr,
             tasks::task_manager::task_ptr* current_task = nullptr) noexcept
         : major_compaction_task_impl(module, tasks::task_id::create_random_id(),
                 parent_id ? 0 : module->new_sequence_number(),
                 "keyspace", std::move(keyspace), "", "", parent_id,
-                fm.value_or(flush_mode::all_tables))
+                fm.value_or(flush_mode::all_tables), consider_only_existing_data)
         , _db(db)
         , _table_infos(std::move(table_infos))
         , _cv(cv)
         , _current_task(current_task)
     {}
+
+    tasks::is_user_task is_user_task() const noexcept override;
 protected:
     virtual future<> run() override;
 };
@@ -136,8 +143,9 @@ public:
             tasks::task_id parent_id,
             replica::database& db,
             std::vector<table_info> local_tables,
-            flush_mode fm) noexcept
-        : major_compaction_task_impl(module, tasks::task_id::create_random_id(), 0, "shard", std::move(keyspace), "", "", parent_id, fm)
+            flush_mode fm,
+            bool consider_only_existing_data) noexcept
+        : major_compaction_task_impl(module, tasks::task_id::create_random_id(), 0, "shard", std::move(keyspace), "", "", parent_id, fm, consider_only_existing_data)
         , _db(db)
         , _local_tables(std::move(local_tables))
     {}
@@ -160,8 +168,9 @@ public:
             table_info ti,
             seastar::condition_variable& cv,
             tasks::task_manager::task_ptr& current_task,
-            flush_mode fm) noexcept
-        : major_compaction_task_impl(module, tasks::task_id::create_random_id(), 0, "table", std::move(keyspace), std::move(table), "", parent_id, fm)
+            flush_mode fm,
+            bool consider_only_existing_data) noexcept
+        : major_compaction_task_impl(module, tasks::task_id::create_random_id(), 0, "table", std::move(keyspace), std::move(table), "", parent_id, fm, consider_only_existing_data)
         , _db(db)
         , _ti(std::move(ti))
         , _cv(cv)
@@ -199,17 +208,22 @@ private:
     sharded<replica::database>& _db;
     std::vector<table_info> _table_infos;
     const flush_mode _flush_mode;
+    tasks::is_user_task _is_user_task;
 public:
     cleanup_keyspace_compaction_task_impl(tasks::task_manager::module_ptr module,
             std::string keyspace,
             sharded<replica::database>& db,
             std::vector<table_info> table_infos,
-            flush_mode mode) noexcept
+            flush_mode mode,
+            tasks::is_user_task is_user_task) noexcept
         : cleanup_compaction_task_impl(module, tasks::task_id::create_random_id(), module->new_sequence_number(), "keyspace", std::move(keyspace), "", "", tasks::task_id::create_null_id())
         , _db(db)
         , _table_infos(std::move(table_infos))
         , _flush_mode(mode)
+        , _is_user_task(is_user_task)
     {}
+
+    tasks::is_user_task is_user_task() const noexcept override;
 protected:
     virtual future<> run() override;
 };
@@ -226,6 +240,8 @@ public:
     std::string type() const final {
         return "global cleanup compaction";
     }
+
+    tasks::is_user_task is_user_task() const noexcept override;
 private:
     future<> run() final;
 };
@@ -311,6 +327,8 @@ public:
         , _table_infos(std::move(table_infos))
         , _needed(needed)
     {}
+
+    tasks::is_user_task is_user_task() const noexcept override;
 protected:
     virtual future<> run() override;
 };
@@ -406,6 +424,8 @@ public:
     virtual std::string type() const override {
         return "upgrade " + sstables_compaction_task_impl::type();
     }
+
+    tasks::is_user_task is_user_task() const noexcept override;
 protected:
     virtual future<> run() override;
 };
@@ -490,6 +510,8 @@ public:
     virtual std::string type() const override {
         return "scrub " + sstables_compaction_task_impl::type();
     }
+
+    tasks::is_user_task is_user_task() const noexcept override;
 protected:
     virtual future<> run() override;
 };

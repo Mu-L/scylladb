@@ -4,14 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "mutation_partition_serializer.hh"
 #include "mutation_partition.hh"
 
 #include "counters.hh"
-#include "idl/mutation.dist.hh"
 #include "idl/mutation.dist.impl.hh"
 #include "frozen_mutation.hh"
 #include <seastar/coroutine/maybe_yield.hh>

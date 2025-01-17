@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <fmt/std.h>
@@ -16,7 +16,6 @@
 #include "sstables/exceptions.hh"
 #include "sstables/open_info.hh"
 #include "utils/disk-error-handler.hh"
-#include "utils/fmt-compat.hh"
 #include "utils/lister.hh"
 
 namespace utils {
@@ -99,8 +98,9 @@ future<> directories::create_and_verify(directories::set dir_set, recursive recu
 }
 
 template <typename... Args>
+[[noreturn]]
 static inline
-void verification_error(fs::path path, const char* fstr, Args&&... args) {
+void verification_error(const fs::path& path, const char* fstr, Args&&... args) {
     auto emsg = fmt::format(fmt::runtime(fstr), std::forward<Args>(args)...);
     startlog.error("{}: {}", path.string(), emsg);
     throw std::runtime_error(emsg);
@@ -118,20 +118,20 @@ future<> directories::do_verify_owner_and_mode(fs::path path, recursive recurse,
     // just allow euid 0 as a special case. It should survive the file_accessible() checks below.
     // See #4823.
     if (geteuid() != 0 && sd.uid != geteuid()) {
-        verification_error(std::move(path), "File not owned by current euid: {}. Owner is: {}", geteuid(), sd.uid);
+        verification_error(path, "File not owned by current euid: {}. Owner is: {}", geteuid(), sd.uid);
     }
     switch (sd.type) {
     case directory_entry_type::regular: {
         bool can_access = co_await file_accessible(path.string(), access_flags::read);
         if (!can_access) {
-            verification_error(std::move(path), "File cannot be accessed for read");
+            verification_error(path, "File cannot be accessed for read");
         }
         break;
     }
     case directory_entry_type::directory: {
         bool can_access = co_await file_accessible(path.string(), access_flags::read | access_flags::write | access_flags::execute);
         if (!can_access) {
-            verification_error(std::move(path), "Directory cannot be accessed for read, write, and execute");
+            verification_error(path, "Directory cannot be accessed for read, write, and execute");
         }
         if (level && !recurse) {
             co_return;
@@ -145,7 +145,7 @@ future<> directories::do_verify_owner_and_mode(fs::path path, recursive recurse,
         break;
     }
     default:
-        verification_error(std::move(path), "Must be either a regular file or a directory (type={})", static_cast<int>(sd.type));
+        verification_error(path, "Must be either a regular file or a directory (type={})", static_cast<int>(sd.type));
     }
 };
 

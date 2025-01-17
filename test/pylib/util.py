@@ -1,8 +1,9 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
+from collections.abc import Coroutine
 import threading
 import time
 import asyncio
@@ -137,15 +138,6 @@ async def get_available_host(cql: Session, deadline: float) -> Host:
     return await wait_for(find_host, deadline)
 
 
-async def read_barrier(cql: Session, host: Host):
-    """To issue a read barrier it is sufficient to attempt dropping a
-    non-existing table. We need to use `if exists`, otherwise the statement
-    would fail on prepare/validate step which happens before a read barrier is
-    performed.
-    """
-    await cql.run_async("drop table if exists nosuchkeyspace.nosuchtable", host = host)
-
-
 # Wait for the given feature to be enabled.
 async def wait_for_feature(feature: str, cql: Session, host: Host, deadline: float) -> None:
     async def feature_is_enabled():
@@ -242,9 +234,24 @@ async def start_writes(cql: Session, keyspace: str, table: str, concurrency: int
 
     return finish
 
-async def wait_for_view(cql: Session, name: str, node_count: int, timeout: int = 120):
+async def wait_for_view_v1(cql: Session, name: str, node_count: int, timeout: int = 120):
     async def view_is_built():
         done = await cql.run_async(f"SELECT COUNT(*) FROM system_distributed.view_build_status WHERE status = 'SUCCESS' AND view_name = '{name}' ALLOW FILTERING")
         return done[0][0] == node_count or None
     deadline = time.time() + timeout
     await wait_for(view_is_built, deadline)
+
+async def wait_for_view(cql: Session, name: str, node_count: int, timeout: int = 120):
+    async def view_is_built():
+        done = await cql.run_async(f"SELECT COUNT(*) FROM system.view_build_status_v2 WHERE status = 'SUCCESS' AND view_name = '{name}' ALLOW FILTERING")
+        return done[0][0] == node_count or None
+    deadline = time.time() + timeout
+    await wait_for(view_is_built, deadline)
+
+
+async def wait_for_first_completed(coros: list[Coroutine]):
+    done, pending = await asyncio.wait([asyncio.create_task(c) for c in coros], return_when=asyncio.FIRST_COMPLETED)
+    for t in pending:
+        t.cancel()
+    for t in done:
+        await t

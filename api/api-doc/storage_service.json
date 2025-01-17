@@ -741,10 +741,159 @@
                      "allowMultiple":false,
                      "type":"boolean",
                      "paramType":"query"
+                  },
+                  {
+                     "name":"consider_only_existing_data",
+                     "description":"Set to \"true\" to flush all memtables and force tombstone garbage collection to check only the sstables being compacted (false by default). The memtable, commitlog and other uncompacted sstables will not be checked during tombstone garbage collection.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
                   }
                ]
             }
          ]
+      },
+      {
+          "path":"/storage_service/backup",
+          "operations":[
+              {
+                  "method":"POST",
+                  "summary":"Starts copying SSTables from a specified keyspace to a designated bucket in object storage",
+                  "type":"string",
+                  "nickname":"start_backup",
+                  "produces":[
+                      "application/json"
+                  ],
+                  "parameters":[
+                      {
+                          "name":"endpoint",
+                          "description":"ID of the configured object storage endpoint to copy sstables to",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"bucket",
+                          "description":"Name of the bucket to backup sstables to",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                           "name":"prefix",
+                           "description":"The prefix of the objects for the backuped sstables",
+                           "required":true,
+                           "allowMultiple":false,
+                           "type":"string",
+                           "paramType":"query"
+                      },
+                      {
+                          "name":"keyspace",
+                          "description":"Name of a keyspace to copy sstables from",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"table",
+                          "description":"Name of a table to copy sstables from",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"snapshot",
+                          "description":"Name of a snapshot to copy sstables from",
+                          "required":false,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      }
+                  ]
+              }
+          ]
+      },
+      {
+          "path":"/storage_service/restore",
+          "operations":[
+              {
+                  "method":"POST",
+                  "summary":"Starts copying SSTables from a designated bucket in object storage to a specified keyspace",
+                  "type":"string",
+                  "nickname":"start_restore",
+                  "produces":[
+                      "application/json"
+                  ],
+                  "parameters":[
+                      {
+                          "name":"endpoint",
+                          "description":"ID of the configured object storage endpoint to copy SSTables from",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"bucket",
+                          "description":"Name of the bucket to read SSTables from",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"prefix",
+                          "description":"The prefix of the object keys for the backuped SSTables",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "in": "body",
+                          "name": "sstables",
+                          "description": "The list of the object keys of the TOC component of the SSTables to be restored",
+                          "required":true,
+                          "schema" :{
+                              "type": "array",
+                              "items": {
+                                  "type": "string"
+                              }
+                          }
+                      },
+                      {
+                          "name":"keyspace",
+                          "description":"Name of a keyspace to copy SSTables to",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"table",
+                          "description":"Name of a table to copy SSTables to",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"scope",
+                          "description":"Defines the set of nodes to which mutations can be streamed",
+                          "required":false,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query",
+                          "enum": ["all", "dc", "rack", "node"]
+                      }
+                  ]
+              }
+          ]
       },
       {
          "path":"/storage_service/keyspace_compaction/{keyspace}",
@@ -777,6 +926,14 @@
                   {
                      "name":"flush_memtables",
                      "description":"Controls flushing of memtables before compaction (true by default). Set to \"false\" to skip automatic flushing of memtables before compaction, e.g. when tables were flushed explicitly before invoking the compaction api.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"consider_only_existing_data",
+                     "description":"Set to \"true\" to flush all memtables and force tombstone garbage collection to check only the sstables being compacted (false by default). The memtable, commitlog and other uncompacted sstables will not be checked during tombstone garbage collection.",
                      "required":false,
                      "allowMultiple":false,
                      "type":"boolean",
@@ -1492,38 +1649,6 @@
          ]
       },
       {
-         "path":"/storage_service/truncate/{keyspace}",
-         "operations":[
-            {
-               "method":"POST",
-               "summary":"Truncates (deletes) the given columnFamily from the provided keyspace. Calling truncate results in actual deletion of all data in the cluster under the given columnFamily and it will fail unless all hosts are up. All data in the given column family will be deleted, but its definition will not be affected.",
-               "type":"void",
-               "nickname":"truncate",
-               "produces":[
-                  "application/json"
-               ],
-               "parameters":[
-                  {
-                     "name":"keyspace",
-                     "description":"The keyspace",
-                     "required":true,
-                     "allowMultiple":false,
-                     "type":"string",
-                     "paramType":"path"
-                  },
-                  {
-                     "name":"cf",
-                     "description":"Column family name",
-                     "required":false,
-                     "allowMultiple":false,
-                     "type":"string",
-                     "paramType":"query"
-                  }
-               ]
-            }
-         ]
-      },
-      {
          "path":"/storage_service/keyspaces",
          "operations":[
             {
@@ -1890,6 +2015,14 @@
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"force",
+                     "description":"Enforce the source_dc option, even if it unsafe to use for rebuild",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
                      "paramType":"query"
                   }
                ]
@@ -2690,6 +2823,46 @@
                      "required":false,
                      "allowMultiple":false,
                      "type":"boolean",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/tablets/repair",
+         "operations":[
+            {
+               "nickname":"repair_tablet",
+               "method":"POST",
+               "summary":"Repair a tablet",
+               "type":"void",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"ks",
+                     "description":"Keyspace name to repair",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"table",
+                     "description":"Table name to repair",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"tokens",
+                     "description":"Tokens owned by the tablets to repair. Multiple tokens can be provided using a comma-separated list. When set to the special word 'all', all tablets will be repaired",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
                      "paramType":"query"
                   }
                ]
